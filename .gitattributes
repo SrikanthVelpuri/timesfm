@@ -1,0 +1,4 @@
+timesfm-forecasting/examples/anomaly-detection/output/anomaly_detection.png !text !filter !merge !diff
+timesfm-forecasting/examples/covariates-forecasting/output/covariates_data.png !text !filter !merge !diff
+timesfm-forecasting/examples/global-temperature/output/forecast_animation.gif !text !filter !merge !diff
+timesfm-forecasting/examples/global-temperature/output/forecast_visualization.png !text !filter !merge !diff
