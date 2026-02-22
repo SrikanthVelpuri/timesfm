@@ -1,6 +1,6 @@
-# Git LFS tracking for binary outputs in claude-skill/
-claude-skill/**/*.png filter=lfs diff=lfs merge=lfs -text
-claude-skill/**/*.gif filter=lfs diff=lfs merge=lfs -text
+# Git LFS tracking for binary outputs in timesfm-forecasting skill
+timesfm-forecasting/**/*.png filter=lfs diff=lfs merge=lfs -text
+timesfm-forecasting/**/*.gif filter=lfs diff=lfs merge=lfs -text
 timesfm-forecasting/examples/anomaly-detection/output/anomaly_detection.png !text !filter !merge !diff
 timesfm-forecasting/examples/covariates-forecasting/output/covariates_data.png !text !filter !merge !diff
 timesfm-forecasting/examples/global-temperature/output/forecast_animation.gif !text !filter !merge !diff
