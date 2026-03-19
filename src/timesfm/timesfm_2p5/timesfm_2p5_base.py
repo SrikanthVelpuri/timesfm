@@ -221,8 +221,8 @@ class TimesFM_2p5:
       dynamic_categorical_covariates: A dict of dynamic categorical covariates.
       static_numerical_covariates: A dict of static numerical covariates.
       static_categorical_covariates: A dict of static categorical covariates.
-      xreg_mode: one of "xreg + timesfm" or "timesfm + xreg". "xreg + timesfm"
-        fits a model on the residuals of the TimesFM forecast. "timesfm + xreg"
+      xreg_mode: one of "xreg + timesfm" or "timesfm + xreg". "timesfm + xreg"
+        fits a model on the residuals of the TimesFM forecast. "xreg + timesfm"
         fits a model on the targets then forecasts on the residuals via TimesFM.
       normalize_xreg_target_per_input: whether to normalize the xreg target per
         input in the given batch.
