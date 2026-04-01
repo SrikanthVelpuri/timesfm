@@ -22,6 +22,10 @@ This open version is not an officially supported Google product.
     install timesfm==1.3.0` to install an older version of this package to load
     them.
 
+## Update - Mar. 19, 2026
+
+Huge shoutout to [@borealBytes](https://github.com/borealBytes)! TimesFM [SKILLS.md](https://github.com/google-research/timesfm/tree/master/timesfm-forecasting) is out.
+
 ## Update - Oct. 29, 2025
 
 Added back the covariate support through XReg for TimesFM 2.5.
