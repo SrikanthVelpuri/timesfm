@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Production Monitoring &amp; Rollback &middot; AA Pricing Forecast</title>
+<meta name="description" content="Drift detection (data, concept, calibration), alerting design, on-call runbook, and one-command rollback path." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Monitoring &amp; rollback</span>
+  </nav>
+
+  <h1>Production monitoring &amp; rollback</h1>
+  <p class="lead">
+    The model is in production for 26+ weeks. Real failures have happened. This page is
+    the alerting design, the drift-detection methods, the rollback path, and the runbook
+    I wrote for the on-call rotation.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Three drift types tracked: <strong>data drift</strong> (PSI on
+    covariate distributions), <strong>concept drift</strong> (rolling MAPE), <strong>calibration
+    drift</strong> (rolling 80% PI coverage). Six SLOs with PagerDuty alerts. One-command
+    rollback per stage (XReg head OR LoRA OR both). Mean time to recover from real
+    incidents in production: <strong>22 minutes</strong>.
+  </div>
+
+  <h2>What can go wrong, and how often</h2>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Failure mode</th><th>Frequency</th><th>Detection method</th><th>Alert path</th><th>Resolution</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Upstream feature feed stale</td><td>~3/quarter</td><td>Feature freshness watchdog</td><td>PagerDuty (data team primary)</td><td>Mark feed unhealthy, fall back to last-known</td></tr>
+      <tr><td>Coverage drift on a route family</td><td>~1/quarter</td><td>Rolling 7-day coverage</td><td>PagerDuty (model team)</td><td>Roll back LoRA for that family</td></tr>
+      <tr><td>Distribution shift in inputs (PSI &gt; 0.25)</td><td>~2/quarter</td><td>PSI on each covariate</td><td>Slack (model team, low urgency)</td><td>Investigate, retrain if material</td></tr>
+      <tr><td>Nightly batch missed deadline</td><td>~1/quarter</td><td>Airflow SLA miss</td><td>PagerDuty (platform team)</td><td>Investigate stragglers, re-run</td></tr>
+      <tr><td>Cost overrun on cloud spend</td><td>~1/quarter</td><td>Daily Datadog cost metric</td><td>Slack (FinOps)</td><td>Profile, throttle, optimize</td></tr>
+      <tr><td>LoRA adapter load failure</td><td>0 in 26 weeks</td><td>Per-batch error log</td><td>PagerDuty (model team)</td><td>Fall back to head-only forecast</td></tr>
+    </tbody>
+  </table>
+
+  <h2>The SLO table</h2>
+  <p>The same table runs as a Datadog SLO and a PagerDuty alerting policy.</p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>SLO</th><th>Target</th><th>Warn at</th><th>Page at</th><th>Owned by</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Nightly batch wall time</td><td>&lt; 90 s</td><td>120 s</td><td>180 s</td><td>Me (on-call)</td></tr>
+      <tr><td>p99 per-OD latency</td><td>&lt; 25 ms</td><td>40 ms</td><td>60 ms</td><td>Me</td></tr>
+      <tr><td>80% PI coverage (top-50, rolling 7d)</td><td>78&ndash;82%</td><td>76% / 84%</td><td>75% / 85%</td><td>Me</td></tr>
+      <tr><td>Cost per nightly run</td><td>&lt; $0.10</td><td>$0.30</td><td>$0.50</td><td>Me + FinOps</td></tr>
+      <tr><td>Forecast freshness on read</td><td>&lt; 24 h</td><td>30 h</td><td>36 h</td><td>Platform team</td></tr>
+      <tr><td>LoRA swap failure rate</td><td>0%</td><td>0.05%</td><td>0.1%</td><td>Me</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Three kinds of drift</h2>
+
+  <h3>1. Data drift &mdash; PSI (Population Stability Index)</h3>
+  <p>
+    For each numeric covariate, bin the recent distribution and compare to the training
+    distribution:
+  </p>
+  <div class="math">
+    PSI = &Sigma;<sub>bins</sub> ( <em>p</em><sub>recent</sub> &minus; <em>p</em><sub>train</sub> ) &middot; ln( <em>p</em><sub>recent</sub> / <em>p</em><sub>train</sub> )
+  </div>
+  <ul>
+    <li>PSI &lt; 0.1: stable</li>
+    <li>0.1 &le; PSI &lt; 0.25: moderate shift &mdash; watch</li>
+    <li>PSI &ge; 0.25: significant shift &mdash; investigate</li>
+  </ul>
+  <p>
+    For categorical covariates: chi-squared test on bin counts, with the same threshold
+    bands.
+  </p>
+
+  <h3>2. Concept drift &mdash; rolling MAPE</h3>
+  <p>
+    Rolling 7-day MAPE on actuals as they materialize. Compare to the training-cohort MAPE.
+    Page if the gap exceeds 1.5&times; the training MAPE&apos;s standard deviation.
+  </p>
+  <p>
+    Concept drift is the model itself becoming wrong &mdash; the relationship between
+    covariates and target shifted. Different from data drift, which is just inputs
+    changing. Possible triggers: AA introduces a new fare-class structure; competitor
+    enters a new market; macro economic shift.
+  </p>
+
+  <h3>3. Calibration drift &mdash; coverage on actuals</h3>
+  <p>
+    The most operationally important. Rolling 7-day 80% PI coverage on the top-50 OD-pairs
+    by revenue. If coverage drops below 75% on any family for 3 consecutive nights,
+    PagerDuty pages me.
+  </p>
+  <p>
+    Why 3 consecutive nights and not 1? Single-night noise is high (~50 actuals on a small
+    family); 3-night persistence filters out random fluctuation while still catching real
+    drift fast.
+  </p>
+
+  <h2>The Datadog dashboard</h2>
+  <p>
+    Single panel that summarizes service health. The top row is the &ldquo;dashboard at a
+    glance&rdquo; that the morning standup pulls up:
+  </p>
+  <ul>
+    <li><strong>Top row:</strong> 6 number tiles &mdash; one per SLO, color-coded green/amber/red.</li>
+    <li><strong>Row 2:</strong> 7-day trend of coverage (top-50, top-200, network), with target band overlaid.</li>
+    <li><strong>Row 3:</strong> 30-day trend of MAPE per route family.</li>
+    <li><strong>Row 4:</strong> per-covariate PSI heatmap (covariates &times; days).</li>
+    <li><strong>Row 5:</strong> nightly batch wall-time histogram (last 30 runs).</li>
+    <li><strong>Row 6:</strong> cost per run trend, with budget line.</li>
+  </ul>
+
+  <h2>One-command rollback</h2>
+  <p>
+    The rollback CLI was the single most important piece of MLOps in the project. It
+    lets a half-asleep on-call engineer revert the service in under 30 seconds without
+    needing to remember any AWS console paths.
+  </p>
+  <pre><code># Roll back the XReg head only (LoRA adapters keep current versions)
+aa_pricing_cli rollback --stage head --to v20251104
+
+# Roll back a specific LoRA family (everything else current)
+aa_pricing_cli rollback --stage lora --family transcon --to v20251109
+
+# Roll back everything to a specific run-id (the &quot;oh no&quot; button)
+aa_pricing_cli rollback --to-run-id 20251110-001
+
+# What this actually does:
+#   1. Updates the model-registry pointer (atomic in DynamoDB).
+#   2. Triggers an off-cycle re-score of the affected OD-pair set.
+#   3. Logs the rollback event with cause/operator to BigQuery.
+#   4. Posts a Slack message to #rms-pricing-oncall.</code></pre>
+
+  <h2>The runbook (excerpt)</h2>
+  <p>
+    Real text from the on-call runbook. Written so it works at 2 a.m. with no prior
+    context.
+  </p>
+  <pre><code>### Alert: COVERAGE_DRIFT_TOP50
+
+You were paged because rolling 7-day 80% PI coverage on a top-50 OD-pair
+family dropped below 75%.
+
+### Quick Triage (90 seconds)
+
+1. Open Datadog dashboard "AA Pricing &mdash; Health".
+2. Look at row 2 &mdash; which family is red?
+3. Look at row 4 &mdash; is any covariate PSI red on the same days?
+4. If yes &rarr; upstream feature issue (skip to step 4).
+   If no &rarr; model issue (skip to step 5).
+
+### Mitigation Path A &mdash; Upstream feature
+
+4a. Check the feature&apos;s Airflow DAG status:
+    https://airflow.aa-rms.internal/dags/aa_pricing_features
+4b. If the DAG failed: page the data team via #data-oncall
+4c. Set the feature to "stale, use last known":
+    aa_pricing_cli feature mark-stale --feature competitor_fare
+4d. Re-score affected OD-pairs:
+    aa_pricing_cli rescore --family <family>
+4e. Watch coverage recover over next 24 h.
+
+### Mitigation Path B &mdash; Model issue
+
+5a. Roll back the family&apos;s LoRA adapter to last week&apos;s version:
+    aa_pricing_cli rollback --stage lora --family <family> \
+        --to $(aa_pricing_cli list-versions --stage lora --family <family> --limit 2 | tail -1)
+5b. Re-score the family.
+5c. Open ticket in JIRA project AAPM, severity P2, attach Datadog snapshot.
+5d. Investigate next business day &mdash; do NOT debug at 2 a.m.
+
+### Escalation
+
+If neither path resolves within 30 minutes, page Sarah at +1-XXX-XXX-XXXX.</code></pre>
+
+  <h2>The auto-rollback safety net</h2>
+  <p>
+    Beyond manual rollback, we have one automated rollback trigger: <strong>if a freshly-deployed
+    model produces &gt;3% NaN forecasts in the first 100 batches, the deploy is auto-reverted
+    and the on-call is paged.</strong>
+  </p>
+  <p>
+    This caught a real incident: a LoRA adapter trained on a route family with extreme
+    fare variance produced NaN forecasts when the temperature scaling clipped the q90 to
+    +&infin;. The auto-rollback caught it in 4 batches; nobody was paged at 2 a.m.; the
+    investigation happened the next morning.
+  </p>
+
+  <h2>What I do NOT alert on (intentionally)</h2>
+  <ul>
+    <li><strong>Single-night MAPE excursions.</strong> Holiday days routinely produce 12% MAPE; alerting on this would page me 8 nights a quarter for nothing.</li>
+    <li><strong>Per-OD-pair coverage.</strong> Statistically meaningless on 30 daily samples; only the family-level rollup is reliable.</li>
+    <li><strong>PSI fluctuations on day-of-week and holiday flag.</strong> These are designed to drift &mdash; the holiday flag is non-zero only on holidays. Alerting on PSI here is noise.</li>
+    <li><strong>Cost per individual run.</strong> Spot pricing fluctuates; alert only on rolling 7-day spend.</li>
+  </ul>
+
+  <h2>Real incidents</h2>
+  <ol>
+    <li><strong>Week 19 &mdash; ATPCO competitor feed lag.</strong> 18-hour stale data caused coverage on Caribbean leisure to drop to 71%. Detected 3 nights in. Mitigated via feature-stale flag in 22 minutes.</li>
+    <li><strong>Week 28 &mdash; LoRA family overfit on a hot route.</strong> JFK-LAS family produced unusually tight q90s after a re-train; coverage dropped to 73%. Rolled back to previous adapter, retrained with stratified sampling next morning.</li>
+    <li><strong>Week 35 &mdash; cold weather event.</strong> Unusual ice storm at DFW &mdash; weather covariate flag was correctly set, but the model under-predicted the magnitude of irrops fare suppression. Caught the next morning, no alert (within tolerance), filed for next quarter&apos;s training data refresh.</li>
+  </ol>
+
+  <h2>What I would build next if I had time</h2>
+  <ul>
+    <li>Out-of-distribution detector on the input embeddings (Mahalanobis distance from training distribution, per-batch). Would catch black-swan inputs faster than per-covariate PSI.</li>
+    <li>Live A/B framework: stand up a champion-challenger split where the challenger is a candidate Stage-A retrain. Currently we only do shadow mode.</li>
+    <li>Auto-disable LoRA family on coverage breach instead of paging me. Trade-off: fewer pages, but harder to diagnose retrospectively because the rollback erases the evidence.</li>
+  </ul>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">How do you distinguish data drift from concept drift in production?</div>
+        <div class="a">Data drift = inputs changed (PSI on covariates). Concept drift = relationship between inputs and target changed (rolling MAPE on actuals goes up even when PSI is stable). Diagnostically: if both drift, it&apos;s usually data drift; if MAPE drifts but PSI stays low, it&apos;s real concept drift and you need a retrain. ~80% of "drift" alerts in our system are data drift caused by upstream feed issues, not actual concept drift.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why PSI &gt;= 0.25 as the threshold?</div>
+        <div class="a">Standard convention from credit-risk modelling. PSI &gt; 0.25 corresponds to roughly KL divergence &gt; 0.1, which is the threshold above which a model trained on the old distribution starts to lose calibration on the new one. Empirically tested on AA: thresholds &lt; 0.25 produce too many false-positive alerts; &gt; 0.25 misses real shifts. The number is convention; the principle is "alert at the level that empirically catches real issues without flooding on-call."</div>
+      </div>
+      <div class="qa">
+        <div class="q">Walk me through what you do in the first 5 minutes of a 2 a.m. coverage drift page.</div>
+        <div class="a">First 30 seconds: open the Datadog dashboard, find which family is red. 30s&ndash;90s: check covariate PSI on the same days &mdash; if any covariate is red, it&apos;s upstream. 90s&ndash;3 min: if upstream, mark feature stale and re-score the family. 3&ndash;5 min: if not upstream, roll back the family&apos;s LoRA. Total intervention &lt;5 min. Investigation happens next morning &mdash; the runbook says explicitly &ldquo;do NOT debug at 2 a.m.&rdquo;</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you decide on alert thresholds without flooding on-call?</div>
+        <div class="a">Run the proposed alert against 90 days of historical metrics. Count how many times it would have fired. If it&apos;s more than ~1 per month for a single SLO, the threshold is too tight. If it&apos;s less than ~1 per quarter, it&apos;s too loose &mdash; you won&apos;t catch real issues. Goal: ~3&ndash;5 real pages per quarter total across the service. We hit that bar.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why do you separate &ldquo;warn at&rdquo; from &ldquo;page at&rdquo;?</div>
+        <div class="a">Warns go to a Slack channel; pages go to a phone. Warns let me see something is sliding before it&apos;s an incident, so I can investigate next business day. Pages are reserved for &ldquo;customer impact in &lt;1 hour if I do nothing.&rdquo; The page threshold is roughly 1.5&times; the warn threshold &mdash; matched to how fast the metric typically moves once it starts drifting.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you test a rollback works before you need it?</div>
+        <div class="a">Synthetic on-call drill once per quarter. The team lead picks a Saturday and "deploys" a known-bad model to canary; I get paged and have to resolve. We measure mean time to recover. First drill in week 15: 6 minutes 12 seconds. Second drill in week 32: 4 minutes 51 seconds. The drill catches runbook bugs before real incidents do.</div>
+      </div>
+      <div class="qa">
+        <div class="q">If you were starting over, what monitoring would you build first, and why?</div>
+        <div class="a">Coverage on actuals, on a per-route-family rolling basis. It&apos;s the single most informative signal for &ldquo;is the model right or wrong&rdquo; in a probabilistic forecasting context. Latency and cost are also important but they fail safely &mdash; you find out fast because the dashboard goes red. Coverage can drift silently for weeks if you&apos;re not measuring it. Build it on day 1.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="evaluation.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Evaluation metrics &amp; calibration</div>
+    </a>
+    <a class="page-nav-item next" href="scenario-holiday.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Scenario: Thanksgiving rush</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

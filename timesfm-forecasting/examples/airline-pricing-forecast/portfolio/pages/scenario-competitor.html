@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Scenario: Competitor Undercut &middot; AA Pricing Forecast</title>
+<meta name="description" content="Delta drops fares on ATL-LAX overnight. How TimesFM's competitor-fare covariate, family-specific elasticity, and a 14-minute off-cycle latency drive AA's response on adjacent routes." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#scenarios">Scenarios</a> &nbsp;/&nbsp; <span>Competitor undercut</span>
+  </nav>
+
+  <h1>Scenario 3 &mdash; The competitor undercut</h1>
+  <p class="lead">
+    At 06:14 a.m. CST, Delta drops main-cabin fares on Atlanta-LAX by $20. The AA response
+    has to reach customer-facing channels within ~30 minutes or the substitution effect
+    bleeds bookings to Delta. The model + off-cycle re-score path closes that loop in
+    about 14 minutes p50.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Sabre fare-shop ingestion picks up Delta&apos;s move at 06:18.
+    The competitor-fare covariate updates for AA&apos;s adjacent routes (DFW-LAX, ORD-LAX,
+    MIA-LAX). Off-cycle re-score fires at 06:21, completes 06:28. Forecast adjustments:
+    -$11 on hub-corp routes (0.55 elasticity), -$17 on event-leisure routes (0.85). The
+    optimizer reads the new forecast and matches Delta within $3 on leisure routes;
+    leaves hub-corp pricing unchanged. <strong>Customer-facing fare update: 06:32 CST,
+    18 minutes after Delta&apos;s move.</strong>
+  </div>
+
+  <h2>Trigger</h2>
+  <p>
+    Delta files new fares for Atlanta-LAX in ATPCO at 06:14:08 a.m. CST. AA&apos;s Sabre
+    fare-shop ingestion polls every 4 minutes, picks up the new fares at 06:17:52. The
+    delta is large enough to trigger the off-cycle re-score path: &gt;$8 fare change on a
+    matching-cluster route.
+  </p>
+
+  <h2>Covariate inputs</h2>
+  <p>
+    Only the <code>competitor_fare</code> array changes for the affected routes. Every
+    other covariate is unchanged.
+  </p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Route</th><th>Old competitor fare</th><th>New competitor fare</th><th>&Delta;</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>AA-DFW-LAX (hub-corp, adjacent)</td><td>$305</td><td>$285</td><td>-$20</td></tr>
+      <tr><td>AA-MIA-LAX (leisure-hub, adjacent)</td><td>$305</td><td>$285</td><td>-$20</td></tr>
+      <tr><td>AA-ORD-LAX (hub-corp, adjacent)</td><td>$305</td><td>$285</td><td>-$20</td></tr>
+      <tr><td>AA-ATL-LAX (direct overlap)</td><td>$305</td><td>$285</td><td>-$20</td></tr>
+      <tr><td>AA-DFW-PHX (non-adjacent, control)</td><td>$240</td><td>$240</td><td>$0</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Model behavior</h2>
+  <p>
+    The XReg head&apos;s competitor-elasticity coefficient is family-specific:
+  </p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Family</th><th>Elasticity</th><th>Forecast adjustment for $20 competitor drop</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>AA-DFW-LAX (hub-corp)</td><td>0.55</td><td>-$11.00</td></tr>
+      <tr><td>AA-MIA-LAX (leisure-hub)</td><td>0.70</td><td>-$14.00</td></tr>
+      <tr><td>AA-ORD-LAX (event-leisure-ish)</td><td>0.85</td><td>-$17.00</td></tr>
+      <tr><td>AA-ATL-LAX (direct overlap)</td><td>0.90</td><td>-$18.00</td></tr>
+    </tbody>
+  </table>
+  <p>
+    The model does NOT automatically match. It produces a <em>conditional expected
+    fare</em> given that the competitor&apos;s fare is now lower. The optimizer decides
+    whether to match.
+  </p>
+
+  <div class="insight">
+    <strong>Important separation:</strong> the model produces forecast distributions; the
+    optimizer applies pricing policy. Keeping these separate means the forecast is
+    audit-defensible (it&apos;s a prediction, not a price-setting action) and the policy
+    can change without retraining the model.
+  </div>
+
+  <h2>Optimizer response</h2>
+  <p>
+    The optimizer&apos;s policy on competitor matching is family-specific:
+  </p>
+  <ul>
+    <li><strong>Hub-corp (DFW-LAX, ORD-LAX):</strong> Match conservatively. AA loyalty (AAdvantage, corp contracts) buffers substitution. Match within $3 of competitor &mdash; not exactly.</li>
+    <li><strong>Leisure-hub (MIA-LAX):</strong> Match within $5. Some loyalty cushion but customers are price-sensitive.</li>
+    <li><strong>Event-leisure (ORD-LAS-style routes, if there were one in this cluster):</strong> Match within $1. Almost no loyalty cushion; full match.</li>
+    <li><strong>Direct-overlap (ATL-LAX):</strong> Match exactly. Same OD-pair as the competitor; no cushion.</li>
+  </ul>
+  <p>
+    On DFW-LAX, the model says expected fare drops to ~$294 (from $305). The optimizer
+    chooses a bid-price aligned to ~$300 (Delta + $15) &mdash; aggressive enough to capture
+    AAdvantage demand, conservative enough not to undershoot AA&apos;s own positioning.
+  </p>
+
+  <h2>The 14-minute off-cycle latency</h2>
+  <pre><code>06:14:08  Delta files new ATPCO fares
+06:17:52  Sabre fare-shop ingestion picks up the change (4-min poll)
+06:18:14  Datadog metric &quot;competitor_fare_delta&quot; flips above threshold
+06:18:21  Off-cycle re-score job dispatched
+06:18:36  Job lands on the warm GPU instance (already running, no spin-up)
+06:18:49  Re-score begins on affected route cluster (54 OD-pairs)
+06:19:18  Re-score completes (~30 s for 54 routes vs 41 s for 6,700)
+06:19:24  Updated forecasts written to feature store
+06:19:31  Optimizer&apos;s read cache TTL expires
+06:19:42  Optimizer reads new forecast, computes new bid-prices
+06:20:08  Bid-prices propagate to Sabre PSS
+06:32:14  Customer-facing fare on aa.com updated</code></pre>
+  <p>
+    p50 latency from Delta filing to customer-facing fare: ~14 minutes. p99: ~38 minutes.
+    Pre-TimesFM, this loop took ~2 hours because the per-route ARIMAX re-fits were too slow
+    to do off-cycle &mdash; we just waited for the nightly batch.
+  </p>
+
+  <h2>Trade-offs</h2>
+  <h3>Match elasticity: how aggressively to follow competitors</h3>
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>High elasticity (e.g., 0.9 on hub-corp)</h4>
+      <ul>
+        <li>Maximizes booking capture during competitor moves.</li>
+        <li>Keeps AA visible at the top of fare-comparison sites.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>High elasticity (downside)</h4>
+      <ul>
+        <li>Erodes pricing power on routes where AAdvantage loyalty is real.</li>
+        <li>Triggers price-war dynamics &mdash; competitors match back, fares spiral down.</li>
+        <li>Empirically, AA captures ~60% of substitution-eligible demand at 0.55 elasticity, ~75% at 0.9 elasticity &mdash; but at 0.9 the absolute fare is lower, so total revenue is roughly flat.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>How the elasticity was estimated</h3>
+  <p>
+    Stage A fine-tune fit the elasticity coefficient on 24 months of historical data
+    where competitor moves were observable. The fit is per-family (rank-32 cross term in
+    the XReg head). Sanity-check: the OR team had a long-standing belief that hub-corp
+    elasticity should be 0.5&ndash;0.6 from booking-curve analysis; we got 0.55. Strong
+    cross-validation.
+  </p>
+
+  <h3>Antitrust considerations</h3>
+  <p>
+    AA does NOT explicitly target a "match Delta exactly" policy. The model produces an
+    expected fare given competitor moves; the optimizer applies a conservative buffer. The
+    decoupling is by design &mdash; both for defensibility and because explicit matching
+    rules would be visible in the artifacts and could create regulatory risk.
+  </p>
+
+  <h2>Where this could fail</h2>
+  <ol>
+    <li><strong>Sabre fare-shop polling lag.</strong> If the polling interval drops or fails, the competitor covariate is stale. Symptom: forecast doesn&apos;t move when competitor moves; AA looks slow on aa.com. Mitigation: feature freshness watchdog pages within 30 min of staleness.</li>
+    <li><strong>Spurious competitor signal (data quality).</strong> ATPCO occasionally publishes a temporary fare that&apos;s an artifact (filing error). Mitigation: smoothing over a 30-min window; require persistent fare to trigger the threshold.</li>
+    <li><strong>Cluster definition wrong.</strong> If we treat ATL-LAX as not adjacent to DFW-LAX (different cluster), we miss the substitution. Cluster definitions are reviewed quarterly by Pricing.</li>
+  </ol>
+
+  <h2>Real-world variants</h2>
+  <ul>
+    <li><strong>United price increase.</strong> Same logic, opposite direction. Forecast lifts +$11 on adjacent hub-corp routes; optimizer decides whether to follow or maintain price advantage.</li>
+    <li><strong>Spirit / Frontier ULCC undercut.</strong> Lower-cost carriers; their prices are systematically below AA&apos;s. We track them but the elasticity is lower (~0.2 on hub routes) because the customer segments overlap less.</li>
+    <li><strong>International codeshare partner.</strong> If British Airways (a partner) drops a transatlantic fare, AA usually follows because of the joint-venture revenue split; elasticity ~0.95 on those routes.</li>
+    <li><strong>Multi-lateral move.</strong> All major US carriers raise fares in the same morning (typical of fuel-surcharge announcements). Each carrier reads the others&apos; moves; the model handles each pairwise interaction independently.</li>
+  </ul>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Why is the competitor elasticity coefficient family-specific?</div>
+        <div class="a">Customer segments differ. Hub-corp routes (DFW-LAX) have a high share of business travelers on AAdvantage status / corporate contracts who are insensitive to competitor moves &mdash; price difference matters less than schedule and lounge access. Leisure-event routes (ORD-LAS) have price-sensitive vacationers who substitute easily. The model captures this through the rank-32 cross-route interaction term in the XReg head.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How would you detect if a competitor were trying to game the system?</div>
+        <div class="a">Two patterns to watch. (1) Spike-and-revert: competitor files a low fare for 5 minutes then withdraws it, hoping to bait AA into a long-running match. Defense: require persistence (covariate is updated only after fares hold for &gt;15 min). (2) Tit-for-tat oscillation: each carrier matches the other&apos;s last-known fare, fares spiral down. Defense: optimizer&apos;s match buffer ($3 on hub-corp) breaks the symmetric spiral.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Could two carriers&apos; models &ldquo;collude&rdquo; emergently without explicit coordination?</div>
+        <div class="a">Theoretically possible if both trained on similar data and use similar elasticity assumptions; in practice the noise in real demand and the differing elasticities across families prevent equilibrium convergence. We monitor for it &mdash; if AA&apos;s and Delta&apos;s fares move in lock-step on a route for &gt;2 weeks with no underlying demand reason, that&apos;s a signal to re-examine the elasticity coefficient and document for compliance.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What if Sabre&apos;s fare-shop polling fails for an hour?</div>
+        <div class="a">Feature freshness watchdog pages the data team within 30 min of staleness. The forecast falls back to the last-known competitor fare; the optimizer keeps using the last-known bid-prices. Customer-facing fares stay where they were &mdash; might be over- or under-priced relative to the now-current competitor, but the cost is bounded (you&apos;d lose at most an hour of bookings to mispricing). Better than firing the optimizer with a NaN covariate.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why don&apos;t you just match the competitor exactly on every route?</div>
+        <div class="a">Two reasons. (1) Loyalty math: ~28% of AA hub-corp bookings come from AAdvantage status / corp contracts; they&apos;ll pay an AA premium up to ~$30 for status credit and lounge access. Matching exactly leaves $30 of revenue on the table. (2) Antitrust risk: an explicit "match exactly" policy is more visible than a probabilistic match-with-elasticity rule, and creates audit risk.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="scenario-fuel.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Scenario: Fuel-price spike</div>
+    </a>
+    <a class="page-nav-item next" href="scenario-weather.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Scenario: Weather irrops</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

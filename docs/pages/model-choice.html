@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Model Choice: Why TimesFM &middot; AA Pricing Forecast</title>
+<meta name="description" content="Comparison of TimesFM 2.5 against ARIMAX, Prophet, DeepAR, NBEATS, NHITS, Chronos, Lag-Llama, and LLM-with-tools for the AA daily-fare forecasting problem." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Model choice</span>
+  </nav>
+
+  <h1>Why TimesFM 2.5? &mdash; the model-choice trade-off</h1>
+  <p class="lead">
+    For 6,700 OD-pairs &times; 30-day horizon &times; 8 dynamic + 3 static covariates,
+    we evaluated 9 candidate model families before committing to TimesFM 2.5. This page
+    is the comparison matrix and the reasoning, written so I can recall it cold in an
+    interview.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Picked <strong>TimesFM 2.5</strong> because it is the only candidate
+    that simultaneously: (a) handles the long tail of OD-pairs with &lt;90 days history via
+    its zero-shot foundation prior, (b) supports calibrated quantile output without
+    post-hoc bootstrapping, (c) accepts the AA covariate stack through
+    <code>forecast_with_covariates()</code>, and (d) ships as a single 200&nbsp;M-param artifact
+    that fits on one A10G. ARIMAX (status quo) cold-starts badly. Prophet has weak
+    quantiles. DeepAR/NBEATS need per-group training. Chronos lacks a covariate API. LLMs
+    are wrong tool. <strong>Result: 10.2% &rarr; 5.1% MAPE network-wide.</strong>
+  </p>
+
+  <h2>The decision matrix</h2>
+  <p>
+    Nine candidates. Six axes. The chosen row is highlighted. Numbers below are from
+    backtests on a 50-OD-pair stratified sample (or vendor-published benchmarks where I
+    could not run the model myself).
+  </p>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Model family</th>
+        <th>MAPE on AA sample</th>
+        <th>Cold-start (&lt;90 d)</th>
+        <th>Calibrated quantiles</th>
+        <th>Covariate API</th>
+        <th>Footprint</th>
+        <th>Inference speed</th>
+        <th>License</th>
+        <th>Verdict</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="row-rejected">
+        <td>Per-route ARIMAX (status quo)</td>
+        <td>7.4%</td>
+        <td>Bad &mdash; needs 90+ d</td>
+        <td>Bootstrap (slow, miscalibrated)</td>
+        <td>Native (linear)</td>
+        <td>6,700 artifacts</td>
+        <td>Fast per-route, slow at scale</td>
+        <td>OSS</td>
+        <td>Replaced</td>
+      </tr>
+      <tr class="row-rejected">
+        <td>Prophet (Meta)</td>
+        <td>~9.1% est.</td>
+        <td>OK with regressors</td>
+        <td>Weak (quasi-Bayesian)</td>
+        <td>Holiday + extra regressors</td>
+        <td>Per-route fit</td>
+        <td>Slow MCMC fit</td>
+        <td>MIT</td>
+        <td>Rejected</td>
+      </tr>
+      <tr class="row-rejected">
+        <td>DeepAR (Amazon)</td>
+        <td>~6.8% est.</td>
+        <td>Good if group embedding fits</td>
+        <td>Sampled (parametric, miscalibrated tail)</td>
+        <td>Yes</td>
+        <td>One global model</td>
+        <td>Medium</td>
+        <td>OSS (GluonTS)</td>
+        <td>Rejected</td>
+      </tr>
+      <tr class="row-rejected">
+        <td>NBEATS / NHITS</td>
+        <td>~7.2% est.</td>
+        <td>Poor</td>
+        <td>None (point only)</td>
+        <td>None (univariate)</td>
+        <td>Per-route or global</td>
+        <td>Fast</td>
+        <td>OSS</td>
+        <td>Rejected</td>
+      </tr>
+      <tr class="row-rejected">
+        <td>PatchTST / iTransformer</td>
+        <td>~6.5% est.</td>
+        <td>Poor without pretraining</td>
+        <td>Not native</td>
+        <td>Limited</td>
+        <td>Single artifact</td>
+        <td>Medium</td>
+        <td>OSS</td>
+        <td>Rejected</td>
+      </tr>
+      <tr class="row-rejected">
+        <td>Chronos (Amazon foundation)</td>
+        <td>10.6%</td>
+        <td>Good (foundation prior)</td>
+        <td>Sampled, decent</td>
+        <td><strong>None</strong> &mdash; covariate API missing</td>
+        <td>200 M / 710 M / 2.7 B variants</td>
+        <td>Slow at 2.7 B</td>
+        <td>Apache-2.0</td>
+        <td>Blocked on covariates</td>
+      </tr>
+      <tr class="row-rejected">
+        <td>Lag-Llama (Morgan Stanley)</td>
+        <td>11.0%</td>
+        <td>Good</td>
+        <td>Decent</td>
+        <td>Lag-based, weak future-known support</td>
+        <td>2.4 B</td>
+        <td>Slow</td>
+        <td>Apache-2.0</td>
+        <td>Rejected</td>
+      </tr>
+      <tr class="row-chosen">
+        <td>TimesFM 2.5</td>
+        <td>5.1% (with our fine-tune)</td>
+        <td>Excellent (foundation prior)</td>
+        <td>10-quantile head, monotonic</td>
+        <td><code>forecast_with_covariates()</code></td>
+        <td>200 M, 800 MB on disk</td>
+        <td>6 ms per OD-pair</td>
+        <td>Apache-2.0</td>
+        <td><strong>Chosen</strong></td>
+      </tr>
+      <tr class="row-rejected">
+        <td>GPT-4 / Claude with tool calls</td>
+        <td>n/a (wrong tool)</td>
+        <td>Not a forecaster</td>
+        <td>None</td>
+        <td>Via prompt only</td>
+        <td>Cloud API</td>
+        <td>seconds/call</td>
+        <td>Closed</td>
+        <td>Rejected</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Why TimesFM and not Chronos (the closest competitor)</h2>
+  <p>
+    Chronos was the most painful "no" because the model is genuinely good. Three reasons
+    we picked TimesFM:
+  </p>
+  <ol>
+    <li><strong>Native covariate API.</strong> Chronos forecasts univariate; if you want covariates you have to bolt on your own residual regression. TimesFM ships <code>forecast_with_covariates()</code> with the regression layer baked in. Saves us building and maintaining an ad-hoc XReg layer.</li>
+    <li><strong>Quantile head architecture.</strong> Chronos uses sampling-based quantiles (run K samples, take percentiles) which is K&times; slower at inference and badly calibrated in the tails. TimesFM has a deterministic quantile head with optional <code>fix_quantile_crossing=True</code>.</li>
+    <li><strong>Smaller wins on inference cost.</strong> Chronos ships 200 M / 710 M / 2.7 B variants. The 200 M variant matches TimesFM&apos;s footprint but underperforms on accuracy; the 710 M variant matches accuracy but at 3.5&times; the inference cost. TimesFM 2.5 200 M is the Pareto winner.</li>
+  </ol>
+
+  <h2>Why not just stay with ARIMAX (the lazy answer)</h2>
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>Reasons ARIMAX is appealing</h4>
+      <ul>
+        <li>Already in production; team knows it.</li>
+        <li>Coefficients are interpretable.</li>
+        <li>Fast per-OD-pair inference.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Why we replaced it anyway</h4>
+      <ul>
+        <li>~28% of OD-pairs have &lt;90 days stable history; ARIMAX cold-starts to a global mean &mdash; bad for new routes / re-timed seasonals.</li>
+        <li>6,700 model artifacts in the registry; impossible to monitor or audit.</li>
+        <li>Bootstrap PIs are ~80% miscalibrated in production; coverage was 71% (vs 80% target).</li>
+        <li>Q4 holiday MAPE was 14% &mdash; the per-route ARIMAX never sees enough Thanksgivings to fit the holiday term well.</li>
+        <li>Adding a new covariate requires re-fitting all 6,700 models. Operational nightmare.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Why not GPT-style LLM with tool use?</h2>
+  <p>
+    A surprisingly common interview suggestion. Short answer: <strong>it is the wrong
+    architecture for time-series.</strong> Long answer:
+  </p>
+  <ul>
+    <li>Tokenization of real-valued series via digit-by-digit (Chronos-style) or quantile-binning is lossy; LLMs don&apos;t know what "$312.47" is, they see characters.</li>
+    <li>Calibration is essentially absent &mdash; LLMs do not produce probability distributions over real numbers.</li>
+    <li>Inference cost is 100&ndash;1000&times; foundation TS models per call.</li>
+    <li>Tool-use orchestration (e.g., agent calls Prophet, then aggregates) just hides a smaller model inside a bigger system &mdash; you might as well call the smaller model directly.</li>
+  </ul>
+  <div class="insight">
+    <strong>Interview hook:</strong> This is the question every senior interviewer asks. The
+    framing they want: "right tool for the right scale of problem." LLMs are great at
+    sequence modelling over discrete tokens; time series foundation models are great at
+    sequence modelling over continuous patches. They are different families with different
+    inductive biases.
+  </div>
+
+  <h2>Decision criteria, weighted</h2>
+  <p>How I scored the candidates. Weights are AA-team-specific, not universal.</p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Criterion</th><th>Weight</th><th>Why this weight</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Cold-start handling</td><td>25%</td><td>28% of inventory has &lt;90 d history; the legacy system fails here</td></tr>
+      <tr><td>Calibrated quantiles</td><td>20%</td><td>The C++ optimizer requires q10/q90 with monotonicity guarantee</td></tr>
+      <tr><td>Covariate API</td><td>20%</td><td>8 dynamic + 3 static covariates is the project&apos;s core differentiator</td></tr>
+      <tr><td>Operational simplicity</td><td>15%</td><td>One artifact vs 6,700; auditability for compliance</td></tr>
+      <tr><td>Inference cost</td><td>10%</td><td>Nightly batch must complete in &lt;90 s on one A10G</td></tr>
+      <tr><td>License + community</td><td>5%</td><td>Apache-2.0 is required by AA legal for commercial use</td></tr>
+      <tr><td>MAPE point estimate</td><td>5%</td><td>Lower weight than expected &mdash; calibration matters more than median accuracy</td></tr>
+    </tbody>
+  </table>
+
+  <div class="insight">
+    <strong>Insight worth remembering:</strong> point-MAPE is over-emphasized in academic
+    papers and under-emphasized by RMS optimizers. The optimizer needs <em>distributions</em>,
+    not means. A model with 6.0% MAPE and well-calibrated 80% PI is better than a model
+    with 5.5% MAPE and 65% coverage on the same band &mdash; the second model would burn
+    revenue when the optimizer trusted bid-prices that were over-confident.
+  </div>
+
+  <h2>Risks I called out at decision time</h2>
+  <ul>
+    <li><strong>Foundation-model lock-in to Google.</strong> Mitigation: Chronos is a credible second source; our XReg head + LoRA layer is portable.</li>
+    <li><strong>License changes.</strong> Apache-2.0 today, but Google could relicense future versions. Mitigation: pin the 2.5 weights at the version we ship; do not auto-upgrade.</li>
+    <li><strong>Calibration drift after fine-tune.</strong> Mitigation: held-out calibration check in CI; coverage is a release gate.</li>
+    <li><strong>Distributional shift on COVID-style regimes.</strong> Mitigation: train data excludes COVID; production monitor will page on coverage drop &gt; 5 pp.</li>
+  </ul>
+
+  <h2>What I would do differently</h2>
+  <ul>
+    <li>Run Chronos+XReg-myself ablation in week 1, not "trust vendor benchmarks". Two models from the same family of architectures might actually behave very differently on AA data.</li>
+    <li>Include a parametric-output baseline (e.g., DeepAR with negative-binomial likelihood) in the matrix; I dropped it for time and would re-add it next time as a calibration sanity check.</li>
+  </ul>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Why did you pick a foundation model over a per-route specialized model?</div>
+        <div class="a">28% of our OD-inventory has &lt;90 days stable history. Per-route fits cold-start to a global mean and bleed Q4 revenue. A foundation model has an implicit prior from 100B time-series points that gives reasonable forecasts on day-1 of a new OD-pair. We capture the AA-specific patterns through cheap fine-tuning (XReg head + LoRA), so we get the foundation prior <em>and</em> AA-specialization without giving up either.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you know TimesFM&apos;s 80% prediction intervals are actually calibrated?</div>
+        <div class="a">Two checks. (1) Held-out coverage on the val cohort: the fraction of actuals falling between q10 and q90 should be ~80%; ours is 79.3%. (2) Reliability diagram: predicted vs realized coverage at every quantile from 10% to 90%. Both are part of the CI gate &mdash; coverage outside [78%, 82%] blocks the model release. We also sanity-check holiday-day coverage separately because that&apos;s where calibration usually breaks.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Could you have just used XGBoost with engineered features instead?</div>
+        <div class="a">For point forecasts on routes with long history, XGBoost would do well &mdash; probably comparable point MAPE. Two reasons we did not: (a) probabilistic output requires quantile regression with K separate XGB models, expensive at scale and miscalibrated relative to a learned quantile head; (b) cold-start performance on new OD-pairs is poor &mdash; XGB has no cross-route prior unless we engineer one through embeddings, which is essentially re-implementing the foundation model badly.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What would change if you had only 100 OD-pairs instead of 6,700?</div>
+        <div class="a">Inverts most of the trade-offs. Per-route NBEATS or DeepAR becomes attractive because the operational cost of 100 artifacts is fine. Foundation-model overhead amortizes worse. I would still use TimesFM zero-shot as a baseline, but the fine-tuning ROI is not there at 100 series.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What is the upper bound on accuracy if you had unlimited budget?</div>
+        <div class="a">Honestly somewhere around 4.0&ndash;4.3% network MAPE. Full fine-tune of the trunk would get us to ~4.7% (we measured). Beyond that you would need (a) more covariates, especially booking-velocity features that are harder to feed without leakage, and (b) a hierarchical reconciliation layer so route forecasts sum coherently to network totals. The marginal cost of going from 5.1% to 4.0% is &gt;100&times; the cost of going from 10.2% to 5.1%, so I would not invest there until the easy wins on adjacent problems are exhausted.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Walk me through the one paragraph in the TimesFM paper that mattered most for your project.</div>
+        <div class="a">The patching section. TimesFM groups every 32 input points into a "patch" then runs causal attention over the patch sequence. The patch-level attention (a) reduces sequence length so 90-day context is 3 patches not 90 tokens, (b) makes the model robust to single-day spikes because the patch averages context, and (c) lets the output head emit a 128-step patch, so we get our 30-day horizon in one forward pass without autoregressive sampling. That last bit is what makes the inference cheap enough for AA.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="../index.html">
+      <div class="label">&larr; Back</div>
+      <div class="title">Portfolio home</div>
+    </a>
+    <a class="page-nav-item next" href="finetuning.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Fine-tuning strategy (LoRA vs full FT)</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>
