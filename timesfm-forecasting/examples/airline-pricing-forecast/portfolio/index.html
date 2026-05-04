@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AA Pricing Forecast with TimesFM &middot; Applied Scientist Portfolio</title>
+<meta name="description" content="End-to-end ML project: fine-tuning Google's TimesFM foundation model for American Airlines daily fare forecasting, with two-stage adapter training and 47x inference speedup." />
+<link rel="stylesheet" href="assets/css/style.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
+</head>
+<body>
+
+<!-- ============== HEADER ============== -->
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio &middot; End-to-end ML Project</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="https://github.com/google-research/timesfm" target="_blank" rel="noopener">TimesFM</a>
+      <a href="../README.md">Repo README</a>
+    </nav>
+  </div>
+</header>
+
+<!-- ============== TABS ============== -->
+<nav class="tabs container" role="tablist" aria-label="Portfolio sections">
+  <button class="tab active" data-tab="overview" role="tab">Overview</button>
+  <button class="tab" data-tab="role" role="tab">My Role</button>
+  <button class="tab" data-tab="timeline" role="tab">Timeline</button>
+  <button class="tab" data-tab="architecture" role="tab">Architecture</button>
+  <button class="tab" data-tab="finetuning" role="tab">Fine-Tuning</button>
+  <button class="tab" data-tab="inference" role="tab">Inference</button>
+  <button class="tab" data-tab="stories" role="tab">User Stories</button>
+  <button class="tab" data-tab="scenarios" role="tab">Scenarios</button>
+  <button class="tab" data-tab="dashboard" role="tab">Dashboard</button>
+</nav>
+
+<main class="container main-content">
+
+<!-- ============== OVERVIEW ============== -->
+<section class="panel active" id="overview" role="tabpanel">
+  <div class="hero">
+    <h1>End-to-end fine-tuning of a foundation model for AA daily-fare forecasting</h1>
+    <p class="lead">
+      Adapted Google&rsquo;s TimesFM 2.5 foundation model to American Airlines pricing data
+      through two cheap surgical fine-tuning surfaces &mdash; an XReg regression head and
+      per-route-family LoRA adapters &mdash; then optimized inference 47&times; to fit a single
+      A10G GPU and a $50/year cloud bill. Owned end-to-end as the Applied Scientist:
+      data, modeling, evaluation, deployment, and on-call.
+    </p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="#" data-tab-link="role">Read my role &rarr;</a>
+      <a class="btn" href="#" data-tab-link="dashboard">See the dashboards</a>
+    </div>
+  </div>
+
+  <h2>Headline numbers</h2>
+  <div class="kpi-grid">
+    <div class="kpi">
+      <div class="kpi-value">10.2% &rarr; 5.1%</div>
+      <div class="kpi-label">Network MAPE<br>(zero-shot &rarr; final)</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-value">47&times;</div>
+      <div class="kpi-label">Inference speedup<br>(280 ms &rarr; 6 ms / OD-pair)</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-value">~$7</div>
+      <div class="kpi-label">Quarterly retrain<br>compute cost</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-value">~$48M</div>
+      <div class="kpi-label">Estimated annual<br>revenue lift</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-value">41 s</div>
+      <div class="kpi-label">Nightly batch wall time<br>for 6,700 OD-pairs</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-value">16 weeks</div>
+      <div class="kpi-label">Discovery &rarr; full network<br>rollout</div>
+    </div>
+  </div>
+
+  <h2>What it does</h2>
+  <ul class="feature-list">
+    <li><strong>Forecasts daily average fare</strong> for 6,700 AA OD-pairs over a 30-day horizon, conditioned on 8 dynamic + 3 static covariates.</li>
+    <li><strong>Returns calibrated quantiles</strong> (q10, q90) so the C++ bid-price optimizer can do risk-aware inventory decisions.</li>
+    <li><strong>Trained without continued pretraining</strong> &mdash; AA has no budget for that &mdash; using only XReg head fine-tuning and LoRA adapters.</li>
+    <li><strong>Hot-swaps LoRA adapters per route family</strong> in &lt;10 ms with pinned-memory state-dict updates.</li>
+    <li><strong>Falls back gracefully</strong> when an adapter fails: head-only forecast, no service degradation.</li>
+    <li><strong>Self-monitoring</strong> &mdash; PI coverage drift on top-50 routes pages me at 2 a.m. with a one-command rollback path.</li>
+  </ul>
+
+  <h2>Tech stack</h2>
+  <div class="stack-grid">
+    <span class="stack-tag">Python 3.11</span>
+    <span class="stack-tag">PyTorch 2.x</span>
+    <span class="stack-tag">TimesFM 2.5</span>
+    <span class="stack-tag">LoRA (PEFT)</span>
+    <span class="stack-tag">torch.compile</span>
+    <span class="stack-tag">BF16 mixed precision</span>
+    <span class="stack-tag">Airflow</span>
+    <span class="stack-tag">S3 + Parquet</span>
+    <span class="stack-tag">Redis cache</span>
+    <span class="stack-tag">Datadog</span>
+    <span class="stack-tag">PagerDuty</span>
+    <span class="stack-tag">cosign</span>
+    <span class="stack-tag">DataHub</span>
+    <span class="stack-tag">A10G spot</span>
+  </div>
+</section>
+
+<!-- ============== MY ROLE ============== -->
+<section class="panel" id="role" role="tabpanel">
+  <h1>My role: Applied Scientist who shipped end-to-end ML</h1>
+  <p class="lead">
+    Officially I am an Applied Scientist on the AA Revenue Management AI team.
+    The job description is &ldquo;design models, write papers, hand the code to ML
+    Engineering.&rdquo; For this project the ML Engineering org was headcount-constrained,
+    so the team lead asked me to own the entire lifecycle. Here is how my
+    responsibilities expanded.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>Phase</th>
+          <th>&ldquo;Applied Scientist&rdquo; job</th>
+          <th>&ldquo;ML Engineer&rdquo; job I picked up</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Data</strong></td>
+          <td>Pull a clean sample, profile distributions</td>
+          <td>Build the production extract job, schema-version the feature store</td>
+        </tr>
+        <tr>
+          <td><strong>Model</strong></td>
+          <td>Pick the right architecture, write the loss</td>
+          <td>Containerize, version artifacts, sign safetensors</td>
+        </tr>
+        <tr>
+          <td><strong>Eval</strong></td>
+          <td>MAPE / coverage in a notebook</td>
+          <td>Reusable eval module, CI gate, calibration drift dashboard</td>
+        </tr>
+        <tr>
+          <td><strong>Inference</strong></td>
+          <td>Verify accuracy on a held-out slice</td>
+          <td>BF16 + <code>torch.compile</code> + LoRA hot-swap; hit the latency SLO</td>
+        </tr>
+        <tr>
+          <td><strong>Deploy</strong></td>
+          <td>Email a notebook</td>
+          <td>Canary &rarr; 5% &rarr; 25% &rarr; full, with auto-rollback</td>
+        </tr>
+        <tr>
+          <td><strong>Monitor</strong></td>
+          <td>Look at residuals on Friday</td>
+          <td>Coverage drift alerts paging me at 2 a.m.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Five things I learned that I would not have learned writing papers</h2>
+  <div class="lesson-grid">
+    <div class="lesson">
+      <div class="lesson-num">1</div>
+      <h3>Treat eval, data, training as code</h3>
+      <p>Tested, reviewed, versioned. Not artifacts of a research process &mdash; deliverables in their own right. Every metric I reported had a unit test for the math.</p>
+    </div>
+    <div class="lesson">
+      <div class="lesson-num">2</div>
+      <h3>Optimize for 2 a.m. failure modes</h3>
+      <p>Idempotency, backfill, retries, signed artifacts, runbook, rollback. Stuff with zero presence in a paper but every presence on-call.</p>
+    </div>
+    <div class="lesson">
+      <div class="lesson-num">3</div>
+      <h3>Build trust through reproducibility</h3>
+      <p>Every number came with a notebook and a frozen dataset hash. When the Director asked &ldquo;what changes if we exclude COVID?&rdquo; I answered in an hour, not a week.</p>
+    </div>
+    <div class="lesson">
+      <div class="lesson-num">4</div>
+      <h3>Negotiate scope ruthlessly</h3>
+      <p>v1 had 8 covariates, not 47. v1 had 200 routes with LoRA, not all 6,700. v1 was nightly batch, not real-time. Each cut was a fight; each was right for the timeline.</p>
+    </div>
+    <div class="lesson">
+      <div class="lesson-num">5</div>
+      <h3>Own the boring MLOps</h3>
+      <p>The CI gate, rollback command, runbook, alerts &mdash; where the project would have died if I&rsquo;d waited for ML Engineering. I picked them up because nobody else would.</p>
+    </div>
+  </div>
+
+  <blockquote class="callout">
+    The boundary between Applied Scientist and ML Engineer is artificial.
+    The real boundary is between &ldquo;work that ends in a notebook&rdquo; and &ldquo;work
+    that ends in a system another human can rely on.&rdquo;
+  </blockquote>
+
+  <p class="see-also">
+    &rarr; Full narrative in <a href="../user_stories.md">user_stories.md</a> with one
+    story per epic and the artifact shipped at each step.
+  </p>
+</section>
+
+<!-- ============== TIMELINE ============== -->
+<section class="panel" id="timeline" role="tabpanel">
+  <h1>16-week project timeline</h1>
+  <p class="lead">Eight two-week sprints, each with an exit gate. The project shipped on schedule, 100% network rollout in week 16.</p>
+
+  <div class="gantt">
+    <div class="gantt-header">
+      <div class="gantt-label-col">Sprint</div>
+      <div class="gantt-weeks">
+        <span>W1</span><span>W2</span><span>W3</span><span>W4</span>
+        <span>W5</span><span>W6</span><span>W7</span><span>W8</span>
+        <span>W9</span><span>W10</span><span>W11</span><span>W12</span>
+        <span>W13</span><span>W14</span><span>W15</span><span>W16</span>
+      </div>
+    </div>
+    <div class="gantt-row"><div class="gantt-label">Discovery</div><div class="gantt-bar" style="--start:0;--span:2;--color:#0078d2">S1</div></div>
+    <div class="gantt-row"><div class="gantt-label">Data + Eval Harness</div><div class="gantt-bar" style="--start:2;--span:2;--color:#0e7490">S2</div></div>
+    <div class="gantt-row"><div class="gantt-label">Zero-shot Baseline</div><div class="gantt-bar" style="--start:4;--span:2;--color:#22c55e">S3</div></div>
+    <div class="gantt-row"><div class="gantt-label">XReg Head Fine-tune</div><div class="gantt-bar" style="--start:6;--span:2;--color:#a855f7">S4</div></div>
+    <div class="gantt-row"><div class="gantt-label">LoRA Adapters</div><div class="gantt-bar" style="--start:8;--span:2;--color:#a855f7">S5</div></div>
+    <div class="gantt-row"><div class="gantt-label">Inference Optimization</div><div class="gantt-bar" style="--start:10;--span:2;--color:#f59e0b">S6</div></div>
+    <div class="gantt-row"><div class="gantt-label">Canary</div><div class="gantt-bar" style="--start:12;--span:2;--color:#c8102e">S7</div></div>
+    <div class="gantt-row"><div class="gantt-label">Full Rollout</div><div class="gantt-bar" style="--start:14;--span:2;--color:#c8102e">S8</div></div>
+  </div>
+
+  <h2>Sprint deliverables</h2>
+  <div class="sprint-list">
+    <div class="sprint-card"><h3>Sprint 1 &middot; Discovery</h3><p>Memo + go/no-go with Director sign-off. 50 OD-pair zero-shot baseline.</p></div>
+    <div class="sprint-card"><h3>Sprint 2 &middot; Data + Eval</h3><p>Airflow DAG, eval module, CI gate, 24-month backfill.</p></div>
+    <div class="sprint-card"><h3>Sprint 3 &middot; Zero-shot Baseline</h3><p>10.2% MAPE on full 3,500-pair val cohort. Per-family breakdowns.</p></div>
+    <div class="sprint-card"><h3>Sprint 4 &middot; XReg Head</h3><p>6.0% MAPE. Coefficients sanity-checked. <code>aa-timesfm-xreg-v1</code> signed.</p></div>
+    <div class="sprint-card"><h3>Sprint 5 &middot; LoRA Adapters</h3><p>17 of 20 families pass. 5.1% network MAPE. Pinned-memory hot-swap.</p></div>
+    <div class="sprint-card"><h3>Sprint 6 &middot; Inference</h3><p>41 s wall time. p99 14 ms. Cost $0.011/run. Profiler-driven.</p></div>
+    <div class="sprint-card"><h3>Sprint 7 &middot; Canary</h3><p>5 OD-pairs shadow &rarr; 5%. Director sign-off. Synthetic on-call drill 6m12s.</p></div>
+    <div class="sprint-card"><h3>Sprint 8 &middot; Rollout</h3><p>5% &rarr; 25% &rarr; 50% &rarr; 75% &rarr; 100%. SLOs held. ~$48M annual lift validated.</p></div>
+  </div>
+
+  <h2>What I would do differently</h2>
+  <ol class="retro-list">
+    <li>Sprint 2 was too short &mdash; eval harness deserved 3 weeks.</li>
+    <li>Started weekly directors update too late (Sprint 5; should have been Sprint 1).</li>
+    <li>Synthetic on-call drill in Sprint 7; should have done a paper drill in Sprint 4.</li>
+    <li>Shipped 17 LoRA adapters; bottom 5 contributed almost nothing &mdash; could have shipped 12 and saved a week.</li>
+  </ol>
+
+  <p class="see-also">&rarr; Full timeline in <a href="../timeline.md">timeline.md</a>.</p>
+</section>
+
+<!-- ============== ARCHITECTURE ============== -->
+<section class="panel" id="architecture" role="tabpanel">
+  <h1>TimesFM 2.5 architecture, AA-flavored</h1>
+  <p class="lead">200M-parameter decoder-only transformer trained on 100B time-series points by Google. Here is how I plug AA pricing into it.</p>
+
+  <h2>The pipeline, top to bottom</h2>
+  <div class="pipeline">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><h3>Patching</h3><p>90 daily fares &rarr; 3 patches of 32 points each. Mask-aware; padding flags ride alongside.</p></div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><h3>Input residual MLP</h3><p>Per-patch z-normalization + 2-layer MLP &rarr; 1280-d patch embedding. <code>normalize_inputs=True</code> for AA: fares range $80&ndash;$11,000.</p></div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><h3>Transformer trunk (20 blocks)</h3><p>Causal self-attention with RoPE, SwiGLU FFN, pre-LayerNorm. Frozen for AA &mdash; no continued pretraining.</p></div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><h3>Output head</h3><p>128-step patch + 10-quantile head. <code>fix_quantile_crossing=True</code> &mdash; the C++ optimizer requires monotonic quantiles.</p></div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><h3>XReg layer (AA fine-tuned)</h3><p>Regression on residuals: <code>final = TimesFM_baseline + XReg(future_covariates)</code>. This is where AA-specific elasticities live.</p></div></div>
+    <div class="step"><div class="step-num">6</div><div class="step-body"><h3>LoRA adapter (per route family)</h3><p>Rank-8 adapters on attention Q/K/V/O projections. Hot-swapped per family in &lt;10 ms.</p></div></div>
+  </div>
+
+  <h2>The exact ForecastConfig AA uses</h2>
+<pre><code>cfg = timesfm.ForecastConfig(
+    max_context=90,                        # one quarter of daily fares
+    max_horizon=30,                        # 30-day RMS window
+    normalize_inputs=True,                 # fares range $80 - $11,000
+    per_core_batch_size=64,                # tuned for A10G
+    use_continuous_quantile_head=True,     # better long-horizon calibration
+    force_flip_invariance=True,            # f(-x) = -f(x)
+    infer_is_positive=True,                # fares strictly positive
+    fix_quantile_crossing=True,            # required for the optimizer
+    return_backcast=False,                 # AA does not need backcast
+)</code></pre>
+
+  <p class="caption">Each flag ties to a specific failure I hit in production backtests. Full incident history in <a href="../model_architecture.md">model_architecture.md</a>.</p>
+
+  <h2>Covariate taxonomy</h2>
+  <div class="covar-grid">
+    <div class="covar-card">
+      <h4>Dynamic numerical (4)</h4>
+      <ul>
+        <li><code>jet_fuel_usd_gal</code></li>
+        <li><code>competitor_fare</code></li>
+        <li><code>days_to_departure</code></li>
+        <li><code>load_factor_lag</code></li>
+      </ul>
+    </div>
+    <div class="covar-card">
+      <h4>Dynamic categorical (4)</h4>
+      <ul>
+        <li><code>holiday_flag</code></li>
+        <li><code>day_of_week</code></li>
+        <li><code>school_break</code></li>
+        <li><code>weather_disruption</code></li>
+      </ul>
+    </div>
+    <div class="covar-card">
+      <h4>Static categorical (3)</h4>
+      <ul>
+        <li><code>route_type</code></li>
+        <li><code>cabin</code></li>
+        <li><code>equipment</code></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============== FINE-TUNING ============== -->
+<section class="panel" id="finetuning" role="tabpanel">
+  <h1>Fine-tuning &mdash; cheap, surgical, no pretraining</h1>
+  <p class="lead">
+    AA does not have a continued-pretraining budget. The Google base weights stay
+    frozen. Fine-tuning happens on two cheap surfaces: the XReg regression head
+    (~40 min, $0.70) and per-route-family LoRA adapters (~6 hours total, $6.50).
+    Total quarterly compute: <strong>~$7</strong>.
+  </p>
+
+  <h2>MAPE progression</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-mape-progression"></canvas>
+  </div>
+  <p class="caption">Each fine-tuning stage cuts validation MAPE. Going past LoRA rank-8 to full fine-tune would cost ~$45K to capture the last 0.4 pp &mdash; not defensible.</p>
+
+  <h2>Compute cost per stage</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-cost-comparison"></canvas>
+  </div>
+  <p class="caption">Two-stage path captures &gt;85% of achievable gain at &lt;1% of full fine-tune cost.</p>
+
+  <h2>The two stages</h2>
+  <div class="stage-grid">
+    <div class="stage-card">
+      <h3>Stage A &mdash; XReg head</h3>
+      <ul>
+        <li>Trunk frozen; only the regression head trains.</li>
+        <li>Pinball loss across 10 quantiles + median MSE.</li>
+        <li>~250K windows, 3 epochs, ~40 min on 1&times;A10G.</li>
+        <li>Output: ~1.2 MB safetensors file.</li>
+        <li><strong>Result:</strong> 10.2% &rarr; 6.0% MAPE.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Stage B &mdash; LoRA adapters</h3>
+      <ul>
+        <li>Rank-8 LoRA on attention Q/K/V/O.</li>
+        <li>One adapter per route family (20 families).</li>
+        <li>~50K windows per family, ~6 min each.</li>
+        <li>Output: 17 of 20 ship; 3 fall back to head-only.</li>
+        <li><strong>Result:</strong> 6.0% &rarr; 5.1% MAPE.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Per-family LoRA pass/fail</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-lora-perfamily"></canvas>
+  </div>
+  <p class="caption">Families that did not improve by &ge;0.5 pp MAPE fall back to head-only forecast. No service degradation.</p>
+
+  <p class="see-also">&rarr; Full recipe + retraining cadence in <a href="../finetuning_aa_data.md">finetuning_aa_data.md</a>.</p>
+</section>
+
+<!-- ============== INFERENCE ============== -->
+<section class="panel" id="inference" role="tabpanel">
+  <h1>Inference optimization &mdash; 280 ms &rarr; 6 ms</h1>
+  <p class="lead">
+    47&times; speedup, layer by layer. Each optimization is independently
+    rollback-able. Full nightly batch over 6,700 OD-pairs runs in 41 seconds
+    on a single A10G spot instance, $0.011 per run.
+  </p>
+
+  <h2>Latency by configuration</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-inference-latency"></canvas>
+  </div>
+  <p class="caption">Each row is a separate change. Batching alone got 80% of the win &mdash; the rest was cleanup.</p>
+
+  <h2>Throughput vs cost</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-throughput-cost"></canvas>
+  </div>
+  <p class="caption">Right-axis cost per nightly run; left-axis throughput. The optimization budget is in dollars, not seconds.</p>
+
+  <h2>What I tried that did NOT work</h2>
+  <ul class="dead-end-list">
+    <li><strong>INT8 dynamic quantization.</strong> 4 ms latency, but 80% PI coverage dropped to 73%. Bid-price-grade quantiles couldn&rsquo;t take the precision hit. Dropped.</li>
+    <li><strong>ONNX + TensorRT.</strong> 5% kernel-coverage gap fell back to CUDA, eliminating the speedup. With <code>torch.compile</code> already at 6 ms, not worth the operational complexity.</li>
+    <li><strong>Speculative decoding.</strong> TimesFM&rsquo;s output patches are 128 steps; only 30 are kept. Speculation overhead exceeded savings.</li>
+    <li><strong>Multi-GPU sharding.</strong> 1.6&times; speedup at 2&times; cost. Doubling cost to halve a 41-second job is bad business.</li>
+  </ul>
+
+  <h2>End-to-end nightly timeline</h2>
+  <table class="timeline-table">
+    <thead><tr><th>Step</th><th>Duration</th><th>Cumulative</th></tr></thead>
+    <tbody>
+      <tr><td>Spin A10G spot, attach EFS</td><td>30 s</td><td>02:00:30</td></tr>
+      <tr><td>Load base + head + 17 LoRA &rarr; pinned mem</td><td>6 s</td><td>02:00:36</td></tr>
+      <tr><td><code>torch.compile</code> warm-up (one batch)</td><td>12 s</td><td>02:00:48</td></tr>
+      <tr><td>Score 6,700 OD-pairs (105 batches of 64)</td><td>41 s</td><td>02:01:29</td></tr>
+      <tr><td>Write to feature store</td><td>8 s</td><td>02:01:37</td></tr>
+      <tr><td>Dispatch metrics &rarr; Datadog</td><td>2 s</td><td>02:01:39</td></tr>
+      <tr><td>Spot release</td><td>1 s</td><td><strong>02:01:40</strong></td></tr>
+    </tbody>
+  </table>
+  <p class="caption">Total wall time: 1 m 40 s. Cost: $0.011 per run. Annualized: &lt;$50/year.</p>
+
+  <p class="see-also">&rarr; Full breakdown of every optimization in <a href="../inference_optimization.md">inference_optimization.md</a>.</p>
+</section>
+
+<!-- ============== USER STORIES ============== -->
+<section class="panel" id="stories" role="tabpanel">
+  <h1>User stories &mdash; one per epic</h1>
+  <p class="lead">
+    The work I did, in the format I would have written it as Jira tickets for
+    myself. Each story has the &ldquo;Applied Scientist&rdquo; framing, the
+    acceptance criteria I held myself to, and the ML-Engineer skill I had to
+    pick up to ship it.
+  </p>
+
+  <div class="story-grid">
+    <article class="story">
+      <div class="story-tag">Sprint 1</div>
+      <h3>Make the case for a foundation model</h3>
+      <p><em>As an Applied Scientist, I want to quantify how much accuracy we leave on the table with the per-route ARIMAX baseline so I can justify (or kill) a foundation-model approach before we spend a quarter on it.</em></p>
+      <div class="story-pickup"><strong>ML-Eng skill picked up:</strong> reproducible notebooks with pinned env, data hash, seed control. Future-me would re-run this every quarter.</div>
+    </article>
+
+    <article class="story">
+      <div class="story-tag">Sprint 2</div>
+      <h3>Stand up a production-grade extract job</h3>
+      <p><em>As an Applied Scientist, I want a daily 03:00 CST job that lands a feature-engineered panel in S3, so model training and nightly inference both read from one source of truth.</em></p>
+      <div class="story-pickup"><strong>ML-Eng skill picked up:</strong> Airflow DAGs that survive on-call. Broke prod twice on day-2 retries before figuring out poll-with-backoff.</div>
+    </article>
+
+    <article class="story">
+      <div class="story-tag">Sprint 2</div>
+      <h3>Build the evaluation harness</h3>
+      <p><em>As an Applied Scientist, I want a reusable evaluation module that any new model checkpoint can plug into, so experiments are comparable and the eval is the same in CI as on my laptop.</em></p>
+      <div class="story-pickup"><strong>ML-Eng skill picked up:</strong> treating eval as code. Every metric I report has a unit test for the math.</div>
+    </article>
+
+    <article class="story">
+      <div class="story-tag">Sprint 3</div>
+      <h3>Establish the zero-shot baseline</h3>
+      <p><em>As an Applied Scientist, I want to measure TimesFM 2.5 zero-shot on the full AA panel, so every later improvement is grounded against a real number.</em></p>
+      <div class="story-pickup"><strong>ML-Eng skill picked up:</strong> running batch jobs at scale on a budget. First attempt cost $90 because I forgot to set <code>per_core_batch_size</code>.</div>
+    </article>
+
+    <article class="story">
+      <div class="story-tag">Sprint 4</div>
+      <h3>Fine-tune the XReg head on AA covariates</h3>
+      <p><em>As an Applied Scientist, I want to train a regression head that maps AA covariates to fare residuals so the foundation model can incorporate AA-specific elasticities.</em></p>
+      <div class="story-pickup"><strong>ML-Eng skill picked up:</strong> versioning model artifacts with cosign signatures tied to training-data hashes.</div>
+    </article>
+
+    <article class="story">
+      <div class="story-tag">Sprint 5</div>
+      <h3>Train per-route-family LoRA adapters</h3>
+      <p><em>As an Applied Scientist, I want to capture AA-specific cyclic patterns through cheap LoRA adapters, so I can squeeze out the last MAPE points without retraining the trunk.</em></p>
+      <div class="story-pickup"><strong>ML-Eng skill picked up:</strong> adapter loading protocol design. Pinned-memory hot-swap got me from 800 ms to 8 ms per swap.</div>
+    </article>
+
+    <article class="story">
+      <div class="story-tag">Sprint 6</div>
+      <h3>Hit the nightly batch SLO</h3>
+      <p><em>As an Applied Scientist (acting as ML Engineer), I want the nightly batch over 6,700 OD-pairs to complete in &lt;60s on a single A10G, so the C++ optimizer has fresh forecasts before 02:30 CST.</em></p>
+      <div class="story-pickup"><strong>ML-Eng skill picked up:</strong> PyTorch Profiler. Caught a stray FP32 kernel in my BF16 graph that would have eaten 30% of my throughput budget.</div>
+    </article>
+
+    <article class="story">
+      <div class="story-tag">Sprint 7</div>
+      <h3>Canary deploy to 5 OD-pairs</h3>
+      <p><em>As an Applied Scientist (acting as ML Engineer), I want to canary the foundation-model forecast on 5 low-revenue OD-pairs in shadow mode for 7 days, so I can compare it to ARIMAX without customer-facing risk.</em></p>
+      <div class="story-pickup"><strong>ML-Eng skill picked up:</strong> writing diff reports a director can read. First version was a 12-tab spreadsheet; final was a 1-page PDF with three charts.</div>
+    </article>
+
+    <article class="story">
+      <div class="story-tag">Sprint 7</div>
+      <h3>Wire production monitoring and rollback</h3>
+      <p><em>As an Applied Scientist (acting as ML Engineer), I want automatic alerts on coverage drift and a one-command rollback path, so I can be paged at 2 a.m. and have the service back to known-good in &lt;5 min.</em></p>
+      <div class="story-pickup"><strong>ML-Eng skill picked up:</strong> writing runbooks for half-asleep on-call engineers. Different audience than papers; same underlying knowledge.</div>
+    </article>
+
+    <article class="story">
+      <div class="story-tag">Sprint 8</div>
+      <h3>Full network rollout</h3>
+      <p><em>As an Applied Scientist (acting as ML Engineer), I want to ramp from 25% to 100% of OD-pairs over two weeks, so any unforeseen issues affect a small surface first.</em></p>
+      <div class="story-pickup"><strong>ML-Eng skill picked up:</strong> communication cadence. Weekly Director updates and biweekly VP updates &mdash; would have started both in Sprint 1 next time.</div>
+    </article>
+  </div>
+
+  <p class="see-also">&rarr; Full stories with acceptance criteria in <a href="../user_stories.md">user_stories.md</a>.</p>
+</section>
+
+<!-- ============== SCENARIOS ============== -->
+<section class="panel" id="scenarios" role="tabpanel">
+  <h1>Six pricing scenarios in production</h1>
+  <p class="lead">
+    The same <code>forecast_with_covariates()</code> call serves all six scenarios.
+    The difference between them is entirely in the covariate inputs and the
+    optimizer&rsquo;s policy &mdash; that is the point of the foundation-model approach.
+  </p>
+
+  <div class="scenario-grid">
+    <div class="scenario-card">
+      <div class="scenario-icon">🎄</div>
+      <h3>1. Thanksgiving rush</h3>
+      <p>Holiday flag pre-published; horizon spans Nov 26 &rarr; Dec 1. Forecast median jumps +$95, q90 widens to $525. Optimizer protects high-yield inventory; +$11M revenue across the network for the holiday week.</p>
+    </div>
+    <div class="scenario-card">
+      <div class="scenario-icon">⛽</div>
+      <h3>2. Fuel-price spike</h3>
+      <p>Brent up 9% Monday. <code>jet_fuel_usd_gal</code> covariate updates. XReg coefficient (+$11.4 per $1 fuel) lifts every OD-pair forecast. Off-cycle re-score job fires at 05:00 CST.</p>
+    </div>
+    <div class="scenario-card">
+      <div class="scenario-icon">📉</div>
+      <h3>3. Competitor undercut</h3>
+      <p>Delta drops fares on ATL-LAX at 06:14 a.m. CST. Competitor covariate updates for adjacent routes. Forecast for ORD-LAS shifts -$17 (0.85 elasticity); optimizer matches on leisure routes only.</p>
+    </div>
+    <div class="scenario-card">
+      <div class="scenario-icon">🌨️</div>
+      <h3>4. Weather irrops</h3>
+      <p>Winter storm at ORD for two days. <code>weather_disruption</code> flag flips to 1. Forecast drops -$22 on affected days only; surrounding days unaffected. Optimizer dumps low-class inventory.</p>
+    </div>
+    <div class="scenario-card">
+      <div class="scenario-icon">✈️</div>
+      <h3>5. New seasonal route launch</h3>
+      <p>JFK-PVG launches with zero history. Synthetic prior from analog routes (JFK-HKG, ORD-PVG) + AA covariates. Wide PI for first 14 days; tightens as real bookings come in.</p>
+    </div>
+    <div class="scenario-card">
+      <div class="scenario-icon">💺</div>
+      <h3>6. Cabin upsell forecast</h3>
+      <p>Premium economy on DFW-LAX. Static <code>cabin</code> covariate flips. Median ~2.6&times; main-cabin; PI much wider ($600 vs $135). Optimizer protects last-minute upsell inventory.</p>
+    </div>
+  </div>
+
+  <h2>Frequency of these scenarios</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-scenario-frequency"></canvas>
+  </div>
+  <p class="caption">Per-year frequency in real AA operations. Scenarios 2&ndash;4 trigger off-cycle re-scoring jobs; scenario 1 is built into the nightly run.</p>
+
+  <p class="see-also">&rarr; Full per-scenario walkthrough with covariate inputs and RMS responses in <a href="../scenarios.md">scenarios.md</a>.</p>
+</section>
+
+<!-- ============== DASHBOARD ============== -->
+<section class="panel" id="dashboard" role="tabpanel">
+  <h1>Production dashboard</h1>
+  <p class="lead">
+    The metrics I watch in production. All numbers are illustrative based on the synthetic example,
+    but the structure mirrors what would be on the real AA Datadog dashboard.
+  </p>
+
+  <h2>Coverage drift &mdash; rolling 30 days</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-coverage-drift"></canvas>
+  </div>
+  <p class="caption">80% PI coverage on top-50 OD-pairs. Target band [78%, 82%]. Page if rolling 7-day average dips below 75% on any family.</p>
+
+  <h2>Forecast vs actual &mdash; AA-DFW-LAX</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-forecast-actual"></canvas>
+  </div>
+  <p class="caption">Median forecast plus q10/q90 prediction intervals; actual fare overlaid. Synthetic data from <code>forecast_aa_pricing.py</code>.</p>
+
+  <h2>Per-route MAPE breakdown</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-per-route-mape"></canvas>
+  </div>
+  <p class="caption">MAPE by route family, comparing zero-shot vs head-only vs LoRA-adapted. Bottom-three families fall back to head-only because LoRA did not improve them by &ge;0.5 pp.</p>
+
+  <h2>SLOs at a glance</h2>
+  <table class="slo-table">
+    <thead><tr><th>SLO</th><th>Target</th><th>Last 7 days</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Nightly batch wall time</td><td>&lt; 90 s</td><td>41&ndash;47 s</td><td><span class="slo-pass">PASS</span></td></tr>
+      <tr><td>p99 per-OD latency</td><td>&lt; 25 ms</td><td>14 ms</td><td><span class="slo-pass">PASS</span></td></tr>
+      <tr><td>80% PI coverage (top-50)</td><td>78&ndash;82%</td><td>79.3%</td><td><span class="slo-pass">PASS</span></td></tr>
+      <tr><td>Cost per run</td><td>&lt; $0.10</td><td>$0.011</td><td><span class="slo-pass">PASS</span></td></tr>
+      <tr><td>LoRA swap failures</td><td>0</td><td>0</td><td><span class="slo-pass">PASS</span></td></tr>
+      <tr><td>Forecast freshness</td><td>&lt; 24 h</td><td>~6 h</td><td><span class="slo-pass">PASS</span></td></tr>
+    </tbody>
+  </table>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>
+      Built on top of the
+      <a href="https://github.com/google-research/timesfm" target="_blank" rel="noopener">TimesFM</a>
+      foundation model. Synthetic data only &mdash; no proprietary AA systems are
+      connected. American Airlines and AAdvantage are trademarks of American Airlines, Inc.;
+      use here is illustrative only.
+    </p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; fork this repo and host on GitHub Pages from this folder.</p>
+  </div>
+</footer>
+
+<script src="assets/js/app.js"></script>
+<script src="assets/js/charts.js"></script>
+</body>
+</html>

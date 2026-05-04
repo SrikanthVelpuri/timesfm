@@ -18,8 +18,12 @@ The folder is self-contained:
 | ---- | ------- |
 | [forecast_aa_pricing.py](forecast_aa_pricing.py) | Runnable script: synthetic AA panel, XReg API call, 2&times;2 plot |
 | [model_architecture.md](model_architecture.md) | How TimesFM works internally and why a foundation model fits pricing |
-| [finetuning_aa_data.md](finetuning_aa_data.md) | How AA would fine-tune TimesFM on its own RMS data |
-| [scenarios.md](scenarios.md) | Six end-to-end pricing scenarios with the engineers narrating |
+| [finetuning_aa_data.md](finetuning_aa_data.md) | Two-stage AA fine-tuning (XReg head + LoRA) &mdash; **no pretraining**, ~$7/quarter compute |
+| [inference_optimization.md](inference_optimization.md) | Layer-by-layer 47&times; speedup: batching, BF16, `torch.compile`, LoRA hot-swap |
+| [user_stories.md](user_stories.md) | **My Applied-Scientist-acting-as-ML-Engineer journey**, story-by-story |
+| [timeline.md](timeline.md) | 16-week sprint plan with deliverables, gates, retros |
+| [scenarios.md](scenarios.md) | Six end-to-end pricing scenarios |
+| [portfolio/](portfolio/) | **GitHub Pages dashboard site** &mdash; tabbed portfolio with interactive charts |
 | `output/` | Generated plot, panel CSV, metadata JSON (created on first run) |
 
 ---
@@ -189,31 +193,33 @@ sweep. (It can &mdash; ~3 GB GPU memory peak.)
 
 ## How TimesFM is finetuned to AA pricing data
 
-Out of the box TimesFM is **zero-shot**. AA can use it that way for the long
-tail. But for trunk routes (DFW-LAX, MIA-JFK, ORD-LAS, JFK-LHR &hellip;) Sarah
-wants to fine-tune so the model picks up AA-specific elasticities &mdash; for
-example, that DFW-LAX customers are 30% less price-sensitive than ORD-LAS
-customers because DFW-LAX is hub-corporate-dominated.
+> **Important reality.** AA has **no budget for continued pretraining**. The
+> Google base weights are frozen. Fine-tuning happens entirely on cheap,
+> surgical surfaces &mdash; the XReg regression head and per-family LoRA
+> adapters. Total quarterly compute cost: **~$7**.
 
 The full procedure is in [finetuning_aa_data.md](finetuning_aa_data.md). The
-short version:
+short version &mdash; two stages, both cheap:
 
-1. **Continued pretraining** on 5 years of AA daily fare history across all
-   OD-pairs, using the same next-token loss as the original TimesFM paper but
-   with AA&apos;s 50 GB tokenized panel.
-2. **XReg head fine-tuning** on the regression layer that consumes the
-   covariate stack (fuel, competitor, holiday, &hellip;) so the AA-specific
-   elasticities are learned end-to-end.
-3. **Per-route-family LoRA adapters** for the top 200 OD-pairs &mdash; rank-8
-   adapters that can be swapped at inference time without reloading the base
-   model.
+1. **XReg head fine-tuning** on the regression layer that consumes the
+   covariate stack (fuel, competitor, holiday, &hellip;). ~40 min on one
+   A10G; ~$0.70 per retrain.
+2. **Per-route-family LoRA adapters** for the top 200 OD-pairs &mdash; rank-8
+   adapters that hot-swap at inference time without reloading the base
+   model. 17 of 20 families ship; ~6 hours total compute; ~$6.50 per retrain.
 
-Marcus&apos;s contribution is the LoRA adapter registry: every adapter is a
-~4 MB safetensors file in S3 keyed by `route_family / training_date`. The
-nightly batch loads the base model once, then iterates over OD-pairs hot-
-swapping adapters in &lt;10 ms each. That&apos;s the kind of detail that does
-not appear in the model paper but determines whether the system works at AA
-scale.
+The MAPE progression captures the value of each stage:
+
+| Configuration | Val MAPE |
+| ------------- | -------- |
+| Zero-shot (Google base) | 10.2% |
+| + XReg head | 6.0% |
+| + LoRA rank-8 | **5.1%** |
+| Full fine-tune (rejected, budget) | 4.7% |
+
+Going from 5.1% to 4.7% would cost ~$45K and a quarter of engineering. Not
+defensible for AA scale. The two-stage path captures &gt;85% of the
+achievable gain at &lt;1% of the cost.
 
 ---
 
