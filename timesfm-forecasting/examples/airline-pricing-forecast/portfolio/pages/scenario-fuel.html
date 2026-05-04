@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Scenario: Fuel-Price Spike &middot; AA Pricing Forecast</title>
+<meta name="description" content="A 9% Brent crude opening forces the entire network to re-price. How TimesFM's fuel-pass-through coefficient, off-cycle re-scoring, and SLO-driven freshness handle the shock." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#scenarios">Scenarios</a> &nbsp;/&nbsp; <span>Fuel-price spike</span>
+  </nav>
+
+  <h1>Scenario 2 &mdash; The fuel-price spike</h1>
+  <p class="lead">
+    Brent crude opens up 9% on a Monday morning. Treasury&apos;s daily fuel curve rolls
+    forward at 04:30 CST. The whole AA network has to re-price before the call center
+    opens at 06:00 CST. Tight window, narrow tolerance, no room for the nightly batch&apos;s
+    02:00 CST snapshot to dictate today&apos;s fares.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> A 9% fuel jump translates to ~+$3.20 per OD-pair on hub routes
+    (sensitivity $12 per $1 of fuel). The off-cycle re-score job triggers at 05:00 CST when
+    fuel moves &gt;5%, finishes by 05:42, and overwrites the affected forecasts in the
+    feature store before 06:00. The optimizer holds back ~2% more low-class inventory
+    network-wide. Fuel pass-through is the cleanest covariate to validate: the fitted
+    coefficient (+$11.4 / $1 fuel) matches the OR team&apos;s independent calculation
+    within 5%.
+  </div>
+
+  <h2>Trigger</h2>
+  <p>
+    Monday 04:30 CST: Treasury&apos;s daily commodity feed publishes the new jet-fuel
+    curve. The 14-day forecast shows fuel rising from $2.85 to $3.12 over two weeks
+    before partial mean-reversion. The AA pricing team had already agreed: a &gt;5%
+    fuel move triggers the off-cycle re-score path.
+  </p>
+
+  <h2>Covariate inputs</h2>
+  <p>
+    Only one thing changes: the <code>jet_fuel_usd_gal</code> array shifts up across the
+    horizon. Holidays, competitor fares, DTD, weather all stay where they were when the
+    nightly batch ran at 02:00 CST.
+  </p>
+  <table class="decision-matrix">
+    <thead><tr><th>Day</th><th>Old fuel ($/gal)</th><th>New fuel ($/gal)</th><th>&Delta; fuel</th></tr></thead>
+    <tbody>
+      <tr><td>Today (D+0)</td><td>$2.85</td><td>$3.05</td><td>+$0.20</td></tr>
+      <tr><td>D+7</td><td>$2.86</td><td>$3.10</td><td>+$0.24</td></tr>
+      <tr><td>D+14</td><td>$2.87</td><td>$3.12</td><td>+$0.25</td></tr>
+      <tr><td>D+21</td><td>$2.88</td><td>$3.05</td><td>+$0.17</td></tr>
+      <tr><td>D+30</td><td>$2.89</td><td>$2.96</td><td>+$0.07</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Model behavior</h2>
+  <p>
+    TimesFM&apos;s baseline is unchanged &mdash; history is unchanged. The XReg head sees
+    the new fuel covariate, multiplies through the family-specific elasticity, and adds the
+    pass-through:
+  </p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Family</th><th>Fuel sensitivity ($/gal)</th><th>D+7 forecast adjustment</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>AA-DFW-LAX (domestic-hub)</td><td>$12.0 / $1</td><td>+$2.88</td></tr>
+      <tr><td>AA-MIA-JFK (leisure-hub)</td><td>$9.0 / $1</td><td>+$2.16</td></tr>
+      <tr><td>AA-ORD-LAS (event-leisure)</td><td>$10.0 / $1</td><td>+$2.40</td></tr>
+      <tr><td>AA-LAX-LHR (transatlantic)</td><td>$22.0 / $1 (longer-haul, more fuel)</td><td>+$5.28</td></tr>
+    </tbody>
+  </table>
+  <p>
+    These are small absolute moves but they apply to all 6,700 OD-pairs simultaneously.
+    Across the network the daily revenue impact is in the hundreds of thousands of dollars.
+    Fuel sensitivity is highest on long-haul routes where fuel is a larger fraction of
+    operating cost.
+  </p>
+
+  <h2>The off-cycle re-score path</h2>
+  <p>
+    The nightly batch at 02:00 CST snapshotted the forecast with fuel = $2.85. At 04:30
+    Treasury says fuel = $3.05. The mismatch must be reconciled before customers see
+    fares.
+  </p>
+  <pre><code># Triggered automatically by the freshness watchdog
+# at 05:00 CST when |fuel_new - fuel_snapshot| / fuel_snapshot &gt; 0.05
+
+aa_pricing_cli rescore \
+    --reason fuel_shift \
+    --fuel-curve s3://aa-rms/fuel/2025-11-04.parquet \
+    --routes all \
+    --out s3://aa-rms/forecasts/2025-11-04-rescored
+
+# Internally:
+#   1. Load resident model (already in pinned memory).
+#   2. Pull last night&apos;s context + the new fuel curve.
+#   3. Re-run forecast_with_covariates() for all 6,700 OD-pairs.
+#   4. Write ONLY the changed forecasts back to the feature store
+#      (idempotent overwrite, partitioned by run-id).
+#   5. Log the re-score event with cause and operator to BigQuery.
+
+# Total wall time: ~42 seconds (same as nightly).
+# Cost: $0.011.</code></pre>
+
+  <h2>Trade-offs</h2>
+  <h3>Threshold for triggering re-score</h3>
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>Lower threshold (e.g., 2%)</h4>
+      <ul>
+        <li>Fresher forecasts, smaller staleness window.</li>
+        <li>Captures small intraday moves more often.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Lower threshold (downside)</h4>
+      <ul>
+        <li>More frequent re-runs (~5/day at 2% vs ~10/year at 5%).</li>
+        <li>Each re-run costs ~$0.011, low individual cost but adds up.</li>
+        <li>Operationally noisy &mdash; alerts harder to triage.</li>
+        <li>Below 2% the elasticity-driven fare delta is &lt;$0.50 &mdash; below optimizer rounding.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Why we chose 5%</h3>
+  <p>
+    Empirically: a 5% fuel move on the most fuel-sensitive route (long-haul, $22/$1)
+    moves the median fare by $1.10 &mdash; the smallest delta the optimizer&apos;s
+    bid-price discretization can resolve. Below 5%, the re-run produces a forecast that
+    rounds to the same bid-price as the previous one. So we trigger above the noise
+    floor and not below.
+  </p>
+
+  <h2>Where this could fail</h2>
+  <ol>
+    <li><strong>Treasury feed is late.</strong> If the 04:30 update misses the SLA, we run on stale fuel data. Mitigation: feature freshness watchdog pages the data team if any feed is &gt;6 h old.</li>
+    <li><strong>Fuel sensitivity coefficient is wrong.</strong> If the XReg head over-fit on a fuel-stable training period, real-world spikes pass through too aggressively. Mitigation: the coefficient is sanity-checked against the OR team&apos;s independent bottom-up cost calculation every quarter.</li>
+    <li><strong>Hedging changes the effective sensitivity.</strong> AA hedges 30&ndash;50% of fuel exposure. A 9% spot move only flows ~5% to the bottom line. Mitigation: the model&apos;s coefficient is fit on <em>realized</em> fare history, which already reflects historical hedging behavior. So this is implicitly handled, but a regime change in hedging policy would require retraining.</li>
+  </ol>
+
+  <h2>Validating the fuel coefficient</h2>
+  <p>
+    Fuel is the cleanest covariate to validate independently because the underlying
+    economics are bottom-up calculable. The Operations Research team did the math
+    independently:
+  </p>
+  <ul>
+    <li>Average fuel burn per OD-pair-passenger-mile: known from FAA filings.</li>
+    <li>Hedging policy: 35% hedged through Q4.</li>
+    <li>Pass-through ratio AA charges customers vs absorbs into margin: ~60% pass-through.</li>
+    <li>Resulting expected coefficient: ~$11.0 per $1 fuel network-average.</li>
+  </ul>
+  <p>
+    Our learned coefficient: $11.4. Within 4% of the OR team&apos;s independent calculation.
+    That kind of cross-validation against a domain-knowledge prior is one of the strongest
+    sanity checks an Applied Scientist can do.
+  </p>
+
+  <h2>Real-world variants</h2>
+  <ul>
+    <li><strong>Sustained fuel rally.</strong> Multi-week climb. Each daily update triggers a re-score. Operationally fine.</li>
+    <li><strong>Fuel crash.</strong> Same path in reverse. Coefficients are linear; behavior is symmetric.</li>
+    <li><strong>Spread blow-out (jet fuel vs WTI).</strong> The covariate is jet-fuel-specific, not WTI. If refiners&apos; crack spreads explode (as in Q4 2022), the jet-fuel curve diverges from WTI. The model uses jet fuel directly, so spread risk is handled.</li>
+    <li><strong>Carbon pricing introduction.</strong> Hypothetical &mdash; if AA starts paying carbon credits, the effective per-gallon cost rises. Would manifest as a coefficient shift over the retraining window. We&apos;d see it in the validation against the OR team&apos;s number.</li>
+  </ul>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Why does fuel sensitivity differ across route families?</div>
+        <div class="a">Three drivers. (1) Trip length: a 5,500-mile JFK-LHR burns more fuel per ticket than a 1,200-mile DFW-LAX. (2) Aircraft type: widebodies are less fuel-efficient per seat than modern narrowbodies on a per-trip-mile basis but more efficient per seat-mile at high load factors. (3) Pricing power: hub-corp routes have better pass-through to fares than discount-leisure routes, so the same fuel cost shows up as larger fare moves on corp routes.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Walk me through how you&apos;d catch a wrong fuel coefficient in production.</div>
+        <div class="a">Three signals. (1) Coverage drift: if the coefficient is too high, real fares lag forecasts and we under-cover; if too low, we over-cover. The 80% PI coverage SLO catches this within 7 days. (2) Comparison to OR&apos;s independent bottom-up calc, done quarterly. (3) Per-family residuals correlated with fuel: if the residual MAPE on long-haul routes spikes whenever fuel moves materially, the long-haul-family LoRA needs more fuel sensitivity.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why not just use a real-time fuel-pricing API instead of a daily Treasury curve?</div>
+        <div class="a">Three reasons. (1) Treasury&apos;s curve includes hedging-aware basis adjustments &mdash; the raw spot price is misleading because most of AA&apos;s fuel exposure is hedged. (2) Real-time APIs are latency-sensitive and unreliable on weekends. (3) The model is trained on Treasury-curve values, so production must match training. Using a different source at inference would create a covariate shift the model wasn&apos;t calibrated for.</div>
+      </div>
+      <div class="qa">
+        <div class="q">If fuel jumped 50% (a true crisis), would you trust the model?</div>
+        <div class="a">No. The training distribution likely doesn&apos;t contain &gt;30% jumps. Linearly extrapolating the +$11.4 coefficient gives a +$45 fare bump, but at that magnitude (a) demand elasticity kicks in non-linearly &mdash; people stop flying &mdash; and (b) competitor behavior shifts non-linearly. The runbook for this case is: switch to a manual override mode where Pricing sets fares directly while we retrain. ML models should not extrapolate into regimes they haven&apos;t seen.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How does the model handle fuel hedging?</div>
+        <div class="a">Implicitly. The coefficient is fitted on realized fare history, which already reflects historical hedging behavior. As long as hedging policy is stable, the coefficient is correct. If AA changes hedging policy materially, the coefficient becomes wrong and we&apos;d catch it in the OR-team validation. The model isn&apos;t aware of hedges; it just sees the realized cost-pass-through pattern.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="scenario-holiday.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Scenario: Thanksgiving rush</div>
+    </a>
+    <a class="page-nav-item next" href="scenario-competitor.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Scenario: Competitor undercut</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Inference Optimization &middot; AA Pricing Forecast</title>
+<meta name="description" content="Layer-by-layer 47x speedup of TimesFM inference: batching, BF16, torch.compile, LoRA hot-swap, KV cache, forecast caching. With code samples and rejected alternatives." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Inference optimization</span>
+  </nav>
+
+  <h1>Inference optimization &mdash; the 47&times; speedup, layer by layer</h1>
+  <p class="lead">
+    The nightly batch of 6,700 OD-pairs has to complete in &lt;90 s on a single A10G spot
+    instance. Naive PyTorch (FP32, batch=1, eager mode) takes 31 minutes. The shipped path
+    runs in 41 seconds at $0.011 per nightly batch. Each optimization is independently
+    rollback-able; this page is the layered stack, with the code at each layer.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Stack: <strong>batching (15.6&times;) &rarr; BF16 (2&times;) &rarr; torch.compile (1.5&times;) &rarr; pinned-memory LoRA hot-swap</strong>.
+    Median latency 280 ms &rarr; 6 ms per OD-pair. p99 14 ms. Throughput 3.6 &rarr; 165 series/sec.
+    Cost per nightly run $0.205 &rarr; $0.011. <strong>Annual inference cost &lt;$50.</strong>
+  </div>
+
+  <h2>The optimization stack</h2>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>#</th><th>Optimization</th><th>Median latency</th><th>Speedup</th><th>VRAM</th><th>Throughput</th><th>Cost / run</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>0</td><td>FP32, batch=1, eager (baseline)</td><td>280 ms</td><td>1.0&times;</td><td>1.0 GB</td><td>3.6 / s</td><td>$0.205</td></tr>
+      <tr><td>1</td><td>+ Batching (batch=64, family-grouped)</td><td>18 ms</td><td>15.6&times;</td><td>3.1 GB</td><td>56 / s</td><td>$0.075</td></tr>
+      <tr><td>2</td><td>+ BF16 mixed precision</td><td>9 ms</td><td>31.1&times;</td><td>2.4 GB</td><td>110 / s</td><td>$0.038</td></tr>
+      <tr><td>3</td><td>+ <code>torch.compile(mode="reduce-overhead")</code></td><td>6 ms</td><td>46.7&times;</td><td>2.6 GB</td><td>165 / s</td><td>$0.022</td></tr>
+      <tr class="row-chosen"><td>4</td><td>+ LoRA hot-swap (pinned memory)</td><td>6 ms (p99 14 ms)</td><td>46.7&times;</td><td>3.0 GB</td><td>165 / s</td><td>$0.011</td></tr>
+      <tr><td>5</td><td>+ Forecast caching (intra-day re-runs)</td><td>cache hit: 0 ms</td><td>infinite on hit</td><td>+ Redis</td><td>n/a</td><td>n/a</td></tr>
+    </tbody>
+  </table>
+
+  <div class="insight">
+    <strong>Order matters.</strong> Batching alone got 80% of the win. The order is "cheap, high-leverage first". Doing torch.compile before batching is a waste &mdash; you compile a graph that runs at 280 ms instead of 18 ms.
+  </div>
+
+  <h2>Layer 1: batching (the biggest win)</h2>
+  <p>
+    TimesFM&apos;s API takes a list of input series and parallelizes across the batch axis.
+    "Batching" is just &ldquo;make the list longer&rdquo;.
+  </p>
+  <pre><code># Before: one OD-pair at a time
+for od_pair in od_pairs:                        # 6,700 iterations
+    point, q = model.forecast_with_covariates(  # 280 ms each
+        inputs=[fare[od_pair]],
+        ...,
+    )
+
+# After: 64 at a time, grouped by route family
+for chunk in chunked_by_family(od_pairs, size=64):  # 105 iterations
+    inputs = [fare[od] for od in chunk]
+    point, q = model.forecast_with_covariates(      # 18 ms / OD amortized
+        inputs=inputs,
+        dynamic_numerical_covariates={...},
+        static_categorical_covariates={...},
+    )</code></pre>
+
+  <h3>Why grouping by family</h3>
+  <p>
+    Each route family has its own LoRA adapter. If you shuffle the batch, you swap adapters
+    mid-batch &mdash; the swap cost dominates. Sort by family, you swap once per chunk.
+    First version of this code shuffled and was 3&times; slower than necessary.
+  </p>
+
+  <h3>Choosing batch size 64</h3>
+  <p>Empirical sweep on A10G:</p>
+  <table class="decision-matrix">
+    <thead><tr><th>Batch</th><th>Latency / OD</th><th>VRAM peak</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>280 ms</td><td>1.0 GB</td><td>Eager baseline</td></tr>
+      <tr><td>8</td><td>47 ms</td><td>1.4 GB</td><td>Tensor cores under-utilized</td></tr>
+      <tr><td>32</td><td>22 ms</td><td>2.1 GB</td><td>Decent</td></tr>
+      <tr class="row-chosen"><td>64</td><td>18 ms</td><td>3.1 GB</td><td><strong>Sweet spot</strong> &mdash; chosen</td></tr>
+      <tr><td>128</td><td>16 ms</td><td>5.4 GB</td><td>Diminishing returns</td></tr>
+      <tr><td>256</td><td>16 ms</td><td>OOM</td><td>Hit memory ceiling</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Picked 64 for safety margin: A10G has 24 GB VRAM, but the model has to coexist with
+    feature loading, KV cache, and the LoRA adapter pool.
+  </p>
+
+  <h2>Layer 2: BF16 mixed precision</h2>
+  <p>
+    A10G&apos;s tensor cores execute BF16 matmuls at 2&times; the throughput of FP32 with no
+    accuracy loss for inference at this scale.
+  </p>
+  <pre><code>import torch
+
+with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    point, q = model.forecast_with_covariates(...)</code></pre>
+
+  <h3>Why BF16 and not FP16</h3>
+  <p>
+    FP16 has a much smaller dynamic range (max ~6.5e4 before overflow). With fares spanning
+    $80&ndash;$11,000 the loss of precision at the high end was visible in q90 (~0.4% drift).
+    BF16 has FP32&apos;s exponent range, just less mantissa, so dynamic range is preserved.
+    No measurable accuracy delta vs FP32.
+  </p>
+  <div class="math">
+    FP32: 1 sign, 8 exp, 23 mantissa &nbsp;&middot;&nbsp; BF16: 1 sign, 8 exp, 7 mantissa &nbsp;&middot;&nbsp; FP16: 1 sign, 5 exp, 10 mantissa
+  </div>
+
+  <h3>Caught one bug</h3>
+  <p>
+    The XReg head was still in FP32 (trained without autocast). The cast at the FP32 &rarr;
+    BF16 boundary was eating 6% of inference time. PyTorch Profiler caught it &mdash; kernel
+    mix showed a stray FP32 GEMM right at the head. Re-trained with autocast on, problem
+    disappeared.
+  </p>
+
+  <h2>Layer 3: torch.compile</h2>
+  <pre><code>model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(...)
+model.compile(timesfm.ForecastConfig(...))           # TimesFM-side compile
+
+# AND wrap the call site
+forecast_fn = torch.compile(
+    model.forecast_with_covariates,
+    mode="reduce-overhead",     # CUDA graphs under the hood
+    fullgraph=False,            # tolerate dynamic shapes
+)</code></pre>
+
+  <h3>What each flag does</h3>
+  <ul>
+    <li><code>mode="reduce-overhead"</code>: uses CUDA graphs to eliminate kernel-launch overhead. Big win for short-running kernels typical of batch-64 transformer inference.</li>
+    <li><code>fullgraph=False</code>: TimesFM has data-dependent control flow (variable-length context handling). Forcing fullgraph fails compile; <code>False</code> produces multiple compiled subgraphs, each fast.</li>
+  </ul>
+
+  <h3>Compile cost</h3>
+  <p>
+    ~12 seconds the first time the function is called. Amortized over 105 batches per
+    nightly run, this is 0.1 s per batch &mdash; trivial. <strong>Watch out for
+    recompilation:</strong> if input shapes vary unpredictably, <code>torch.compile</code>
+    recompiles, which can cost minutes. Solution: pad to fixed shapes per family.
+  </p>
+
+  <pre><code># Pad final partial batch to 64 with dummy series; discard their outputs.
+# Cost: ~1% wasted compute on tail batch.
+# Benefit: zero recompilation in steady state.
+
+if len(chunk) &lt; 64:
+    pad = 64 - len(chunk)
+    chunk = chunk + [DUMMY_SERIES] * pad
+    point, q = forecast_fn(inputs=chunk, ...)
+    point = point[:-pad]   # discard dummies
+    q = q[:-pad]</code></pre>
+
+  <h2>Layer 4: LoRA hot-swap with pinned memory</h2>
+  <p>
+    The naive LoRA swap costs ~800 ms (re-load adapter from disk, transfer to GPU). My
+    target was &lt;10 ms.
+  </p>
+
+  <h3>The path that worked</h3>
+  <ol>
+    <li><strong>Preload all 17 adapters at service startup</strong> into pinned CPU memory (<code>tensor.pin_memory()</code>). Total RAM: ~80 MB. Cost: ~600 ms once, at startup.</li>
+    <li><strong>Apply via in-place state-dict update</strong> on the resident GPU model. PyTorch handles the H2D transfer with the pinned source &mdash; significantly faster than pageable memory. Each swap: ~6&ndash;10 ms.</li>
+    <li><strong>Group batches by family</strong> so the swap rate is one per ~3.8 batches, not one per OD-pair.</li>
+  </ol>
+
+  <pre><code>import safetensors.torch as st
+
+class LoraRegistry:
+    def __init__(self, families, base_path):
+        self.adapters = {}
+        for family in families:
+            sd = st.load_file(f"{base_path}/{family}.safetensors")
+            self.adapters[family] = {
+                k: v.pin_memory() for k, v in sd.items()
+            }
+
+    def apply_(self, model, family):
+        # In-place LoRA-only update. Base weights untouched.
+        with torch.no_grad():
+            for k, v in self.adapters[family].items():
+                # k is like 'attn.q_proj.lora_A.weight'
+                target = model.get_parameter(k)
+                target.copy_(v, non_blocking=True)
+        torch.cuda.synchronize()
+
+# Per batch
+if family != current_family:
+    registry.apply_(model, family)   # ~8 ms
+    current_family = family
+out = forecast_fn(inputs=chunk, ...)</code></pre>
+
+  <h3>Pinned memory math</h3>
+  <ul>
+    <li>Pageable CPU &rarr; GPU (default): ~62 ms per 4 MB adapter</li>
+    <li>Pinned CPU &rarr; GPU: ~8 ms per 4 MB adapter</li>
+    <li>Win: ~8&times;. Per-day savings: 105 batches &times; ~50 ms saved = 5 s. Not huge in absolute terms but it&apos;s the difference between hitting the SLO and missing it on bad days.</li>
+  </ul>
+
+  <h2>Layer 5: forecast caching</h2>
+  <p>
+    Some OD-pairs get re-scored mid-day (competitor undercut, fuel update). If the
+    covariates haven&apos;t changed materially, the forecast hasn&apos;t changed.
+  </p>
+  <ul>
+    <li><strong>Cache key:</strong> <code>(od_pair, departure_date, snapshot_date, sha256(quantized_covar_block))</code></li>
+    <li><strong>Cache value:</strong> forecast tensor + quantile tensor</li>
+    <li><strong>Backing store:</strong> Redis with 24-hour TTL</li>
+    <li><strong>Hit rate</strong> in production: ~37% on intra-day re-runs</li>
+  </ul>
+
+  <h3>Why quantize covariates before hashing</h3>
+  <p>
+    Without quantization, every floating-point reload looks "new" to the cache (e.g.,
+    fuel went from $2.847291 to $2.847294 due to source rounding). Quantize fuel to
+    $0.01, competitor fare to $1, DTD to integer days, load factor to 0.005. Then hash.
+    This was the biggest cache-rate improvement &mdash; 4% &rarr; 37%.
+  </p>
+
+  <h2>What I tried that did NOT work</h2>
+  <p class="caption">An honest dead-end log. These are common interview traps; here is why each was rejected.</p>
+
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>Approaches that did work</h4>
+      <ul>
+        <li>Batching (15.6&times;)</li>
+        <li>BF16 (2&times;)</li>
+        <li><code>torch.compile</code> (1.5&times;)</li>
+        <li>LoRA hot-swap (cost reduction)</li>
+        <li>Forecast caching (off-cycle savings)</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Approaches I rejected</h4>
+      <ul>
+        <li>INT8 dynamic quantization &mdash; coverage dropped to 73%</li>
+        <li>ONNX + TensorRT &mdash; 5% kernel coverage gap</li>
+        <li>Speculative decoding &mdash; horizon math doesn&apos;t fit</li>
+        <li>Multi-GPU sharding &mdash; doubled cost for 1.6&times; speed</li>
+        <li>Tensor parallelism &mdash; same as above</li>
+        <li>Static-batch CUDA graphs without compile &mdash; covered by torch.compile</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Why INT8 quantization failed (the most painful no)</h3>
+  <p>
+    <code>torch.quantization.quantize_dynamic</code> on the linear layers cut latency to 4 ms but
+    degraded q10/q90 calibration noticeably (coverage 79% &rarr; 73%). Bid-price-grade
+    quantiles are precision-sensitive. Two diagnostic findings:
+  </p>
+  <ol>
+    <li>The XReg head&apos;s coefficients have small absolute values (~0.01&ndash;0.1) on covariates with large values (e.g., fuel coefficient $11.4 / $1 fuel). INT8 quantization rounds the small coefficients to 0, eliminating the covariate&apos;s contribution.</li>
+    <li>The quantile head is the most precision-sensitive layer because it has to maintain monotonicity (q10 &lt; q20 &lt; ... &lt; q90). Even small INT8 rounding flips the ordering on flat-fare days.</li>
+  </ol>
+  <p>
+    Could revisit with calibrated INT8 or per-channel quantization, but the savings (4 ms
+    &rarr; 4 ms with calibration overhead) are not worth the engineering. Kept BF16.
+  </p>
+
+  <h3>Why ONNX + TensorRT failed</h3>
+  <p>
+    Exported to ONNX, ran through TensorRT 8.6. The exported graph had ~5% kernel coverage
+    gap that fell back to CUDA, eliminating the expected speedup. With <code>torch.compile</code>
+    already at 6 ms, TensorRT&apos;s incremental gain was &lt;1 ms in the best case &mdash;
+    not worth the operational complexity of maintaining two model formats. <em>Operational
+    complexity</em> here means: ONNX export pipeline, version pinning of TRT, separate
+    benchmark suite, separate rollback target. Not an engineering win.
+  </p>
+
+  <h2>End-to-end nightly timeline</h2>
+  <table class="decision-matrix">
+    <thead><tr><th>Step</th><th>Duration</th><th>Cumulative</th></tr></thead>
+    <tbody>
+      <tr><td>Spin A10G spot, attach EFS</td><td>30 s</td><td>02:00:30</td></tr>
+      <tr><td>Load base + head + 17 LoRA &rarr; pinned mem</td><td>6 s</td><td>02:00:36</td></tr>
+      <tr><td><code>torch.compile</code> warm-up (one batch)</td><td>12 s</td><td>02:00:48</td></tr>
+      <tr><td>Score 6,700 OD-pairs (105 batches of 64)</td><td>41 s</td><td>02:01:29</td></tr>
+      <tr><td>Write to feature store</td><td>8 s</td><td>02:01:37</td></tr>
+      <tr><td>Dispatch metrics &rarr; Datadog</td><td>2 s</td><td>02:01:39</td></tr>
+      <tr><td>Spot release</td><td>1 s</td><td><strong>02:01:40</strong></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Profiling discipline</h2>
+  <p>
+    Every checkpoint goes through PyTorch Profiler before merge:
+  </p>
+  <pre><code>from torch.profiler import profile, ProfilerActivity, schedule
+
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    schedule=schedule(wait=1, warmup=2, active=4, repeat=1),
+    on_trace_ready=lambda p: p.export_chrome_trace("trace.json"),
+    record_shapes=True,
+    profile_memory=True,
+) as prof:
+    for batch in test_batches:
+        forecast_fn(inputs=batch, ...)
+        prof.step()</code></pre>
+  <p>
+    Open <code>trace.json</code> in Chrome&apos;s <code>chrome://tracing</code>. Look for:
+  </p>
+  <ul>
+    <li>Stray FP32 kernels in a BF16 graph (the bug I caught early on).</li>
+    <li>Long gaps between kernels (kernel-launch overhead &rarr; <code>torch.compile</code> with reduce-overhead).</li>
+    <li>D2H copies during the hot path (synchronous CPU access &rarr; should be async).</li>
+    <li>Recompilation events (input shape changed &rarr; pad to fixed).</li>
+  </ul>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Walk me through your approach to optimizing this inference path.</div>
+        <div class="a">Start with profiling, not assumptions. Run baseline, look at the kernel mix and time-per-batch. Identify the hot path. Apply the cheapest, highest-leverage change first &mdash; in this case batching, which gave 80% of the final speedup. Then iterate: BF16, torch.compile, hot-swap. Each change is independently rollback-able. Re-profile after each change to confirm the kernel mix matches expectations.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why didn&apos;t you use TensorRT?</div>
+        <div class="a">5% kernel-coverage gap fell back to CUDA, killing the expected speedup. With torch.compile already at 6 ms, TensorRT&apos;s incremental gain was &lt;1 ms while doubling the operational surface. Optimization is about <em>cost per ms saved</em>; TRT was a bad ratio. Would revisit if torch.compile capped out and we needed more.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you choose batch size?</div>
+        <div class="a">Empirical sweep on production hardware. Watch latency-per-item, peak VRAM, and tensor-core utilization. Pick the batch where (a) latency-per-item plateaus, (b) VRAM has &ge;50% headroom for safety, (c) you don&apos;t hit recompilation in steady state. For us that was 64 on A10G; would be ~256 on A100.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why does batching help so much for transformer inference?</div>
+        <div class="a">GPU tensor cores execute matmuls in fixed-size tiles (e.g., 16&times;16 BF16). At batch=1 you process a "batch" of one row, leaving most of the tile unused. At batch=64 the tile is fully utilized, so you get 64&times; the work for the same kernel-launch and memory-traffic overhead. The same matmul kernel runs &mdash; you&apos;re paying its fixed cost more efficiently.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What does CUDA graphs (the &ldquo;reduce-overhead&rdquo; mode) actually do?</div>
+        <div class="a">Captures the sequence of CUDA kernel launches into a graph object, then replays the whole graph in one CPU&rarr;GPU command instead of N separate launches. For short-running kernels (typical of batch-64 transformer inference where each kernel is ~50&ndash;200 &micro;s), the launch overhead (~5 &micro;s per launch) is a meaningful fraction. Eliminating it gives a 1.3&ndash;1.6&times; speedup, depending on kernel mix.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How would you scale this to 100,000 OD-pairs instead of 6,700?</div>
+        <div class="a">Stays single-A10G if we accept ~10 minute wall time. To stay at 41 s wall time we&apos;d need ~16&times; throughput. Options ranked by cost/benefit: (1) larger batch on A100 (40 GB VRAM) &mdash; batch=512, ~3&times; throughput; (2) data-parallel across 4&times;A10G &mdash; near-linear scaling; (3) move from BF16 to mixed FP8 with H100 &mdash; ~2&times; on FP8 matmuls. Avoid model parallelism &mdash; the model is small enough that DP wins.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you ensure your optimizations don&apos;t change accuracy?</div>
+        <div class="a">CI gate. Every checkpoint runs the eval harness on a frozen mini-cohort and reports MAPE plus 80% PI coverage. Any change that drifts MAPE by &gt;0.05 pp or coverage by &gt;1 pp blocks merge. We caught the BF16 calibration bug, the LoRA dropout bug, and the INT8 calibration drop with this gate. The gate is the single most important piece of MLOps in the project.</div>
+      </div>
+      <div class="qa">
+        <div class="q">If you had to cut one optimization, which would you cut?</div>
+        <div class="a">Forecast caching. The hit rate (37%) is real but the operational complexity (Redis, cache key design, quantization-aware hashing, TTL management) costs more engineering than the latency savings justify in steady state. The other four optimizations &mdash; batching, BF16, compile, hot-swap &mdash; are essentially free in operational complexity and would all stay.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="finetuning.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Fine-tuning strategy</div>
+    </a>
+    <a class="page-nav-item next" href="evaluation.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Evaluation metrics &amp; calibration</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

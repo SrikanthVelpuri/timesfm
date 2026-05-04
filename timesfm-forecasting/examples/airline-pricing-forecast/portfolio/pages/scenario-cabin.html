@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Scenario: Cabin Upsell &middot; AA Pricing Forecast</title>
+<meta name="description" content="Forecasting premium-economy fares on DFW-LAX. Why the wider PI is correct, how static-covariate interactions work, and what it takes to support a cabin-mix simulation." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#scenarios">Scenarios</a> &nbsp;/&nbsp; <span>Cabin upsell</span>
+  </nav>
+
+  <h1>Scenario 6 &mdash; Cabin upsell forecast</h1>
+  <p class="lead">
+    Strategy team asks: "What would happen if we converted 30 economy seats on DFW-LAX
+    to premium economy starting next month?" RMS needs a fare forecast for the premium
+    economy cabin specifically, not just main cabin. Same model, different static
+    covariate, different forecast distribution.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Flip the static <code>cabin</code> covariate from
+    <code>main</code> to <code>premium-economy</code>; keep all other covariates the same.
+    The model produces a forecast median ~2.6&times; the main-cabin median ($960 vs $370
+    on DFW-LAX) and a PI 4&times; wider ($600 vs $135). The wider PI is structurally
+    correct: premium-economy demand is more idiosyncratic. Optimizer treats premium
+    economy as a separate fare-class ladder. <strong>Cabin-mix simulation: same nightly
+    pipeline, same model, just an extra static label per scenario.</strong>
+  </div>
+
+  <h2>Trigger</h2>
+  <p>
+    Strategy team is evaluating a cabin reconfiguration. They want to model the revenue
+    impact of converting 30 main-cabin seats to premium economy on DFW-LAX. The question
+    is two-part:
+  </p>
+  <ol>
+    <li>What fares can we expect on the new premium-economy seats?</li>
+    <li>Will the displaced main-cabin demand cannibalize main-cabin fares (do bookings spill into Y class, vs go to a competitor)?</li>
+  </ol>
+  <p>
+    The model handles question 1 cleanly. Question 2 is more complex and combines the
+    forecast with a separate demand-spillover model maintained by the OR team.
+  </p>
+
+  <h2>Covariate inputs</h2>
+  <p>
+    Only the static <code>cabin</code> covariate changes. The historical context is
+    different too &mdash; we use existing premium-economy fare history on DFW-LAX rather
+    than main-cabin history.
+  </p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Covariate</th><th>Main-cabin scenario</th><th>Premium-economy scenario</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Context (90-day fare history)</td><td>Main-cabin DFW-LAX</td><td>Premium-economy DFW-LAX</td></tr>
+      <tr><td>cabin</td><td>main</td><td><strong>premium-economy</strong></td></tr>
+      <tr><td>route_type</td><td>domestic-hub</td><td>domestic-hub</td></tr>
+      <tr><td>equipment</td><td>narrowbody</td><td>narrowbody</td></tr>
+      <tr><td>jet_fuel_usd_gal</td><td>$2.85</td><td>$2.85 (same)</td></tr>
+      <tr><td>holiday_flag</td><td>same calendar</td><td>same calendar</td></tr>
+      <tr><td>day_of_week</td><td>same</td><td>same</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Model behavior</h2>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Cabin</th><th>Median forecast</th><th>q10</th><th>q90</th><th>PI width (q90-q10)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Main</td><td>$370</td><td>$310</td><td>$445</td><td>$135</td></tr>
+      <tr class="row-chosen"><td><strong>Premium economy</strong></td><td><strong>$960</strong></td><td><strong>$710</strong></td><td><strong>$1,310</strong></td><td><strong>$600</strong></td></tr>
+      <tr><td>Premium economy on holiday day</td><td>$1,250</td><td>$870</td><td>$1,820</td><td>$950</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The PI is much wider on premium economy. Three reasons:
+  </p>
+  <ol>
+    <li><strong>Smaller sample.</strong> Premium economy has ~30 seats vs ~150 main; daily fare averages are noisier.</li>
+    <li><strong>Idiosyncratic buyers.</strong> Corporate executives, last-minute upgrades, schedule-driven upsells. Less predictable demand process than vacation main-cabin.</li>
+    <li><strong>Wider price discrimination.</strong> Premium economy ladder has ~6 fare classes vs ~10 in main; smaller increments mean larger fare jumps within a single day.</li>
+  </ol>
+
+  <div class="insight">
+    <strong>Wider PI is correct.</strong> A model that pretended premium-economy fares
+    were as predictable as main-cabin fares would systematically over-claim certainty.
+    The optimizer would close inventory too aggressively at the q90, missing the
+    last-minute upsell upside. Calibrated wide PIs let the optimizer protect more
+    high-yield seats for the upsell that actually materializes 30% of the time.
+  </div>
+
+  <h2>The cabin-cabin interaction</h2>
+  <p>
+    The XReg head has a rank-32 cross-route interaction term that learns interactions
+    between static and dynamic covariates. For cabin specifically:
+  </p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Interaction</th><th>Effect</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>cabin == premium &times; holiday_flag == 2</td><td>+$290 on premium-economy holiday days (vs +$95 main)</td></tr>
+      <tr><td>cabin == premium &times; day_of_week == Sun</td><td>+$0 (no Sunday tilt for premium; main has +$45 leisure-return lift)</td></tr>
+      <tr><td>cabin == premium &times; competitor_fare delta</td><td>0.10 elasticity (vs 0.55 main-cabin) &mdash; premium customers don&apos;t comparison-shop</td></tr>
+      <tr><td>cabin == premium &times; days_to_departure</td><td>-$3.2 / day (vs -$1.4 main) &mdash; faster price escalation as departure nears</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    These interactions emerge from the rank-32 cross term, not hand-coded. The Stage-A
+    fine-tune learned them from historical data. Sanity check: the OR team independently
+    flagged that premium-economy holiday lift should be ~3&times; main-cabin lift; we got
+    3.05&times;. Good cross-validation.
+  </p>
+
+  <h2>Simulation: 30 main-cabin seats &rarr; premium-economy</h2>
+  <p>
+    The simulation requires more than just running the model under different cabin
+    labels. The OR team combines the model output with a demand-spillover model:
+  </p>
+  <ol>
+    <li>Forecast premium-economy fares on the affected dates (this page&apos;s output).</li>
+    <li>Estimate premium-economy demand at those fares (separate model, not in scope).</li>
+    <li>Compute the resulting load factor; if &lt;90%, the seats are imperfect substitutes.</li>
+    <li>Estimate displaced main-cabin bookings and their landing class (Y? Q? competitor?).</li>
+    <li>Net revenue: premium-economy capture - main-cabin spillover loss.</li>
+  </ol>
+  <p>
+    Strategy did this for several months of forward bookings; the simulation said the
+    cabin reconfiguration was net-positive ~$2.4M annual revenue. The forecast model
+    contributed step 1 (and partial step 4 via main-cabin q90).
+  </p>
+
+  <h2>Trade-offs</h2>
+  <h3>Single model with cabin covariate vs cabin-specific models</h3>
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>Single model + cabin covariate (chosen)</h4>
+      <ul>
+        <li>Same training pipeline, same artifact registry.</li>
+        <li>Cross-cabin interactions learned via the rank-32 term.</li>
+        <li>New cabin types ship by adding a static label, no new model.</li>
+        <li>Cabin-mix simulation runs the same nightly pipeline.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Cabin-specific models (rejected)</h4>
+      <ul>
+        <li>Each cabin type is a separate artifact; multiplies registry size.</li>
+        <li>No native cabin-cross interactions; need a separate joint model.</li>
+        <li>Per-cabin fine-tune compute &mdash; doubles or triples the bill.</li>
+        <li>Operationally complex.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Where this could fail</h2>
+  <ol>
+    <li><strong>Cabin reconfiguration changes the implicit cabin meaning.</strong> If &ldquo;premium economy&rdquo; on a 787 means something different from &ldquo;premium economy&rdquo; on a narrowbody (different seat pitch, different amenities), the static label is mis-applied. Mitigation: separate static labels for premium-economy-narrow vs premium-economy-wide.</li>
+    <li><strong>Insufficient premium-economy history.</strong> If a route has only 3 months of premium-economy operation, the context is short and PI inflates significantly. Mitigation: borrow from analog routes (same approach as cold-start).</li>
+    <li><strong>Spillover model is wrong.</strong> The fare forecast is right but the OR demand-spillover model is wrong, leading to a bad simulation conclusion. The forecast model isn&apos;t responsible for this; the chain of models is.</li>
+  </ol>
+
+  <h2>Real-world variants</h2>
+  <ul>
+    <li><strong>Business class on transatlantic.</strong> Static covariate <code>cabin == business</code>, much wider PI ($1,200&ndash;$1,500), more pronounced holiday and DTD effects.</li>
+    <li><strong>First class on transcon (Flagship First).</strong> Even wider PI; near-zero competitor elasticity.</li>
+    <li><strong>Bundling change (basic-economy introduction).</strong> A <em>new</em> cabin label, requires retraining Stage A to learn its coefficients. Not a simulation, an actual model change.</li>
+    <li><strong>Premium-cabin de-bundling.</strong> Strategy considered selling premium-economy seats with food/wifi separated. Different demand process; would need its own static label for &ldquo;premium-economy basic.&rdquo;</li>
+  </ul>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Why is the PI on premium economy 4&times; wider than main cabin?</div>
+        <div class="a">Three drivers. (1) Smaller sample &mdash; ~30 seats per flight vs ~150, so the daily average fare is a noisier estimate. (2) Customer mix &mdash; corporate executives and last-minute upsells are less predictable than vacationing main-cabin buyers. (3) Wider price discrimination &mdash; premium economy has ~6 fare classes spanning a $700 range vs main with ~10 classes spanning $200. The model&apos;s quantile head learned this from history. The wider PI is calibrated and correct.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why one model with a cabin covariate instead of a separate model per cabin?</div>
+        <div class="a">Three reasons. (1) Cross-cabin interactions are real &mdash; main-cabin holiday lift correlates with premium-economy holiday lift; a joint model learns this. (2) Operational simplicity &mdash; one artifact, one CI gate, one rollback path. (3) New cabin types don&apos;t require new models &mdash; just a new static label and a coefficient learned by Stage A. Cabin-specific models would double or triple the registry without payback.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Walk me through the cabin-mix simulation end-to-end.</div>
+        <div class="a">(1) Run the forecast model with cabin = premium-economy on the affected dates. (2) Hand the output to the OR team&apos;s demand-spillover model, which estimates booking volume at the forecasted fares. (3) Compute load factor; if &lt;90%, model the displaced main-cabin demand. (4) Run the model again with cabin = main on the affected dates with reduced inventory; estimate spillover bookings landing in Y class or going to competitor. (5) Net revenue = premium-economy capture - main-cabin loss. The forecast model is one of three components; spillover and demand are separate models.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What would change if AA introduced basic economy as a new cabin?</div>
+        <div class="a">Basic economy is a separate cabin label. It would require retraining Stage A to learn its coefficient (probably negative relative to main cabin, with weaker DTD effect because basic economy is bought early by leisure customers). This is a model change, not a simulation. The first 30 days would use the cold-start synthetic-prior approach with main-cabin as the analog, then taper as real basic-economy history accumulates.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How does the rank-32 cross term in the XReg head work mathematically?</div>
+        <div class="a">It&apos;s a low-rank approximation of an interaction matrix. With 11 covariates, a full second-order interaction is 11&times;11 = 121 terms. Some of those interactions matter (cabin&times;holiday) and most don&apos;t. A rank-32 factorization parameterizes the interaction matrix as <em>U V<sup>T</sup></em> with <em>U, V</em> &isin; &reals;<sup>11&times;32</sup>; we have a 32-dim hidden space for interactions. Empirically rank 32 captures all the interactions we&apos;ve verified (cabin&times;holiday, cabin&times;DTD, etc.) and saturates &mdash; rank 64 gave no additional MAPE improvement.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="scenario-coldstart.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Scenario: New route cold-start</div>
+    </a>
+    <a class="page-nav-item next" href="../index.html">
+      <div class="label">End of scenarios</div>
+      <div class="title">Return to portfolio home</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

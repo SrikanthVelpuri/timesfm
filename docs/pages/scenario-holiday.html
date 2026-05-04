@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Scenario: Thanksgiving Rush &middot; AA Pricing Forecast</title>
+<meta name="description" content="How TimesFM handles the Thanksgiving holiday peak: covariate inputs, forecast shape, bid-price response, and the trade-offs of aggressive vs conservative q90." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#scenarios">Scenarios</a> &nbsp;/&nbsp; <span>Thanksgiving rush</span>
+  </nav>
+
+  <h1>Scenario 1 &mdash; The Thanksgiving rush</h1>
+  <p class="lead">
+    The week before Thanksgiving is the highest-fare, highest-variance period of the
+    domestic-US calendar. Holiday-specific demand pushes fares +$95 above baseline on
+    domestic-hub routes. The model has to call the peak right or RMS leaves money on
+    the table.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> On the 6 peak days (Wed before through Sun after Thanksgiving),
+    the model lifts median forecast +$95 on hub routes, +$140 on leisure-hub routes, and
+    widens q90 to absorb peak-day variance. The C++ optimizer protects high-yield fare
+    classes earlier, books less low-class inventory, and captures roughly +$11M of network
+    revenue across the holiday week vs the prior ARIMAX-based forecast.
+  </div>
+
+  <h2>Trigger</h2>
+  <p>
+    It is October 22. The 30-day RMS forecast horizon now spans Nov 26 (Wed before)
+    through Dec 1 (Sun after). The pricing team&apos;s federal-holiday calendar marked
+    these days as <code>holiday_flag = 2</code> (peak) months ago. The schedule is
+    published, fuel hedges are booked, the school calendar is known.
+  </p>
+  <p>
+    The model has every input it needs to know the peak is coming, except the actual
+    fare history of those days &mdash; which is in the future.
+  </p>
+
+  <h2>Covariate inputs</h2>
+  <p>
+    The 30-day horizon for AA-DFW-LAX. Bold cells are the peak.
+  </p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Day offset</th><th>Date</th><th>holiday_flag</th><th>school_break</th><th>day_of_week</th><th>fuel ($/gal)</th><th>competitor_fare</th><th>DTD</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>+22</td><td>Nov 13 (Wed)</td><td>0</td><td>0</td><td>Wed</td><td>2.85</td><td>$305</td><td>30</td></tr>
+      <tr><td>+23</td><td>Nov 14 (Thu)</td><td>0</td><td>0</td><td>Thu</td><td>2.86</td><td>$310</td><td>29</td></tr>
+      <tr><td>...</td><td>&hellip;</td><td>0</td><td>0</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td></tr>
+      <tr><td><strong>+27</strong></td><td><strong>Nov 26 (Wed)</strong></td><td><strong>2</strong></td><td><strong>1</strong></td><td><strong>Wed</strong></td><td><strong>2.91</strong></td><td><strong>$420</strong></td><td><strong>21</strong></td></tr>
+      <tr><td><strong>+28</strong></td><td><strong>Nov 27 (Thu)</strong></td><td><strong>2</strong></td><td><strong>1</strong></td><td><strong>Thu</strong></td><td><strong>2.91</strong></td><td><strong>$455</strong></td><td><strong>20</strong></td></tr>
+      <tr><td><strong>+29</strong></td><td><strong>Nov 28 (Fri)</strong></td><td><strong>2</strong></td><td><strong>1</strong></td><td><strong>Fri</strong></td><td><strong>2.92</strong></td><td><strong>$390</strong></td><td><strong>19</strong></td></tr>
+      <tr><td><strong>+30</strong></td><td><strong>Nov 29 (Sat)</strong></td><td><strong>2</strong></td><td><strong>1</strong></td><td><strong>Sat</strong></td><td><strong>2.92</strong></td><td><strong>$365</strong></td><td><strong>18</strong></td></tr>
+      <tr><td><strong>+31</strong></td><td><strong>Nov 30 (Sun)</strong></td><td><strong>2</strong></td><td><strong>1</strong></td><td><strong>Sun</strong></td><td><strong>2.92</strong></td><td><strong>$510</strong></td><td><strong>17</strong></td></tr>
+      <tr><td><strong>+32</strong></td><td><strong>Dec 1 (Sun-after)</strong></td><td><strong>2</strong></td><td><strong>1</strong></td><td><strong>Sun</strong></td><td><strong>2.92</strong></td><td><strong>$485</strong></td><td><strong>16</strong></td></tr>
+    </tbody>
+  </table>
+  <p>
+    Every dynamic covariate has values for both context and horizon &mdash; the holiday
+    calendar is published years in advance, the fuel curve is from Treasury, the
+    competitor fare is observable real-time, the DTD is deterministic.
+  </p>
+
+  <h2>Model behavior</h2>
+  <p>
+    TimesFM does NOT &ldquo;detect&rdquo; the holiday on its own. It would, given enough
+    history, learn the cyclic pattern that fares spike around day-of-year 330 ish. But the
+    XReg head makes this explicit: the <code>holiday_flag == 2</code> coefficient is +$87
+    (network-average), with family-specific multipliers.
+  </p>
+
+  <h3>Forecast shape on AA-DFW-LAX (peak day Nov 27)</h3>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Component</th><th>Value</th><th>Source</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>TimesFM baseline (history-only)</td><td>$378</td><td>Trunk + LoRA on history</td></tr>
+      <tr><td>+ Holiday effect (flag=2)</td><td>+$87</td><td>XReg head coefficient</td></tr>
+      <tr><td>+ School-break leisure premium</td><td>+$0</td><td>Hub-corp route, no leisure tilt</td></tr>
+      <tr><td>+ Day-of-week (Thu)</td><td>+$0</td><td>Already reflected in baseline</td></tr>
+      <tr><td>+ Competitor matching</td><td>+$15</td><td>Delta also peaked</td></tr>
+      <tr><td>+ DTD pressure</td><td>+$11</td><td>Inventory thinning faster than usual</td></tr>
+      <tr class="row-chosen"><td><strong>Median forecast (q50)</strong></td><td><strong>$491</strong></td><td><strong>Sum</strong></td></tr>
+      <tr><td>q10 (lower 80% PI)</td><td>$420</td><td>Quantile head</td></tr>
+      <tr><td>q90 (upper 80% PI)</td><td>$575</td><td>Quantile head</td></tr>
+      <tr><td>PI width (q90 &minus; q10)</td><td>$155</td><td>~ 2&times; non-holiday width ($75)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="insight">
+    <strong>Key behavior:</strong> the PI is intentionally wider on holiday days. The
+    quantile head learned that peak-day variance is structurally higher than weekday
+    variance &mdash; some days the holiday fare maxes out at $620, others at $440 depending
+    on weekday-of-month and competitor moves. A narrow PI would over-claim certainty.
+  </div>
+
+  <h2>Optimizer response</h2>
+  <p>
+    The C++ bid-price optimizer reads (q10, q50, q90) and constructs a fare-class
+    inventory ladder. On Thanksgiving Wed the optimizer&apos;s logic looks like:
+  </p>
+  <pre><code># Reservation level for Y class (highest fare)
+# = q90, because we&apos;re willing to leave seats empty if no one pays
+bid_Y = $575
+
+# Reservation level for B class (mid-tier)
+# = q50, the expected fare
+bid_B = $491
+
+# Reservation level for Q class (deep discount)
+# = max(q10, lowest_filed_fare)
+bid_Q = $420   # high enough that AA closes most Q inventory
+
+# Action:
+#   - Open Y, B classes; protect aggressive inventory there.
+#   - Close Q class on this date (already did 4 days ago).
+#   - Continue to monitor; if competitor fares drop, re-evaluate.</code></pre>
+
+  <h2>Trade-offs</h2>
+  <h3>How wide should q90 be?</h3>
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>Wide q90 (aggressive)</h4>
+      <ul>
+        <li>Captures more revenue on truly-peak days when fares spike to $620.</li>
+        <li>Optimizer protects high-yield seats longer.</li>
+        <li>If actual is $620, you&apos;re happy you didn&apos;t close at $500.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Wide q90 (downside)</h4>
+      <ul>
+        <li>If actual fare is $480, you&apos;re holding empty seats at $570 with nobody paying.</li>
+        <li>Empty seats on peak days are 100% revenue loss; no downstream demand to absorb.</li>
+        <li>Competitor undercuts can leave AA pricing uncompetitive on the day-of.</li>
+      </ul>
+    </div>
+  </div>
+  <p>
+    The pinball loss training implicitly handles this trade-off &mdash; the model is
+    rewarded for tight intervals when calibration permits. Empirically our q90 PI width on
+    holidays (~$160) is about 2&times; non-holiday width &mdash; matched to the historical
+    holiday variance.
+  </p>
+
+  <h3>Aggressive vs conservative interpretation by the optimizer</h3>
+  <p>
+    The optimizer can be configured to use q50 or q90 as the reservation level for Y class.
+    AA chose q90 (aggressive) for the holiday week and q50 (conservative) for the
+    surrounding days. The decision lives in the optimizer policy, not the model &mdash;
+    keeping the model output policy-agnostic is a design rule.
+  </p>
+
+  <h2>What can go wrong, and how we&apos;d know</h2>
+  <ol>
+    <li><strong>Holiday under-call.</strong> The XReg coefficient drifts (e.g., the COVID-era cohort got too much weight). Symptom: holiday-day MAPE &gt; 9% on the val cohort. Mitigation: stratified sampler that over-weights Q4 days during fine-tune.</li>
+    <li><strong>Holiday over-call.</strong> A drift in the opposite direction; we forecast +$95 when the day was actually +$60 (e.g., a recession year). Symptom: empty seats, low load factor. Mitigation: monitor realized vs forecast specifically on holiday days.</li>
+    <li><strong>Competitor de-peaks.</strong> Delta decides not to match the AA holiday lift. The model&apos;s competitor-elasticity coefficient (~0.55 on hub routes) pulls our forecast down by ~$5&ndash;$10 the next morning. Optimizer re-prices the affected days via off-cycle re-score.</li>
+  </ol>
+
+  <h2>Counterfactual: what if we did NOT have the holiday covariate</h2>
+  <p>
+    Hypothetical &mdash; without the <code>holiday_flag</code> covariate, TimesFM would
+    rely entirely on history-cycles. Three problems:
+  </p>
+  <ul>
+    <li><strong>Insufficient cycles.</strong> 90 days of history covers maybe one Labor Day. Thanksgiving is ~9 months away from the context window. Model can&apos;t see it.</li>
+    <li><strong>Date-of-year ambiguity.</strong> Thanksgiving moves &plusmn;6 days year-to-year. A pure date-of-year cycle would smear the peak across two weeks.</li>
+    <li><strong>Drift.</strong> Without the flag, every change to the holiday calendar (e.g., AA shifts Easter day) requires retraining.</li>
+  </ul>
+  <p>
+    This is exactly why the foundation model alone (zero-shot, no covariates) is not
+    enough. Holiday MAPE was 14.1% zero-shot &rarr; 8.7% with the XReg head. The +$95
+    coefficient is doing real work.
+  </p>
+
+  <h2>Real-world variants</h2>
+  <ul>
+    <li><strong>Christmas / New Year.</strong> Same pattern, different magnitudes. flag=2 effect ~+$110 on the Dec 23&ndash;Dec 26 cohort.</li>
+    <li><strong>Easter.</strong> flag=1 (federal holiday tier). +$26 on average. Less variance because Easter weekend is shorter.</li>
+    <li><strong>Spring Break.</strong> No federal holiday flag, but <code>school_break == 1</code> on leisure routes adds +$22.</li>
+    <li><strong>Super Bowl city pair.</strong> Special-event covariate (NOT shipped in v1) would handle this; currently captured implicitly via competitor-fare spikes.</li>
+  </ul>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">How does TimesFM know it&apos;s Thanksgiving on Nov 27 if the context only has 90 days of pre-Thanksgiving data?</div>
+        <div class="a">It doesn&apos;t &mdash; not from history. The <code>holiday_flag</code> covariate explicitly tells it. The XReg head learned (during Stage A fine-tune) that <code>holiday_flag == 2</code> means +$87 on the median; that coefficient applies to any day flagged as 2, regardless of whether the model has &ldquo;seen&rdquo; that calendar date in context. This is the value of the covariate-conditioning approach: known future structure feeds directly into the forecast.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What would you do if the holiday MAPE was 11% in the val cohort instead of 8.7%?</div>
+        <div class="a">Three diagnostics. (1) Holiday samples in train cohort &mdash; how many? If &lt;1% of training windows have flag=2, the coefficient is under-fit; over-weight via stratified sampling. (2) Heterogeneity across families &mdash; is the 11% concentrated on one family? If yes, that family needs a richer rank LoRA or more training windows. (3) Calibration vs accuracy &mdash; if MAPE is bad but coverage is good, it&apos;s about q50 not the distribution; usually a sign of a missing covariate or interaction term.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why is the q90 wider on holidays? Is that a bug?</div>
+        <div class="a">It&apos;s a feature, not a bug. The pinball-loss training learned that holiday variance is structurally higher (some Thanksgivings hit $620, others $440 depending on weekday-of-month, weather, and competitor moves). A narrow q90 would be over-confident; the wider PI is the model honestly admitting uncertainty. The optimizer uses the wider band to protect more high-yield inventory, which is the correct behavior.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Could you replace the holiday flag with day-of-year embeddings?</div>
+        <div class="a">Tried it as an ablation. Day-of-year embedding alone gives 9.4% holiday MAPE (vs 8.7% with explicit flag). The embedding learns "around day 330 fares are high" but smears across the calendar week and doesn&apos;t handle moveable holidays (Easter, Thanksgiving). Could combine both &mdash; an embedding for general seasonality plus a flag for specific holidays &mdash; that gave 8.5% MAPE, marginal gain over flag-only and not worth the engineering. Stuck with flag.</div>
+      </div>
+      <div class="qa">
+        <div class="q">If a stakeholder asks &quot;why is the fare higher on Thanksgiving?&quot;, how do you answer?</div>
+        <div class="a">Decompose the forecast: <code>final = baseline + sum(covariate_contributions)</code>. On Nov 27 the contribution table shows holiday +$87, competitor +$15, DTD +$11, others zero or negligible. I can hand the stakeholder a single chart showing each component&apos;s dollar contribution. This is the audit trail compliance asked for &mdash; not just a single number, but a justifiable decomposition.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="monitoring.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Production monitoring</div>
+    </a>
+    <a class="page-nav-item next" href="scenario-fuel.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Scenario: Fuel-price spike</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

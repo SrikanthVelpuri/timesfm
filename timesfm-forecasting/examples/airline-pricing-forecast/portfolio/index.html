@@ -6,6 +6,7 @@
 <title>AA Pricing Forecast with TimesFM &middot; Applied Scientist Portfolio</title>
 <meta name="description" content="End-to-end ML project: fine-tuning Google's TimesFM foundation model for American Airlines daily fare forecasting, with two-stage adapter training and 47x inference speedup." />
 <link rel="stylesheet" href="assets/css/style.css" />
+<link rel="stylesheet" href="assets/css/pages.css" />
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
 </head>
 <body>
@@ -22,7 +23,7 @@
     </div>
     <nav class="header-links">
       <a href="https://github.com/google-research/timesfm" target="_blank" rel="noopener">TimesFM</a>
-      <a href="../README.md">Repo README</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm/blob/master/timesfm-forecasting/examples/airline-pricing-forecast/README.md">Repo README</a>
     </nav>
   </div>
 </header>
@@ -96,6 +97,78 @@
     <li><strong>Falls back gracefully</strong> when an adapter fails: head-only forecast, no service degradation.</li>
     <li><strong>Self-monitoring</strong> &mdash; PI coverage drift on top-50 routes pages me at 2 a.m. with a one-command rollback path.</li>
   </ul>
+
+  <h2 id="decisions">Deep-dive pages &mdash; design decisions</h2>
+  <p>
+    Five interview-prep pages on the major design decisions behind the project. Each
+    page has a TL;DR, a decision matrix, code samples where relevant, trade-offs, and
+    an interview Q&amp;A section.
+  </p>
+  <div class="page-index-grid">
+    <a class="page-index-card decision" href="pages/model-choice.html">
+      <span class="tag">Decision</span>
+      <h3>Model choice &mdash; Why TimesFM 2.5</h3>
+      <p>9-way comparison: ARIMAX, Prophet, DeepAR, NBEATS, PatchTST, Chronos, Lag-Llama, GPT-tools, and TimesFM. Decision matrix with weights.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/finetuning.html">
+      <span class="tag">Decision</span>
+      <h3>Fine-tuning strategy &mdash; LoRA vs alternatives</h3>
+      <p>PEFT comparison: full FT, adapters, LoRA, QLoRA, prefix tuning, BitFit, IA<sup>3</sup>. Math, rank sweep, hot-swap implementation.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/inference.html">
+      <span class="tag">Decision</span>
+      <h3>Inference optimization &mdash; the 47&times; speedup</h3>
+      <p>Layer-by-layer code: batching, BF16, <code>torch.compile</code>, LoRA hot-swap, caching. Plus the dead-ends I rejected.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/evaluation.html">
+      <span class="tag">Decision</span>
+      <h3>Evaluation &amp; calibration</h3>
+      <p>Pinball loss, CRPS, coverage, ECE, conformal prediction. The math for probabilistic forecasting metrics.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/monitoring.html">
+      <span class="tag">Decision</span>
+      <h3>Production monitoring &amp; rollback</h3>
+      <p>PSI, concept drift, calibration drift. SLO table, alert design, runbook, real incidents from production.</p>
+    </a>
+  </div>
+
+  <h2 id="scenarios">Deep-dive pages &mdash; operational scenarios</h2>
+  <p>
+    Six concrete production scenarios, each with the trigger, covariate inputs, model
+    behavior, optimizer response, trade-offs, and interview Q&amp;A.
+  </p>
+  <div class="page-index-grid">
+    <a class="page-index-card scenario" href="pages/scenario-holiday.html">
+      <span class="tag">Scenario</span>
+      <h3>1. Thanksgiving rush</h3>
+      <p>Holiday peak +$95 / day on hub-corp routes; q90 widens to absorb peak-day variance. +$11M holiday-week revenue.</p>
+    </a>
+    <a class="page-index-card scenario" href="pages/scenario-fuel.html">
+      <span class="tag">Scenario</span>
+      <h3>2. Fuel-price spike</h3>
+      <p>Brent up 9%; off-cycle re-score finishes 18 min before call center opens. Coefficient validation against OR team within 5%.</p>
+    </a>
+    <a class="page-index-card scenario" href="pages/scenario-competitor.html">
+      <span class="tag">Scenario</span>
+      <h3>3. Competitor undercut</h3>
+      <p>Delta drops $20 on ATL-LAX. Family-specific elasticity; 14-min p50 latency to customer-facing fare. Antitrust separation of policy vs forecast.</p>
+    </a>
+    <a class="page-index-card scenario" href="pages/scenario-weather.html">
+      <span class="tag">Scenario</span>
+      <h3>4. Weather irrops</h3>
+      <p>Storm at ORD; -$22 coefficient, intentional. Trained on scheduled (not realized) flags to prevent feedback loops.</p>
+    </a>
+    <a class="page-index-card scenario" href="pages/scenario-coldstart.html">
+      <span class="tag">Scenario</span>
+      <h3>5. New route cold-start</h3>
+      <p>JFK-PVG launches with zero history. Synthetic prior from analog routes; PI-inflation tapers as real history accumulates.</p>
+    </a>
+    <a class="page-index-card scenario" href="pages/scenario-cabin.html">
+      <span class="tag">Scenario</span>
+      <h3>6. Cabin upsell</h3>
+      <p>Premium-economy fares on DFW-LAX; 4&times; wider PI; rank-32 cross term learns cabin&times;holiday interactions.</p>
+    </a>
+  </div>
 
   <h2>Tech stack</h2>
   <div class="stack-grid">
@@ -207,7 +280,7 @@
   </blockquote>
 
   <p class="see-also">
-    &rarr; Full narrative in <a href="../user_stories.md">user_stories.md</a> with one
+    &rarr; Full narrative in <a href="https://github.com/SrikanthVelpuri/timesfm/blob/master/timesfm-forecasting/examples/airline-pricing-forecast/user_stories.md">user_stories.md</a> with one
     story per epic and the artifact shipped at each step.
   </p>
 </section>
@@ -257,7 +330,7 @@
     <li>Shipped 17 LoRA adapters; bottom 5 contributed almost nothing &mdash; could have shipped 12 and saved a week.</li>
   </ol>
 
-  <p class="see-also">&rarr; Full timeline in <a href="../timeline.md">timeline.md</a>.</p>
+  <p class="see-also">&rarr; Full timeline in <a href="https://github.com/SrikanthVelpuri/timesfm/blob/master/timesfm-forecasting/examples/airline-pricing-forecast/timeline.md">timeline.md</a>.</p>
 </section>
 
 <!-- ============== ARCHITECTURE ============== -->
@@ -288,7 +361,7 @@
     return_backcast=False,                 # AA does not need backcast
 )</code></pre>
 
-  <p class="caption">Each flag ties to a specific failure I hit in production backtests. Full incident history in <a href="../model_architecture.md">model_architecture.md</a>.</p>
+  <p class="caption">Each flag ties to a specific failure I hit in production backtests. Full incident history in <a href="https://github.com/SrikanthVelpuri/timesfm/blob/master/timesfm-forecasting/examples/airline-pricing-forecast/model_architecture.md">model_architecture.md</a>.</p>
 
   <h2>Covariate taxonomy</h2>
   <div class="covar-grid">
@@ -373,7 +446,7 @@
   </div>
   <p class="caption">Families that did not improve by &ge;0.5 pp MAPE fall back to head-only forecast. No service degradation.</p>
 
-  <p class="see-also">&rarr; Full recipe + retraining cadence in <a href="../finetuning_aa_data.md">finetuning_aa_data.md</a>.</p>
+  <p class="see-also">&rarr; Full recipe + retraining cadence in <a href="https://github.com/SrikanthVelpuri/timesfm/blob/master/timesfm-forecasting/examples/airline-pricing-forecast/finetuning_aa_data.md">finetuning_aa_data.md</a>.</p>
 </section>
 
 <!-- ============== INFERENCE ============== -->
@@ -420,7 +493,7 @@
   </table>
   <p class="caption">Total wall time: 1 m 40 s. Cost: $0.011 per run. Annualized: &lt;$50/year.</p>
 
-  <p class="see-also">&rarr; Full breakdown of every optimization in <a href="../inference_optimization.md">inference_optimization.md</a>.</p>
+  <p class="see-also">&rarr; Full breakdown of every optimization in <a href="https://github.com/SrikanthVelpuri/timesfm/blob/master/timesfm-forecasting/examples/airline-pricing-forecast/inference_optimization.md">inference_optimization.md</a>.</p>
 </section>
 
 <!-- ============== USER STORIES ============== -->
@@ -505,7 +578,7 @@
     </article>
   </div>
 
-  <p class="see-also">&rarr; Full stories with acceptance criteria in <a href="../user_stories.md">user_stories.md</a>.</p>
+  <p class="see-also">&rarr; Full stories with acceptance criteria in <a href="https://github.com/SrikanthVelpuri/timesfm/blob/master/timesfm-forecasting/examples/airline-pricing-forecast/user_stories.md">user_stories.md</a>.</p>
 </section>
 
 <!-- ============== SCENARIOS ============== -->
@@ -556,7 +629,7 @@
   </div>
   <p class="caption">Per-year frequency in real AA operations. Scenarios 2&ndash;4 trigger off-cycle re-scoring jobs; scenario 1 is built into the nightly run.</p>
 
-  <p class="see-also">&rarr; Full per-scenario walkthrough with covariate inputs and RMS responses in <a href="../scenarios.md">scenarios.md</a>.</p>
+  <p class="see-also">&rarr; Full per-scenario walkthrough with covariate inputs and RMS responses in <a href="https://github.com/SrikanthVelpuri/timesfm/blob/master/timesfm-forecasting/examples/airline-pricing-forecast/scenarios.md">scenarios.md</a>.</p>
 </section>
 
 <!-- ============== DASHBOARD ============== -->

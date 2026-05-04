@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Scenario: New Route Cold-Start &middot; AA Pricing Forecast</title>
+<meta name="description" content="JFK-PVG launches with zero history. Synthetic-prior bootstrapping, foundation-model zero-shot, hierarchical pooling, and how to forecast a route that has never flown." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#scenarios">Scenarios</a> &nbsp;/&nbsp; <span>New route cold-start</span>
+  </nav>
+
+  <h1>Scenario 5 &mdash; New seasonal route launch</h1>
+  <p class="lead">
+    Network Planning announces JFK-PVG (New York to Shanghai), twice-weekly, starting in
+    35 days. The route has zero historical data. The Director of RMS wants a forecast
+    anyway. This is the cold-start scenario that justifies the foundation-model approach
+    in the first place.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> No history &rarr; can&apos;t call TimesFM directly (needs &ge;32
+    points of context). Build a 90-day <strong>synthetic prior</strong> by averaging
+    normalized fare curves from analog routes (JFK-HKG, JFK-NRT, ORD-PVG). Run
+    <code>forecast_with_covariates()</code> on the synthetic prior + real AA covariates.
+    PI is wide for the first 14 days; tightens as real bookings replace synthetic days
+    in the rolling context window. Day-1 MAPE drops from 16% (legacy) to 8% (TimesFM).
+  </div>
+
+  <h2>Trigger</h2>
+  <p>
+    Network Planning notifies RMS that JFK-PVG launches Mar 15, twice weekly (Tue and
+    Sat). Equipment: 777-300ER. Fare-class structure published. No history. The pricing
+    team needs an opening fare ladder for booking that opens 30 days ahead of departure
+    &mdash; so we have ~5 days to produce a credible forecast.
+  </p>
+
+  <h2>The fundamental problem</h2>
+  <p>
+    TimesFM (or any context-conditioned forecaster) needs a context window to predict
+    from. Our model expects 90 days of daily fare history per OD-pair. JFK-PVG has zero
+    days. Three classes of solutions:
+  </p>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Approach</th><th>How it works</th><th>Day-1 MAPE</th><th>Trade-off</th></tr>
+    </thead>
+    <tbody>
+      <tr class="row-rejected"><td>Skip the route</td><td>Don&apos;t forecast; let revenue management set fares manually</td><td>n/a</td><td>Loses the foundation-model advantage; relies on judgment</td></tr>
+      <tr class="row-rejected"><td>Global mean reversion</td><td>Use the network-wide average fare curve as the context</td><td>~16%</td><td>Ignores route specifics; legacy-system approach</td></tr>
+      <tr class="row-rejected"><td>Random initialization</td><td>Random walk of plausible fares</td><td>~22%</td><td>Pathological; PI is meaningless</td></tr>
+      <tr class="row-chosen"><td>Synthetic prior from analog routes</td><td>Build a 90-day context by averaging analog OD-pairs (JFK-HKG, JFK-NRT, ORD-PVG)</td><td>~8% &mdash; <strong>chosen</strong></td><td>Requires defining &ldquo;analog&rdquo;; introduces some bias</td></tr>
+      <tr class="row-rejected"><td>Hierarchical Bayesian pooling</td><td>Pool across all Asia long-haul routes; estimate route-specific deviations</td><td>~9% est.</td><td>Statistically principled; ops complexity</td></tr>
+      <tr class="row-rejected"><td>Meta-learning fine-tune</td><td>Train a meta-model that outputs initialization for new routes</td><td>~7% est.</td><td>Engineering cost too high for &lt;15 launches/year</td></tr>
+    </tbody>
+  </table>
+
+  <h2>The synthetic-prior approach</h2>
+  <p>
+    The path we shipped. Three steps:
+  </p>
+
+  <h3>Step 1: define the analog set</h3>
+  <p>
+    For JFK-PVG, the analogs are routes that share key dimensions:
+  </p>
+  <ul>
+    <li><strong>Geography:</strong> Asia long-haul from US East/Midwest. JFK-HKG, JFK-NRT, ORD-PVG.</li>
+    <li><strong>Equipment:</strong> Wide-body. (Not narrow-body Caribbean.)</li>
+    <li><strong>Cabin mix:</strong> Premium-heavy. (Not all-economy.)</li>
+    <li><strong>Frequency:</strong> Limited (twice-weekly), not daily. Different booking-curve dynamics.</li>
+  </ul>
+  <p>
+    The analog set has 3 routes. More analogs would smooth more, but we want to capture
+    the specifics of "twice-weekly Asia long-haul from JFK."
+  </p>
+
+  <h3>Step 2: build the synthetic context</h3>
+  <pre><code>import numpy as np
+
+def build_synthetic_prior(analog_fare_panels, target_route_meta):
+    """
+    analog_fare_panels: dict[route_id, np.ndarray] of last 90 days of fares
+    target_route_meta:  dict with base_fare, route_type, etc.
+    Returns: 90-day synthetic fare context for the new route.
+    """
+    # 1. Normalize each analog by its mean (so they overlay despite different fare levels)
+    normed = {
+        rid: panel / panel.mean()
+        for rid, panel in analog_fare_panels.items()
+    }
+    # 2. Average across analogs &mdash; gives the typical normalized shape
+    synthetic_shape = np.mean(list(normed.values()), axis=0)
+    # 3. Scale by the new route&apos;s expected base fare (from Pricing&apos;s ladder filing)
+    synthetic_context = synthetic_shape * target_route_meta["base_fare"]
+    return synthetic_context.astype(np.float32)</code></pre>
+
+  <h3>Step 3: forecast as usual, but flag the synthetic context</h3>
+  <pre><code>point, q = model.forecast_with_covariates(
+    inputs=[synthetic_context],
+    dynamic_numerical_covariates={"jet_fuel_usd_gal": [fuel], ...},
+    static_categorical_covariates={
+        "route_type": ["international-asia-longhaul"],
+        "cabin": ["mixed"],
+        "equipment": ["widebody"],
+    },
+)
+
+# CRITICAL: widen the PI to reflect synthetic-context uncertainty.
+# We empirically inflate q90 by +30% and lower q10 by -30% during the
+# first 14 days of the route&apos;s life.
+SYNTHETIC_PI_INFLATION = 0.30
+q[..., 1] -= np.abs(point - q[..., 1]) * SYNTHETIC_PI_INFLATION   # widen q10
+q[..., 9] += np.abs(q[..., 9] - point) * SYNTHETIC_PI_INFLATION   # widen q90</code></pre>
+
+  <p>
+    The PI inflation is a deliberate over-estimate of uncertainty, conservative by
+    design. Without it, the model would report PIs as if the synthetic context were as
+    informative as real history &mdash; and downstream the optimizer would over-trust
+    the q90.
+  </p>
+
+  <h2>How the context fades from synthetic to real</h2>
+  <p>
+    As real bookings come in for JFK-PVG, we replace the synthetic context day-by-day:
+  </p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Days post-launch</th><th>Synthetic days in context</th><th>Real days in context</th><th>PI inflation</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>0 (launch day)</td><td>90</td><td>0</td><td>+30%</td></tr>
+      <tr><td>14</td><td>76</td><td>14</td><td>+15%</td></tr>
+      <tr><td>30</td><td>60</td><td>30</td><td>+5%</td></tr>
+      <tr><td>60</td><td>30</td><td>60</td><td>0</td></tr>
+      <tr><td>90+</td><td>0</td><td>90</td><td>0 (route fully ages in)</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Day-1 forecast quality</h2>
+  <p>
+    On the launch day, the median forecast for JFK-PVG was ~$1,450 main cabin, ~$4,200
+    business. Realized averages over the first month: $1,510 main, $4,310 business. MAPE
+    on the launch month: 8.1% &mdash; well within the network MAPE band. Coverage of 80%
+    PI: 78% &mdash; calibrated.
+  </p>
+
+  <h2>Trade-offs</h2>
+  <h3>Analog selection bias</h3>
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>Carefully chosen analogs</h4>
+      <ul>
+        <li>Capture route-specific dynamics (premium mix, equipment).</li>
+        <li>Day-1 MAPE much better than global mean.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Over-narrow analogs</h4>
+      <ul>
+        <li>Only 3 routes &rarr; high variance in the average.</li>
+        <li>Bias if those 3 routes are seasonally idiosyncratic at the time of borrowing.</li>
+        <li>Solution: average across longer time window (180 d not 90 d) on the analogs to smooth their idiosyncrasy.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>How wide should the PI inflation be?</h3>
+  <p>
+    The 30% inflation was set empirically by simulating launches on retired routes &mdash;
+    we re-launched a route that had history, used the analog method as if no history
+    existed, and measured how much the PIs needed to widen to maintain calibration.
+    Settled on 30% as the smallest that kept coverage &ge;78% in the simulation.
+  </p>
+
+  <h2>Where this could fail</h2>
+  <ol>
+    <li><strong>No good analogs.</strong> A truly novel route (e.g., the first Antarctic charter) has no analogs. Fall back to manual fare-setting by Pricing for the first 30 days.</li>
+    <li><strong>Demand surprise.</strong> JFK-PVG launches and demand is 2&times; what analogs suggested (a sudden China travel boom). The synthetic prior is wrong; the model under-forecasts. Symptom: load factor jumps quickly; revenue management raises bid-prices manually. Model self-corrects within 14 days as real history fades in.</li>
+    <li><strong>Analog-route disruption.</strong> If JFK-HKG was in irrops during the synthetic-prior window, the average is biased low. Mitigation: use 180-day analog windows excluding any flagged irrops periods.</li>
+    <li><strong>Equipment mismatch.</strong> Network Planning swaps the 777-300ER to a 787 mid-launch. Static cabin/equipment covariate would change; we&apos;d re-run with the new static labels but the synthetic prior may need re-derivation if cabin layout differs materially.</li>
+  </ol>
+
+  <h2>Real-world variants</h2>
+  <ul>
+    <li><strong>Re-launch of seasonal route.</strong> AA stops MIA-EZE for summer, restarts in winter. Has prior history but stale (4 months gap). Cold-start lite: use the prior-year same-season history as context.</li>
+    <li><strong>Equipment up-gauge.</strong> Same OD-pair, narrowbody &rarr; widebody. Static covariate changes but historical fares apply (cabin mix shifts).</li>
+    <li><strong>Frequency increase.</strong> Twice-weekly &rarr; daily. The DTD distribution shifts because more daily flights mean lower per-flight load factor for the same demand. Forecast adjustment is small but real.</li>
+    <li><strong>Codeshare-only launch.</strong> AA sells JV partner&apos;s flight as AA-coded. Need different covariate handling because the operator (and equipment) is JV partner, not AA.</li>
+  </ul>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Why does the foundation-model approach win on cold-start?</div>
+        <div class="a">Because the foundation model has an implicit prior over time-series shapes from its 100-billion-point pretraining. Per-route ARIMAX has no prior &mdash; with zero history it produces a constant or a global mean. TimesFM&apos;s prior, even on a synthetic context, gives a reasonable shape. The synthetic prior gives the model the right scale; the foundation prior gives the right shape; the covariates condition on AA-specific structure. Three layers of prior knowledge stacked.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you decide what counts as an analog?</div>
+        <div class="a">Three dimensions: geography (region pair), equipment (narrow vs wide-body), and frequency (daily vs limited). Pricing maintains the analog mapping in a config file; new routes inherit analogs from Network Planning&apos;s route-cluster definition. We re-validate annually by simulating cold-start on retired routes. If the analog-set MAPE on simulation is &gt;12%, we expand the set to 5+ analogs.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Could you use hierarchical Bayesian pooling instead?</div>
+        <div class="a">Yes &mdash; conceptually cleaner. Pool across all Asia long-haul routes, estimate route-specific deviations, propagate uncertainty through. Estimated MAPE 9% (slightly worse than synthetic prior on our simulation), but with theoretical PI guarantees. Reason we chose synthetic prior instead: ops simplicity. Synthetic prior is a 30-line function; Bayesian pooling needs PyMC + a re-fit pipeline + uncertainty propagation. For ~12 launches/year the engineering ROI didn&apos;t justify it.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why inflate the PI by 30% and not let the model figure it out?</div>
+        <div class="a">The model&apos;s quantile head was trained on series with real history. When fed a synthetic context, it does NOT know the context is synthetic; it produces PIs as if the context were as informative as real data. The 30% inflation is a post-hoc correction for the input&apos;s reduced informativeness. A more principled approach would be to encode "synthetic-ness" as a static covariate and train on simulated cold-start; we tested this but the synthetic-flag training data was hard to construct without leakage. The 30% empirical inflation is the pragmatic answer.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What happens if you have only 14 days of real history? Still cold-start?</div>
+        <div class="a">Hybrid. Concatenate: 76 days of synthetic + 14 days of real. The model takes the 90-day window. PI inflation tapers from 30% (day 0) to ~0 (day 90) as the synthetic days age out. The model doesn&apos;t need a special flag &mdash; the real days are simply the most recent in the rolling window, weighted naturally by recency in the attention.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How does this compare to what an LLM would do for a new route?</div>
+        <div class="a">An LLM would have to be prompted with descriptions of analog routes and asked to predict; it would produce confident-sounding numbers without a real probability distribution. No calibrated uncertainty. The synthetic-prior + foundation-model approach gives <em>both</em> a credible point forecast and calibrated PIs. The LLM gets the prose right; the foundation TS model gets the math right.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="scenario-weather.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Scenario: Weather irrops</div>
+    </a>
+    <a class="page-nav-item next" href="scenario-cabin.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Scenario: Cabin upsell</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

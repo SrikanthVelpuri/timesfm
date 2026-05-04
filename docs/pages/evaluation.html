@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Evaluation Metrics &amp; Calibration &middot; AA Pricing Forecast</title>
+<meta name="description" content="Pinball loss, CRPS, coverage, calibration, reliability diagrams, conformal prediction. How to evaluate probabilistic forecasts for revenue management." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Evaluation &amp; calibration</span>
+  </nav>
+
+  <h1>Evaluation metrics for probabilistic forecasts</h1>
+  <p class="lead">
+    The C++ bid-price optimizer does not consume a point forecast. It consumes a
+    distribution. So our evaluation has to be about <em>distribution quality</em>, not
+    just <em>median accuracy</em>. This page is the metric stack we use, the math behind
+    each metric, and the interview-grade answers for why each one matters.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Track <strong>seven</strong> metrics in CI:
+    point MAPE, sMAPE, RMSE, pinball loss (per quantile), 80% PI coverage, calibration ECE,
+    and CRPS. The release gate fails on any of: MAPE &gt; 6.0% network, coverage outside
+    [78%, 82%], ECE &gt; 0.04. Calibration is the most important metric for AA &mdash; a
+    miscalibrated 80% PI burns more revenue than 1 pp of MAPE.
+  </div>
+
+  <h2>Why distribution metrics, not just MAPE</h2>
+  <p>
+    The bid-price optimizer reads q10 and q90 to compute a risk-aware reservation level.
+    If our q90 is consistently too tight (true coverage 65% instead of 80%), the optimizer
+    over-protects high fare classes, the call center quotes too high, customers churn to
+    competitors, and we lose revenue we could have captured. <strong>The model with the
+    best MAPE is not always the model that makes us the most money.</strong>
+  </p>
+
+  <div class="insight">
+    <strong>Mental model:</strong> MAPE measures center accuracy. Calibration measures the
+    honesty of the uncertainty. The optimizer trusts the uncertainty. Therefore calibration
+    matters more in production than papers usually credit it for.
+  </div>
+
+  <h2>The metric stack</h2>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Metric</th><th>Type</th><th>What it measures</th><th>Release gate</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>MAPE</td><td>Point</td><td>Mean abs percent error of median</td><td>&le; 6.0% network</td></tr>
+      <tr><td>sMAPE</td><td>Point</td><td>Symmetric &mdash; bounded, robust</td><td>&le; 5.5%</td></tr>
+      <tr><td>RMSE</td><td>Point</td><td>Tail-sensitive error</td><td>monitored</td></tr>
+      <tr><td>Pinball loss</td><td>Quantile</td><td>Asymmetric loss per quantile</td><td>monitored</td></tr>
+      <tr><td>80% PI coverage</td><td>Interval</td><td>Fraction of actuals in [q10, q90]</td><td>78&ndash;82%</td></tr>
+      <tr><td>ECE</td><td>Calibration</td><td>Expected calibration error across quantiles</td><td>&le; 0.04</td></tr>
+      <tr><td>CRPS</td><td>Distribution</td><td>Continuous-rank probability score (full-distribution)</td><td>monitored</td></tr>
+    </tbody>
+  </table>
+
+  <h2>1. Pinball loss (the loss we train against)</h2>
+  <p>
+    For quantile <em>&tau;</em> &isin; (0, 1) and prediction <em>q&#770;</em><sub>&tau;</sub>:
+  </p>
+  <div class="math">
+    <em>L</em><sub>&tau;</sub>(<em>y</em>, <em>q&#770;</em><sub>&tau;</sub>) = max( &tau;(<em>y</em> &minus; <em>q&#770;</em><sub>&tau;</sub>), &nbsp;(&tau; &minus; 1)(<em>y</em> &minus; <em>q&#770;</em><sub>&tau;</sub>) )
+  </div>
+  <p>
+    For the median (<em>&tau;</em> = 0.5) this reduces to <em>L</em> = 0.5 &middot; |<em>y</em> &minus; <em>q&#770;</em>| &mdash; just MAE. For <em>&tau;</em> = 0.9, the loss is 9&times; heavier on under-predictions than over-predictions, which forces the model to push q90 high enough to cover 90% of actuals.
+  </p>
+  <p>
+    We train against the <strong>average over all 10 quantiles</strong> (TimesFM&apos;s
+    output) plus a small MSE on the median to keep numerical stability:
+  </p>
+  <div class="math">
+    <em>L</em><sub>train</sub> = (1/10) &Sigma;<sub>&tau; &isin; {0.1, &hellip;, 0.9}</sub> <em>L</em><sub>&tau;</sub> &nbsp;+&nbsp; 0.5 &middot; (<em>y</em> &minus; <em>q&#770;</em><sub>0.5</sub>)<sup>2</sup>
+  </div>
+
+  <h3>What pinball loss does NOT do</h3>
+  <p>
+    It does not enforce <em>q&#770;</em><sub>0.1</sub> &lt; <em>q&#770;</em><sub>0.2</sub> &lt; &hellip; &lt; <em>q&#770;</em><sub>0.9</sub>. Each quantile is trained independently. With small batches you sometimes see q40 &gt; q50 in regions of high uncertainty &mdash; harmless on a chart, fatal for an optimizer that assumes monotonicity. Hence <code>fix_quantile_crossing=True</code> in the ForecastConfig.
+  </p>
+
+  <h2>2. Coverage and the 80% PI</h2>
+  <p>
+    Define empirical coverage at level <em>&alpha;</em> = 80% as the fraction of held-out
+    actuals that fall between q10 and q90:
+  </p>
+  <div class="math">
+    cov<sub>80%</sub> = (1/<em>N</em>) &Sigma;<sub><em>i</em>=1</sub><sup><em>N</em></sup> 1[ <em>q&#770;</em><sub>0.1</sub><sup>(<em>i</em>)</sup> &le; <em>y</em><sup>(<em>i</em>)</sup> &le; <em>q&#770;</em><sub>0.9</sub><sup>(<em>i</em>)</sup> ]
+  </div>
+  <p>
+    Target: 80%. Anything in [78%, 82%] is acceptable; outside that we have a problem.
+    For AA we measure coverage:
+  </p>
+  <ul>
+    <li>Network-wide on the val cohort.</li>
+    <li>Per route family.</li>
+    <li>On Q4 only (holiday cohort &mdash; calibration usually breaks here).</li>
+    <li>On weekend vs weekday.</li>
+    <li>On weather-irrops days (small but high-variance cohort).</li>
+  </ul>
+
+  <h3>Why coverage drifts in production</h3>
+  <p>
+    Three drivers, in order of frequency:
+  </p>
+  <ol>
+    <li><strong>Distribution shift in covariates.</strong> A new fuel-price regime that the model wasn&apos;t trained on. Coverage typically drops 3&ndash;5 pp.</li>
+    <li><strong>Stale calibration after fine-tune.</strong> Re-training Stage A while keeping the temperature scaling unchanged. Coverage drift up to 8 pp.</li>
+    <li><strong>Upstream feature freshness loss.</strong> Competitor fare feed missed an update; the covariate is wrong; the conditional forecast is wrong. Coverage symptom is regional &mdash; only routes touched by the bad feature drift.</li>
+  </ol>
+
+  <h2>3. Expected Calibration Error (ECE)</h2>
+  <p>
+    Coverage at one level (80%) is necessary but not sufficient. A model could pass 80%
+    coverage but be miscalibrated at 60% or 90%. ECE summarizes calibration <em>across all
+    quantile levels</em>:
+  </p>
+  <div class="math">
+    ECE = &Sigma;<sub>&tau; &isin; bins</sub> | empirical_coverage(&tau;) &minus; &tau; |
+  </div>
+  <p>
+    Bins: typically {0.1, 0.2, &hellip;, 0.9}. Compute empirical coverage at each level
+    (fraction of actuals below <em>q&#770;</em><sub>&tau;</sub>), take absolute deviation
+    from <em>&tau;</em>, sum. Lower is better; ECE = 0 means perfect calibration.
+  </p>
+  <p>
+    Visual: the <strong>reliability diagram</strong>. X-axis = nominal quantile level. Y-axis = empirical coverage. A perfect model is the y=x diagonal. Real models curve.
+  </p>
+  <p>Our release gate: ECE &le; 0.04 across the 9 bins.</p>
+
+  <h2>4. CRPS &mdash; the full-distribution metric</h2>
+  <p>
+    Continuous Ranked Probability Score generalizes MAE to distributions. For a forecast
+    distribution <em>F</em> with CDF and an actual <em>y</em>:
+  </p>
+  <div class="math">
+    CRPS(<em>F</em>, <em>y</em>) = &int;<sub>&minus;&infin;</sub><sup>&infin;</sup> ( <em>F</em>(<em>x</em>) &minus; 1[<em>x</em> &ge; <em>y</em>] )<sup>2</sup> d<em>x</em>
+  </div>
+  <p>
+    For the discrete-quantile output of TimesFM (10 quantiles), we approximate via:
+  </p>
+  <div class="math">
+    CRPS &approx; (2/<em>K</em>) &Sigma;<sub><em>k</em>=1</sub><sup><em>K</em></sup> <em>L</em><sub>&tau;<sub><em>k</em></sub></sub>(<em>y</em>, <em>q&#770;</em><sub>&tau;<sub><em>k</em></sub></sub>)
+  </div>
+  <p>
+    i.e., the average pinball loss across quantiles is a Monte-Carlo estimate of CRPS. So
+    we already optimize CRPS implicitly during training. We <em>also</em> report it on
+    held-out data because it&apos;s a single scalar that captures distribution quality and
+    is easier to communicate than a 9-bin reliability diagram.
+  </p>
+
+  <h2>5. MAPE, sMAPE, RMSE &mdash; point metrics for completeness</h2>
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>MAPE = mean(|y - &#374;| / |y|)</h4>
+      <ul>
+        <li>Easy to communicate ("our forecast is off by 5%").</li>
+        <li>Comparable across routes with different absolute fare levels.</li>
+        <li>Standard in the airline industry; required for stakeholder reports.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>MAPE pitfalls</h4>
+      <ul>
+        <li>Asymmetric: penalizes over-prediction more than under-prediction.</li>
+        <li>Undefined for y=0 (not an issue for fares; matters for demand).</li>
+        <li>Poor on highly variable series; switch to sMAPE.</li>
+      </ul>
+    </div>
+  </div>
+
+  <p>
+    sMAPE: 200 &middot; |<em>y</em> &minus; <em>&#374;</em>| / (|<em>y</em>| + |<em>&#374;</em>|).
+    Bounded in [0, 200], symmetric &mdash; preferred for cross-cohort comparison.
+  </p>
+  <p>
+    RMSE: penalizes outliers more than MAE. Useful as a sanity check &mdash; a model with
+    similar MAPE but much higher RMSE is making big errors on rare days (often the holiday
+    days RMS cares most about).
+  </p>
+
+  <h2>The eval harness, in code</h2>
+  <pre><code>import numpy as np
+
+def evaluate(model, dataset, horizon=30):
+    """Returns the metrics dict gated in CI."""
+    point, q = model.forecast_with_covariates(
+        inputs=dataset["inputs"],
+        dynamic_numerical_covariates=dataset["dyn_num"],
+        dynamic_categorical_covariates=dataset["dyn_cat"],
+        static_categorical_covariates=dataset["static_cat"],
+    )
+
+    y     = np.asarray(dataset["actuals"])
+    yhat  = point                      # median
+    q10   = q[..., 1]
+    q90   = q[..., 9]
+
+    mape  = np.mean(np.abs(y - yhat) / np.abs(y)) * 100
+    smape = np.mean(2 * np.abs(y - yhat) / (np.abs(y) + np.abs(yhat))) * 100
+    rmse  = np.sqrt(np.mean((y - yhat) ** 2))
+
+    cov80 = np.mean((y &gt;= q10) &amp; (y &lt;= q90)) * 100
+
+    # ECE across 9 quantile levels
+    levels = np.arange(1, 10) / 10.0   # 0.1, 0.2, ..., 0.9
+    ece = 0.0
+    for k, tau in enumerate(levels):
+        empirical = np.mean(y &lt;= q[..., k+1])
+        ece += abs(empirical - tau)
+
+    # CRPS approximation
+    crps = 0.0
+    for k, tau in enumerate(levels):
+        diff = y - q[..., k+1]
+        crps += np.mean(np.maximum(tau * diff, (tau - 1) * diff))
+    crps *= 2.0 / len(levels)
+
+    return {
+        "mape": mape,
+        "smape": smape,
+        "rmse": rmse,
+        "coverage_80pct": cov80,
+        "ece": ece,
+        "crps": crps,
+    }</code></pre>
+
+  <h2>Conformal prediction &mdash; the alternative we did not ship</h2>
+  <p>
+    Conformal prediction is a model-agnostic post-hoc calibration method. Given a calibrated
+    score distribution from a held-out set, it produces prediction intervals with provable
+    finite-sample coverage guarantees. Sounds great for a regulated environment like RMS.
+    Why we did not use it:
+  </p>
+  <ol>
+    <li>TimesFM&apos;s built-in quantile head, with our pinball-loss training, gave coverage
+        in [78%, 82%] without any post-hoc adjustment. The provable guarantee was not worth
+        the engineering.</li>
+    <li>Conformal intervals are uniformly wide on conditional intervals &mdash; the same
+        margin around any conditional median &mdash; unless we use conditional conformal,
+        which is more complex and undermines the &ldquo;simple guarantee&rdquo; appeal.</li>
+    <li>We&apos;d still need to monitor coverage in production. Conformal &ne; "set and forget".</li>
+  </ol>
+  <p>
+    <strong>If we had a black-box external forecaster we couldn&apos;t modify, conformal would be the right choice.</strong> For TimesFM where we control the loss function, training pinball directly is more efficient.
+  </p>
+
+  <h2>Calibration drift in the wild</h2>
+  <p>Three real production stories from the project (with anonymized cohorts):</p>
+  <ul>
+    <li><strong>October 2025:</strong> coverage on Caribbean leisure family dropped from 79% to 71% over 4 days. Root cause: ATPCO competitor fare feed was 18 hours stale due to upstream Sabre incident. Resolution: marked the feed unhealthy, fell back to last-known competitor fare, coverage recovered in 1 day.</li>
+    <li><strong>Stage 4 release candidate:</strong> in CI, coverage on holiday-day cohort was 73%. The Q4 cohort had insufficient holiday samples in train; the LoRA had over-fit on weekday patterns. Resolution: stratified the training sampler to over-weight Q4 days; coverage on holiday cohort hit 81%.</li>
+    <li><strong>BF16 transition:</strong> coverage drifted 0.4 pp when we moved from FP32 to BF16. Below the gate threshold, but spotted by alert. Root cause: FP32 XReg head receiving BF16 inputs; precision loss at the boundary. Resolution: re-trained head with autocast on. Drift recovered.</li>
+  </ul>
+
+  <h2>What metrics I would add if I had more time</h2>
+  <ul>
+    <li><strong>Quantile loss elasticity:</strong> sensitivity of quantile-level loss to small changes in fare. Used in optimizer for second-order risk.</li>
+    <li><strong>Energy score:</strong> generalization of CRPS to multivariate forecasts. Useful when AA wants joint demand+fare forecasts.</li>
+    <li><strong>Realized vs forecast distribution divergence (KS or Wasserstein):</strong> a single number summarizing how far the realized distribution is from the forecast. Easier to alert on than ECE.</li>
+  </ul>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Walk me through the math of pinball loss and why it is the right loss for quantile forecasting.</div>
+        <div class="a">For quantile &tau; and prediction <em>q&#770;</em>, pinball is <em>L</em>(<em>y</em>, <em>q&#770;</em>) = max(&tau;(<em>y</em> &minus; <em>q&#770;</em>), (&tau; &minus; 1)(<em>y</em> &minus; <em>q&#770;</em>)). Penalizes under-prediction by &tau; and over-prediction by 1&minus;&tau;. Minimizing it (in expectation) yields the &tau;-th quantile of the conditional distribution. This is the Koenker-Bassett result &mdash; the foundational paper of quantile regression. For &tau;=0.9 we punish under-prediction 9&times; more, forcing the model to push q90 high enough.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What is calibration, and why is it not the same as accuracy?</div>
+        <div class="a">A model is calibrated if its predicted probabilities match empirical frequencies. A weather model that says "70% chance of rain" is calibrated if 70% of those days actually have rain. Accuracy is about the median; calibration is about the entire predictive distribution. A model can have great median accuracy and terrible calibration &mdash; and that&apos;s actively dangerous in production because downstream systems trust the uncertainty estimates.</div>
+      </div>
+      <div class="qa">
+        <div class="q">If your 80% PI coverage drops to 70%, what is your debugging procedure?</div>
+        <div class="a">Three checks in order. (1) Did the input distribution shift? Compare summary stats of the last 7 days vs the training distribution. (2) Is the issue cohort-specific? Slice coverage by route family, season, day-of-week &mdash; is the drop concentrated? (3) Did an upstream feature go stale? Check the pipeline lineage; if the competitor fare feed missed updates, the conditional forecast is feeding off bad data. Most production drops are in category 3.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why CRPS over Brier or NLL?</div>
+        <div class="a">CRPS handles continuous targets natively (fares); Brier is for binary outcomes; NLL requires assuming a parametric distribution. CRPS reduces to MAE for point forecasts, which means it&apos;s comparable across point and probabilistic models &mdash; a useful property for benchmarking. NLL is fine for parametric models like DeepAR, but TimesFM produces non-parametric quantile output, so NLL is undefined.</div>
+      </div>
+      <div class="qa">
+        <div class="q">When would you prefer conformal prediction over a learned quantile head?</div>
+        <div class="a">When (a) the underlying model is a black box you can&apos;t retrain, (b) you need provable finite-sample coverage for a regulator, or (c) you have a very small calibration set where a learned head would over-fit. For all three, conformal&apos;s nonparametric guarantee shines. For our case &mdash; TimesFM with a learned quantile head trained on millions of windows &mdash; conformal&apos;s benefits don&apos;t outweigh its uniform-width limitation.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you handle the trade-off between sharpness and coverage?</div>
+        <div class="a">Strictly proper scoring rules force you to confront it. Pinball loss penalizes both miscalibration and unnecessary width &mdash; a wider PI hurts when the actual lands inside, a tighter PI hurts when actuals fall outside. Optimizing pinball gives you the right Pareto trade-off automatically. The temptation is to manually widen PIs to "guarantee coverage", but that increases pinball and the optimizer downstream over-protects revenue. Trust the loss.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What's the relationship between pinball loss, CRPS, and quantile crossing?</div>
+        <div class="a">Pinball is a per-quantile loss. CRPS approximates by averaging pinball over quantile levels. Neither enforces ordering &mdash; you can train each quantile head independently and end up with q40 &gt; q50. The fix is either a constrained loss (penalty term for crossings) or a post-hoc projection (sort the quantiles after prediction, our approach via <code>fix_quantile_crossing=True</code>). The latter is mathematically equivalent to the isotonic-regression projection to the simplex of monotonic quantiles.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="inference.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Inference optimization</div>
+    </a>
+    <a class="page-nav-item next" href="monitoring.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Production monitoring &amp; rollback</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

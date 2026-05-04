@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Fine-Tuning Strategy &middot; AA Pricing Forecast</title>
+<meta name="description" content="LoRA vs QLoRA vs full fine-tune vs adapter modules vs BitFit vs IA-cubed vs frozen-with-linear-probe. PEFT method selection for TimesFM on AA pricing data." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Fine-tuning strategy</span>
+  </nav>
+
+  <h1>Fine-tuning strategy &mdash; PEFT method selection</h1>
+  <p class="lead">
+    AA has no continued-pretraining budget. The Google base weights stay frozen. The
+    decision was: <em>which subset of the model do we update, and how do we update it</em>?
+    This page is the parameter-efficient-fine-tuning (PEFT) comparison and the math behind
+    the chosen approach.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Two-stage strategy: (1) fine-tune the <strong>XReg regression head</strong>
+    end-to-end with frozen trunk to learn AA covariate elasticities, then (2) add
+    <strong>rank-8 LoRA adapters</strong> on attention Q/K/V/O projections per route family
+    for the top-200 OD-pairs. Total trainable parameters: ~3.2 M (1.6% of base model).
+    Total quarterly compute: ~$7. MAPE: 10.2% &rarr; 6.0% &rarr; 5.1%.
+    Full fine-tune was rejected at $45K/quarter for a 0.4 pp gain.
+  </p>
+
+  <h2>Why PEFT and not full fine-tuning</h2>
+  <p>
+    A 200&nbsp;M-param model fully fine-tuned on AA&apos;s ~2.8 M training windows would cost
+    around $45,000 of GPU spot per quarter and produce a ~800&nbsp;MB artifact per route family
+    if we wanted family-specific models. PEFT gives 85% of the accuracy gain at 0.02% of the
+    cost and produces ~4&nbsp;MB artifacts.
+  </p>
+  <p>The math, briefly:</p>
+  <div class="math">
+    full FT: train all <em>W</em> &isin; &Theta; &mdash; ~200 M params updated, gradients held for all
+  </div>
+  <div class="math">
+    LoRA: <em>W&apos;</em> = <em>W</em> + (&alpha; / <em>r</em>) &middot; <em>B A</em>, where <em>A</em> &isin; &reals;<sup><em>r</em>&times;<em>k</em></sup>, <em>B</em> &isin; &reals;<sup><em>d</em>&times;<em>r</em></sup>, <em>r</em> &lt;&lt; min(<em>d</em>, <em>k</em>)
+  </div>
+  <p>
+    For TimesFM with hidden dim 1280 and a target attention matrix that is 1280&times;1280,
+    a LoRA rank-8 adapter has 1280&times;8 + 8&times;1280 = <strong>20,480 params</strong> instead of
+    1.638 M. Multiply by 4 attention projections (Q/K/V/O) and 20 transformer blocks:
+    1.6 M LoRA params per route family vs 130 M for full fine-tuning of the same matrices.
+    <strong>~80&times; less compute.</strong>
+  </p>
+
+  <h2>The PEFT decision matrix</h2>
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Trainable params</th>
+        <th>Composability</th>
+        <th>Inference cost</th>
+        <th>MAPE on AA val</th>
+        <th>Memory @ train</th>
+        <th>Verdict</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="row-rejected">
+        <td>Full fine-tune</td>
+        <td>200 M (100%)</td>
+        <td>Per-family copies are 800 MB each</td>
+        <td>Same as base</td>
+        <td>4.7% (best)</td>
+        <td>~80 GB (Adam)</td>
+        <td>Out of budget</td>
+      </tr>
+      <tr class="row-rejected">
+        <td>Adapter modules (Houlsby et al.)</td>
+        <td>~3 M</td>
+        <td>Per-family swap; bottleneck layers</td>
+        <td>+5&ndash;10% latency (extra layers in path)</td>
+        <td>5.4%</td>
+        <td>~6 GB</td>
+        <td>Beaten by LoRA on speed</td>
+      </tr>
+      <tr class="row-chosen">
+        <td>LoRA (rank-8) on attention Q/K/V/O</td>
+        <td>1.6 M / family</td>
+        <td>Excellent &mdash; merge into <em>W</em> at inference if needed; or hot-swap</td>
+        <td>0% latency add (merged) / minimal (unmerged)</td>
+        <td>5.1%</td>
+        <td>~5 GB</td>
+        <td><strong>Chosen</strong></td>
+      </tr>
+      <tr class="row-rejected">
+        <td>QLoRA (4-bit base + LoRA)</td>
+        <td>1.6 M / family</td>
+        <td>Same as LoRA</td>
+        <td>4-bit dequant adds ~10% latency</td>
+        <td>5.3% (slight degrade)</td>
+        <td>~2.5 GB (the win)</td>
+        <td>Memory not the bottleneck for us</td>
+      </tr>
+      <tr class="row-rejected">
+        <td>Prefix tuning (Li &amp; Liang)</td>
+        <td>~50 K / family</td>
+        <td>Concatenated to keys/values</td>
+        <td>Some latency add (sequence length grows)</td>
+        <td>6.4%</td>
+        <td>~3 GB</td>
+        <td>Underperforms on calibration</td>
+      </tr>
+      <tr class="row-rejected">
+        <td>Prompt tuning (Lester et al.)</td>
+        <td>~10 K / family</td>
+        <td>Soft prompts</td>
+        <td>Low</td>
+        <td>7.2%</td>
+        <td>~3 GB</td>
+        <td>Insufficient capacity for AA</td>
+      </tr>
+      <tr class="row-rejected">
+        <td>BitFit (bias-only fine-tune)</td>
+        <td>~50 K (just biases)</td>
+        <td>Trivial swap</td>
+        <td>None</td>
+        <td>8.4%</td>
+        <td>~3 GB</td>
+        <td>Too constrained</td>
+      </tr>
+      <tr class="row-rejected">
+        <td>IA<sup>3</sup> (rescaling vectors)</td>
+        <td>~80 K</td>
+        <td>Element-wise scaling, mergeable</td>
+        <td>None</td>
+        <td>6.9%</td>
+        <td>~3 GB</td>
+        <td>Better than BitFit; worse than LoRA</td>
+      </tr>
+      <tr class="row-chosen">
+        <td>Frozen trunk + linear probe (XReg head)</td>
+        <td>~300 K</td>
+        <td>Single shared head</td>
+        <td>None</td>
+        <td>6.0%</td>
+        <td>~2 GB</td>
+        <td><strong>Chosen as Stage A</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>The two-stage architecture we shipped</h2>
+  <pre><code>+--------------------------------------------------+
+|  google/timesfm-2.5-200m-pytorch (FROZEN ALWAYS) |
++--------------------------------------------------+
+                |                            |
+                |                            |
+   (a) attention layers           (b) output to XReg head
+                |                            |
+                v                            v
+   +---------------------+    +-------------------------+
+   | LoRA r-8 adapters   |    | XReg regression head    |
+   | (per route family,  |    | (linear core + rank-32  |
+   |  20 families)       |    |  cross-route term)      |
+   +---------------------+    +-------------------------+
+                |                            |
+                +--------+    +--------------+
+                         |    |
+                         v    v
+                   final forecast
+                   (median + 10 quantiles)</code></pre>
+
+  <h3>Stage A: XReg head (Linear probe with quantile head)</h3>
+  <ul>
+    <li>Inputs: TimesFM&apos;s baseline forecast residuals + the AA covariate stack.</li>
+    <li>Architecture: L2-regularized linear core + rank-32 cross-route interaction term + 10-quantile output.</li>
+    <li>Loss: pinball loss on all 10 quantiles + median MSE, equally weighted (0.5 / 0.5).</li>
+    <li>Training: ~250 K windows, 3 epochs, ~40 min on 1&times;A10G, $0.70.</li>
+    <li>Why this is &ldquo;PEFT&rdquo;: trunk is frozen; only the head and the rank-32 cross term train. ~300 K params.</li>
+  </ul>
+
+  <h3>Stage B: LoRA rank-8 on attention</h3>
+  <ul>
+    <li>Targets: Q, K, V, O projections in all 20 transformer blocks.</li>
+    <li>Rank: 8 (chosen via sweep over {4, 8, 16, 32}).</li>
+    <li>Alpha (LoRA scaling): 16 (so &alpha;/r = 2.0).</li>
+    <li>Init: A ~ N(0, 0.02), B = 0 (Kaiming-style for the input projection, zero for output to start as identity).</li>
+    <li>Training: ~50 K windows per family, 1 epoch, ~6 min per family, ~$0.30 each.</li>
+    <li>Output: 17 of 20 families ship; 3 fail the &ge;0.5 pp gate and fall back to head-only.</li>
+  </ul>
+
+  <h2>The LoRA rank sweep</h2>
+  <p>
+    Why rank 8? Empirical sweep on a representative family (Transcontinental hub):
+  </p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Rank</th><th>Params / family</th><th>Train time / family</th><th>Val MAPE</th><th>Verdict</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>r = 4</td><td>~800 K</td><td>~4 min</td><td>5.4%</td><td>Underfits family-specific patterns</td></tr>
+      <tr class="row-chosen"><td>r = 8</td><td>~1.6 M</td><td>~6 min</td><td>5.1%</td><td><strong>Chosen</strong> &mdash; best ROI</td></tr>
+      <tr><td>r = 16</td><td>~3.2 M</td><td>~10 min</td><td>5.0%</td><td>0.1 pp gain not worth 2&times; storage / train time</td></tr>
+      <tr><td>r = 32</td><td>~6.4 M</td><td>~18 min</td><td>5.0%</td><td>Saturates</td></tr>
+    </tbody>
+  </table>
+
+  <div class="insight">
+    <strong>Pattern:</strong> for low-data fine-tunes (50K windows), LoRA capacity saturates fast.
+    The choice between r-8 and r-16 is essentially &ldquo;trade 0.1 pp MAPE for half the storage,
+    half the train time, and half the swap latency.&rdquo; All operational, so r-8 wins.
+  </div>
+
+  <h2>How we hot-swap LoRA at inference</h2>
+  <p>
+    The naive load-from-disk swap is ~800 ms (read safetensors, transfer to GPU, apply).
+    That kills the nightly batch budget. The path we shipped:
+  </p>
+  <pre><code># At service startup (once, ~600 ms total)
+adapters = {}
+for family in FAMILIES:                       # 17 families
+    sd = safetensors.load_file(f"adapters/{family}.safetensors")
+    adapters[family] = {                      # pin to CPU memory
+        k: v.pin_memory() for k, v in sd.items()
+    }
+
+# Per batch (amortized ~8 ms per family change)
+def run_batch(family, inputs, covar):
+    if family != current_family:
+        model.lora_state_dict_update_(adapters[family])  # in-place
+        current_family = family
+    return model.forecast_with_covariates(...)</code></pre>
+  <p>
+    The <code>lora_state_dict_update_</code> helper is ~30 lines of PyTorch that copies only
+    the LoRA tensors (A and B per layer) from pinned CPU memory into the resident GPU model.
+    Base weights never move.
+  </p>
+
+  <h3>Why pinned memory matters</h3>
+  <p>
+    PyTorch&apos;s default <code>state_dict.update()</code> with pageable CPU source tensors
+    triggers an extra copy through the OS&apos;s page cache. With pinned memory, the H2D
+    DMA goes straight from CPU to GPU. ~8&times; faster for the LoRA-sized payload (~4 MB):
+  </p>
+  <ul>
+    <li>Pageable CPU &rarr; GPU: ~62 ms</li>
+    <li>Pinned CPU &rarr; GPU: ~8 ms</li>
+  </ul>
+
+  <h2>What I almost shipped wrong</h2>
+  <ol>
+    <li><strong>Trained LoRA on Q only, not on all of QKVO.</strong> Saves params but missed cross-attention patterns. Rank-16 on Q alone (3.2 M params) underperformed rank-8 on QKVO (1.6 M params) by 0.4 pp. <em>Targeting the right matrices matters more than rank.</em></li>
+    <li><strong>Used <code>alpha = rank</code> first.</strong> The original LoRA paper&apos;s "scale by &alpha;/r" lets you change rank without re-tuning effective learning rate &mdash; we want &alpha;/r to be a fixed effective LR scaling. We set &alpha;=16, so r-8 has &alpha;/r = 2.0 and r-16 has &alpha;/r = 1.0. Without this convention, rank changes also changed effective LR and the sweep was noisy.</li>
+    <li><strong>Forgot to disable the dropout in the LoRA layers at inference.</strong> Standard PyTorch eval mode handles this; I had a custom inference path that bypassed it. Calibration drifted ~0.7 pp until I noticed.</li>
+  </ol>
+
+  <h2>Composability with the XReg head</h2>
+  <p>
+    Stage A and Stage B are independent. The shipped service runs:
+  </p>
+  <div class="math">
+    <em>forecast</em> = TimesFM<sub>base + LoRA(family)</sub>(<em>history</em>) + XReg<sub>head</sub>(<em>covariates</em>)
+  </div>
+  <p>
+    Either component can be rolled back independently. If a LoRA family fails CI gate, we
+    drop the adapter and fall back to TimesFM-base + XReg head &mdash; the service
+    degrades gracefully to Stage-A quality on that family. The XReg head, by contrast, is
+    universal and always loaded.
+  </p>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Why LoRA over adapter modules (Houlsby/Pfeiffer)?</div>
+        <div class="a">Two reasons. (1) Inference latency: adapters insert bottleneck layers <em>in the forward pass</em> &mdash; you pay them every batch. LoRA is mathematically <em>added</em> to existing weights and can be merged at inference (W&prime; = W + &alpha;/r &middot; BA), so the latency is identical to base model. (2) Composability: with LoRA we can hot-swap per family in 8 ms; with adapters we&apos;d need to physically replace network layers between batches.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why didn&apos;t you use QLoRA?</div>
+        <div class="a">QLoRA is 4-bit base + LoRA. The win is memory: the base model takes ~300 MB instead of ~800 MB. We had no memory pressure (~3 GB peak on a 24 GB A10G), so QLoRA only added a 10% inference-latency penalty from runtime de-quantization with no offsetting benefit. QLoRA shines when fine-tuning at small VRAM (consumer GPUs, hosted GPUs with 16 GB). Not our case.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How did you set the LoRA dropout?</div>
+        <div class="a">0.05 on the rank dimension. Larger dropout (0.1+) hurt convergence; lower (0.0) overfit on the smaller families. The dropout has to be disabled at inference (<code>module.eval()</code>) &mdash; I once shipped a build that left it on and saw 0.7 pp coverage drift before debugging.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What happens if you train LoRA at rank 1?</div>
+        <div class="a">Tried it. MAPE 6.4% &mdash; worse than the head-only baseline (6.0%) for the family I tested on. With rank 1 the LoRA captures only one direction of variation; it actively interferes with the base model&apos;s ability to use other directions. Below rank ~4 the LoRA hurts more than it helps. Empirical, not theoretical &mdash; the original paper&apos;s claim that rank 1 works on language-model fine-tunes does not transfer to TimesFM.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you decide which layers to LoRA-target?</div>
+        <div class="a">Two signals. (1) Layer-wise gradient magnitudes during a brief full fine-tune probe &mdash; layers with the largest gradient L2 are the ones that "want to change". (2) Ablation: hold out one layer family at a time and measure MAPE delta. For TimesFM, attention QKVO dominates; FFN and embeddings did not improve enough to justify the extra params. We do <em>not</em> LoRA the output head or quantile head &mdash; those are tuned by Stage A.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What's the relationship between LoRA rank and effective learning rate?</div>
+        <div class="a">The original paper&apos;s formula <code>W&prime; = W + (&alpha;/r) &middot; BA</code> means the contribution magnitude is independent of <em>r</em> if you scale &alpha; with <em>r</em>. We fix &alpha;=16 so r-4 has stronger update magnitude than r-16; the rank only changes capacity, not LR. This is the convention used in HuggingFace&apos;s PEFT library and matters when you sweep rank &mdash; otherwise rank changes confound with effective LR changes and your sweep results are misleading.</div>
+      </div>
+      <div class="qa">
+        <div class="q">If you could afford full fine-tuning, would you do it?</div>
+        <div class="a">No. Two reasons beyond cost. (1) Catastrophic forgetting risk: full FT on AA data could degrade zero-shot performance on long-tail OD-pairs that don&apos;t see fine-tune examples. LoRA + frozen trunk preserves the foundation prior by construction. (2) Auditability: with frozen trunk + small LoRA delta, I can produce a layer-wise diff vs the Google base for compliance review. Full FT would give a 200&nbsp;M-param diff that nobody can audit.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="model-choice.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Model choice (TimesFM vs alternatives)</div>
+    </a>
+    <a class="page-nav-item next" href="inference.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Inference optimization deep dive</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

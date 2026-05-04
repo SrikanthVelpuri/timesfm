@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Scenario: Weather Irrops &middot; AA Pricing Forecast</title>
+<meta name="description" content="A winter storm warning at ORD flags weather-disruption days. How TimesFM avoids feedback loops by training on scheduled (not realized) irrops, and why the -$22 coefficient is intentional." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#scenarios">Scenarios</a> &nbsp;/&nbsp; <span>Weather irrops</span>
+  </nav>
+
+  <h1>Scenario 4 &mdash; The weather irrops</h1>
+  <p class="lead">
+    A winter storm warning is issued for Chicago O&apos;Hare for Tuesday and Wednesday.
+    Operations sets the <code>weather_disruption</code> covariate to 1 for any route
+    segment touching ORD on those days. Forecast adjusts -$22; optimizer dumps low-class
+    inventory; better $180 in the seat than no-show on the day.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Weather covariate flips from 0 to 1 on the affected days. XReg
+    coefficient is -$22 (a learned average of historical irrops fare suppression). The
+    forecast median drops only on the affected days; surrounding days unaffected. The PI
+    widens too because irrops days have higher variance (re-accommodation, last-minute
+    cancellations, refunds). The biggest design choice: train on the <em>scheduled</em>
+    weather flag, not the <em>realized</em> outcome &mdash; this prevents a feedback loop
+    where dumping inventory makes irrops days look even cheaper in the next training
+    cycle.
+  </div>
+
+  <h2>Trigger</h2>
+  <p>
+    NWS issues a winter-storm warning for ORD covering Tuesday 06:00 through Wednesday
+    18:00. Ops dashboards flip; the AA Network Operations Center decides whether to issue
+    a Ground Delay Program. Either way, the <code>weather_disruption</code> covariate gets
+    set to 1 on D+1 and D+2 for routes with ORD origin or destination.
+  </p>
+
+  <h2>Covariate inputs</h2>
+  <p>
+    The weather forecast feed (NOAA + private vendor blend) updates every 6 hours. The
+    next nightly batch picks up the new flags. For high-magnitude warnings, an off-cycle
+    re-score fires immediately rather than waiting for the nightly.
+  </p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Day</th><th>Old weather flag</th><th>New weather flag</th><th>Affected route count</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>D+1 (Tue)</td><td>0</td><td>1</td><td>~280 ORD-touching routes</td></tr>
+      <tr><td>D+2 (Wed)</td><td>0</td><td>1</td><td>~280 ORD-touching routes</td></tr>
+      <tr><td>D+3 (Thu)</td><td>0</td><td>0</td><td>0 (storm clears)</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Model behavior</h2>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Component</th><th>Old D+1 forecast</th><th>New D+1 forecast</th><th>&Delta;</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>TimesFM baseline</td><td>$305</td><td>$305</td><td>0</td></tr>
+      <tr><td>Holiday effect</td><td>0</td><td>0</td><td>0</td></tr>
+      <tr><td>DOW effect</td><td>+$45</td><td>+$45</td><td>0</td></tr>
+      <tr><td>Competitor</td><td>+$8</td><td>+$8</td><td>0</td></tr>
+      <tr><td>DTD</td><td>+$5</td><td>+$5</td><td>0</td></tr>
+      <tr><td>Weather</td><td>0</td><td><strong>-$22</strong></td><td><strong>-$22</strong></td></tr>
+      <tr class="row-chosen"><td><strong>Median forecast (q50)</strong></td><td><strong>$363</strong></td><td><strong>$341</strong></td><td><strong>-$22</strong></td></tr>
+      <tr><td>q10</td><td>$320</td><td>$285</td><td>-$35 (PI widens)</td></tr>
+      <tr><td>q90</td><td>$415</td><td>$405</td><td>-$10</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Note the asymmetric PI move: q10 drops more than q90. The model learned that irrops
+    days have a longer left-tail &mdash; some passengers are re-accommodated at the
+    originally-paid fare; some are bumped to revenue flights at last-seat prices; a fraction
+    are refunded entirely. The downside variance is bigger than the upside.
+  </p>
+
+  <h2>Why we train on scheduled, not realized, weather</h2>
+  <div class="insight">
+    <strong>Critical design choice.</strong> If we train the XReg coefficient on
+    <em>realized</em> irrops days (i.e., days where actual cancellations happened), we
+    create a feedback loop: lower forecasts &rarr; lower bid-prices &rarr; cheaper seats
+    sold &rarr; lower realized fares &rarr; bigger negative coefficient on retrain. The
+    coefficient amplifies over each training cycle.
+  </div>
+
+  <p>Instead, we train on the <em>scheduled</em> weather flag &mdash; the prediction made
+  the day before. This way the coefficient measures the historical <em>expected</em>
+  effect of <em>predicted</em> irrops, and the feedback loop is broken: a forecasted
+  storm that doesn&apos;t actually materialize does not retroactively change training
+  data.</p>
+
+  <h2>Where this could fail</h2>
+  <ol>
+    <li><strong>Forecasted storm misses.</strong> NWS predicts ground delay; storm tracks south. AA dropped fares for nothing. Operationally OK because customers already bought at the lower fare; we just pocketed less revenue. Mitigation: re-evaluate at each NOAA refresh; if forecast retracts, back out the weather flag.</li>
+    <li><strong>Cascading cancellations.</strong> A 2-day storm causes 5 days of schedule recovery. The covariate as designed only covers the storm days. The recovery days are under-modeled. Improvement TODO: extend covariate to capture &ldquo;recovery period&rdquo; with separate coefficient.</li>
+    <li><strong>Hurricane track uncertainty.</strong> 5-day forecast cone for a hurricane covers many ORD-bound routes. Covariate flag is binary, so we either flag everything (over-suppress fares) or wait for the cone to narrow (lose the response window). Possible improvement: probabilistic weather covariate with confidence weighting.</li>
+  </ol>
+
+  <h2>Trade-offs</h2>
+  <h3>How aggressively to dump inventory</h3>
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>Aggressive dump (-$30+ on irrops days)</h4>
+      <ul>
+        <li>Fills seats that would otherwise no-show.</li>
+        <li>Reduces customer-care load (refund processing).</li>
+        <li>Better passenger sentiment vs cancelling.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Aggressive dump (downside)</h4>
+      <ul>
+        <li>If storm doesn&apos;t materialize, we sold seats at $230 that would have gone for $310.</li>
+        <li>Sets precedent for &ldquo;weather discounts&rdquo; that customers learn to game.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Why the model says -$22 and not -$50</h3>
+  <p>
+    The fitted coefficient reflects the historical average of how AA actually re-prices
+    during irrops &mdash; conservatively. AA does not dump aggressively because the
+    operational chaos already eats the margin; further fare cuts would compound.
+    The -$22 coefficient is calibrated to reality, not to a theoretical optimum.
+  </p>
+
+  <h2>Real-world variants</h2>
+  <ul>
+    <li><strong>Multi-hub disruption.</strong> Northeast snowstorm hits ORD, JFK, LGA simultaneously. Cluster of routes flag together. Network re-pricing fires once across the affected cluster.</li>
+    <li><strong>Hurricane evacuation routes.</strong> Pre-storm, demand on flights <em>away from</em> the affected city spikes. The weather flag suppresses fares in/out (irrops); the underlying demand surge is in the q90 PI but not modeled explicitly. Possible v2 covariate: &ldquo;evacuation route&rdquo;.</li>
+    <li><strong>Recovery period after a major event.</strong> 3 days after the storm clears, AA is still flying make-up flights to absorb the backlog. Covariate as shipped doesn&apos;t cover this; manual override by Pricing.</li>
+    <li><strong>Wildfire / smoke.</strong> Different from snowstorm but similar irrops footprint. NWS feeds them through the same warning system; covariate handles them identically.</li>
+  </ul>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Walk me through the feedback-loop concern with weather covariates.</div>
+        <div class="a">If we trained on realized irrops outcomes, the model learns from the suppressed fares we set. Lower forecasts in this cycle &rarr; lower bid-prices &rarr; cheaper sold inventory &rarr; lower realized fares &rarr; even more negative coefficient next training. The coefficient diverges. We avoid this by training on scheduled (predicted) weather flags &mdash; the fitted relationship is between &ldquo;day-ahead weather forecast&rdquo; and &ldquo;realized fare,&rdquo; not between &ldquo;realized irrops&rdquo; and &ldquo;realized fare.&rdquo; Static prediction inputs at training prevent feedback.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why is the q10 wider on irrops days but q90 not?</div>
+        <div class="a">Asymmetric historical variance. Some irrops days result in deep fare cuts ($150 below normal); others see only modest cuts ($20). Almost no irrops day has a fare <em>spike</em> &mdash; the only direction is down. So the left tail of the predictive distribution is fatter, the right tail isn&apos;t. The quantile head learned this asymmetry from training data.</div>
+      </div>
+      <div class="qa">
+        <div class="q">If the forecasted storm doesn&apos;t materialize, what happens?</div>
+        <div class="a">The next NOAA refresh removes the flag. We re-score affected routes; forecast bounces back. But customers who already bought at the suppressed fare have those tickets &mdash; we don&apos;t retroactively raise prices. The revenue cost of a false-positive irrops flag is bounded to the bookings that happened during the flagged window, typically 10&ndash;30% of daily volume on those routes. Acceptable cost vs the downside of underpredicting a real storm.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How would you improve the weather covariate?</div>
+        <div class="a">Make it probabilistic. Currently binary 0/1. Better: a continuous &ldquo;disruption probability&rdquo; from NWS&apos;s ensemble forecast. The coefficient becomes -$22 &times; P(storm). At low confidence (50% chance) we suppress fares half as much &mdash; better expected revenue if the storm doesn&apos;t hit. Trade-off: more complex to communicate to Ops, harder to set a binary &ldquo;trigger off-cycle re-score&rdquo; threshold.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How does this interact with AA&apos;s flexible-rebooking waivers?</div>
+        <div class="a">Indirectly. Waivers reduce no-shows (because customers can rebook freely instead of just absorbing the loss), which means less fare suppression is needed. The coefficient is fitted on data from a period with waivers in effect, so the -$22 already accounts for the typical waiver behavior. If AA changed waiver policy materially, we&apos;d need to retrain &mdash; one of the things the OR team flags during quarterly elasticity review.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="scenario-competitor.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Scenario: Competitor undercut</div>
+    </a>
+    <a class="page-nav-item next" href="scenario-coldstart.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Scenario: New route cold-start</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>
