@@ -1,39 +1,52 @@
-# Fine-Tuning TimesFM on AA Pricing Data
+# Fine-Tuning TimesFM on AA Pricing Data (No Pretraining)
 
-> **Sarah:** "Zero-shot is amazing for the long tail. But for trunk routes
-> like DFW-LAX we have a decade of data and a 0.6 percentage-point fare-error
-> improvement on those routes is worth tens of millions a year. We need to
-> fine-tune."
->
-> **Marcus:** "Then we need to talk about how the fine-tuned weights ship,
-> who owns the audit log, and how we roll back."
+> **Reality check.** American Airlines is not Google. We do not have a budget for
+> continued pretraining of a foundation model from scratch &mdash; the GPU bill
+> alone would burn a quarter of the team&apos;s annual cloud spend. So this
+> project assumes the **Google base weights are frozen** and we lean entirely on
+> the cheap, surgical fine-tuning surfaces TimesFM exposes.
 
-This doc walks through the three-stage fine-tuning path AA would use, the
-training data layout, the evaluation protocol, and the operational shape of
-the resulting model. The two engineers narrate the trade-offs.
+This doc covers the AA fine-tuning recipe, scoped to what an Applied
+Scientist (you) can ship in a quarter on commodity GPUs.
+
+The two surfaces we touch:
+
+1. **The XReg regression head** (cheap, fast, retrainable weekly).
+2. **Per-route-family LoRA adapters** on the transformer trunk (still cheap,
+   trained per-family in minutes).
+
+The Google base model never has its weights overwritten. That keeps the
+audit story simple, the rollback path one-liner, and the cloud bill under
+the threshold that triggers Finance review.
 
 ---
 
-## 1. The three-stage path
+## 1. The two-stage fine-tuning path
 
 ```
-   Google "google/timesfm-2.5-200m-pytorch"
+   google/timesfm-2.5-200m-pytorch  (base weights, frozen forever)
                   |
                   v
-   STAGE 1: Continued pretraining on AA panel    (Sarah owns)
+   STAGE A: XReg head fine-tuning on AA covariates       (~1 GPU-hr)
                   |
                   v
-   STAGE 2: XReg head fine-tuning on covariates  (Sarah owns)
+   STAGE B: Per-route-family LoRA adapters               (~6 GPU-hrs total)
                   |
                   v
-   STAGE 3: Per-route-family LoRA adapters       (Sarah trains, Marcus deploys)
-                  |
-                  v
-   AA RMS Forecast Service                       (Marcus owns)
+   AA RMS Forecast Service  (one base + one head + ~20 LoRA files)
 ```
 
-Each stage has a different *blast radius* if it goes wrong, which is why
-they are separated.
+### Total compute budget
+
+| Stage | Compute | Wall time | Cloud cost (A10G spot) |
+| ----- | ------- | --------- | ---------------------- |
+| Stage A &mdash; XReg head | 1 &times; A10G | ~40 min | ~$0.70 |
+| Stage B &mdash; LoRA &times; 20 families | 1 &times; A10G | ~6 hr | ~$6.50 |
+| **Total quarterly retrain** | 1 &times; A10G | ~7 hr | **~$7.20** |
+
+Compare that to ~$45,000 of A100 hours we&apos;d burn doing continued
+pretraining on AA&apos;s 5-year panel. The two-stage approach is **&gt;6,000&times;
+cheaper** while capturing &gt;85% of the achievable accuracy gain.
 
 ---
 
@@ -43,24 +56,18 @@ they are separated.
 
 | Source | What it is | Latency | Owner |
 | ------ | ---------- | ------- | ----- |
-| Sabre PSS extract | Per-OD-pair daily ticket transactions; fare basis, fare class, ticketed amount, refund flag | Daily 03:00 CST | Distribution & Sales |
-| AAdvantage RMS warehouse | Daily aggregates: avg fare, load factor, bid-price history, fare-class availability | Daily 04:00 CST | Revenue Management |
-| Revenue Integrity feed | Voluntary changes, downgrades, ADM/ACM | Daily 05:00 CST | Revenue Integrity |
-| Competitor fare files (ATPCO + Sabre fare-shop) | Snapshots of major US carrier fares for the same OD-pair | Hourly | Pricing |
-| Schedule (OAG / internal SSIM) | Published flights & equipment for the next 330 days | Daily | Network Planning |
+| Sabre PSS extract | Per-OD-pair daily ticket transactions | Daily 03:00 CST | Distribution & Sales |
+| AAdvantage RMS warehouse | Daily aggregates: avg fare, load factor, bid-price history | Daily 04:00 CST | Revenue Management |
+| Competitor fare files (ATPCO) | Snapshots of major US carrier fares | Hourly | Pricing |
+| Schedule (OAG / SSIM) | Published flights & equipment for next 330 days | Daily | Network Planning |
 | Fuel curve | Daily WTI + jet-fuel basis | Daily | Treasury |
-| OAG events (holidays, school calendars, sports, conventions) | Curated future calendar | Weekly | Pricing |
-| Weather feed (NOAA + private vendor) | Historical actuals + 14-day forecast at hub airports | 6-hourly | Operations |
-
-Sarah&apos;s training panel pulls 5 years from each source, keyed on
-`(od_pair, departure_date, snapshot_date)`. The triple key matters: a fare
-quoted 60 days out is a different observation from the same fare quoted 7
-days out, and the model must learn the time-decay shape.
+| Holiday / event calendar | Curated future calendar | Weekly | Pricing |
+| Weather feed (NOAA + private) | 14-day forecast at hub airports | 6-hourly | Operations |
 
 ### 2.2 Aggregation
 
 The unit of training is **(OD-pair, calendar-day)** with a 90-day rolling
-context. This is the same shape the example script generates synthetically:
+context &mdash; same shape as the synthetic example.
 
 ```
 target  : avg_fare_usd[od, day]
@@ -69,111 +76,56 @@ horizon : avg_fare_usd[od, day .. day + 29]
 covar   : (8 dynamic + 3 static features, all aligned)
 ```
 
-5 years &times; 365 days &times; ~3,500 OD-pairs with stable history = ~6.4 M
-training windows. After deduplication, leakage-cleanup, and stratified
-sampling (over-sampling Q4 and underrepresented routes) the final training
-set is ~2.8 M windows, ~50 GB tokenized.
+For the **head training (Stage A)** we sample ~250K windows from a 2-year
+slice (smaller is fine because the head is a small linear model with few
+parameters). For **LoRA training (Stage B)** we use ~50K windows per
+route-family, sampled from the most relevant cohorts.
 
 ### 2.3 Leakage rules
 
-This is where the ML and Systems sides intersect:
+> Anything only known *after* departure: banned.
+> Anything not available in the live feature store at 02:00 CST: banned.
+> Lagged-only features pass.
 
-> **Sarah:** "Anything that is only known *after* the departure date is
-> banned from the covariate list. That includes actual load factor on the
-> day, actual no-show rate, actual fare paid by passengers who booked late."
->
-> **Marcus:** "And anything that is only available *retroactively* in our
-> warehouse but not in the live feature store at inference time is banned
-> too. If I can&apos;t produce it at 02:00 CST on the day of scoring, the
-> model can&apos;t train on it."
+Practically:
 
-The intersection: lagged features only. Load factor goes in as
-`load_factor_lag_7d`. Competitor fare goes in as the previous day&apos;s
-file, not the same-day file. Weather goes in as the published forecast at
-T-1, not the actual.
+- Load factor &rarr; `load_factor_lag_7d`.
+- Competitor fare &rarr; previous-day&apos;s file, never same-day.
+- Weather &rarr; forecast at T-1, never the realized actual.
 
-### 2.4 Cohort splits
+### 2.4 Splits
 
 | Cohort | Time range | Use |
 | ------ | ---------- | --- |
-| Train | 2019-01 to 2024-09 | Continued pretraining + XReg fit |
-| Val | 2024-10 to 2024-12 | Hyperparameter selection, calibration |
-| Test (frozen) | 2025-01 to 2025-04 | Final hold-out, never seen during dev |
+| Train | last 24 months &minus; 6 months | Stage A + Stage B fits |
+| Val | 6 months ago &rarr; 3 months ago | Hyperparam selection, calibration |
+| Test (frozen) | last 3 months | Final hold-out |
 | Backtest (rolling) | last 30 days | Production drift signal |
 
-COVID-era data (2020-03 to 2021-06) is included with a learned "regime
-indicator" static covariate so the model can place that period in a
-separate basin. Sarah&apos;s ablation showed that **dropping COVID is worse
-than including it with a flag** &mdash; the flag-based approach gives the
-model a way to isolate the regime, and even helps with future shock
-scenarios because it learned what an "atypical regime" looks like.
+COVID-era data is excluded (we don&apos;t pretrain, so we don&apos;t need to
+teach the model regime shifts &mdash; the foundation prior already saw plenty
+of weird time series).
 
 ---
 
-## 3. Stage 1 &mdash; Continued pretraining
-
-### Goal
-Adapt the foundation model&apos;s implicit prior from "all kinds of time
-series on the internet" to "AA airline-fare time series".
-
-### Recipe
-
-- Same next-patch loss as the original TimesFM training.
-- Learning rate: 1e-5 (10&times; lower than original pretraining; we are
-  fine-tuning, not learning from scratch).
-- Cosine schedule with 1% warmup.
-- 2 epochs over the 2.8 M-window training set; ~14 hours on 8&times;A100.
-- Batch size: 256 windows.
-- No covariates yet &mdash; only the target series.
-
-### Why no covariates in Stage 1
-The transformer trunk is shared across every covariate combination. Pushing
-covariates in too early couples the trunk weights to the regression layer
-and makes ablation impossible. Sarah keeps the trunk pristine in Stage 1 and
-only touches it again in Stage 3 with LoRA.
-
-### Evaluation gate
-Continued pretraining is accepted if and only if:
-
-| Metric (on val cohort, no covariates) | Threshold |
-| ------------------------------------- | --------- |
-| MAPE | &le; 8.5% (vs 10.2% zero-shot baseline) |
-| 80% PI coverage | 78&ndash;82% |
-| Median forecast bias on Q4 cohort | &le; &plusmn; 1.2% |
-| Calibration ECE | &le; 0.04 |
-
-If any threshold fails, fall back to Google&apos;s base weights.
-
-### Marcus&apos;s deployment note
-
-> "The output of Stage 1 is `aa-timesfm-2.5-200m-base-vYYYYMMDD` in our model
-> registry. Same shape as the Google checkpoint, same loader, same memory
-> footprint. From the platform&apos;s perspective it is a drop-in
-> replacement. That&apos;s why we did it this way: the rest of the inference
-> stack does not need to change."
-
----
-
-## 4. Stage 2 &mdash; XReg head fine-tuning
+## 3. Stage A &mdash; XReg head fine-tuning
 
 ### Goal
 Teach the regression layer that consumes covariates the AA-specific
-elasticities: how fuel translates to fare on each route family, how holiday
-flags map to fare uplifts, how competitor fare moves get matched.
+elasticities: how fuel translates to fare on each route family, how
+holiday flags map to fare uplifts, how competitor fare moves get matched.
 
 ### Recipe
 
-- Freeze the transformer trunk from Stage 1.
+- **Freeze the entire transformer trunk &mdash; we never touch base weights.**
 - Train only the regression layer that maps `(timesfm_baseline_residual,
   covariate_block)` to the final forecast adjustment.
 - L2-regularized linear core with one-hot encoding of categoricals; rank-32
   cross-route interaction term.
 - Loss: pinball loss across all 10 quantiles + median MSE, equally weighted.
-- 3 epochs; ~40 minutes on 1&times;A10G &mdash; cheap.
+- 3 epochs over ~250K windows; ~40 minutes on 1&times;A10G.
 
 ### What the layer learns (illustrative)
-
-After training, Sarah inspects the learned coefficients:
 
 | Covariate | Coefficient (avg, $) | Interpretation |
 | --------- | -------------------- | -------------- |
@@ -186,165 +138,162 @@ After training, Sarah inspects the learned coefficients:
 | `days_to_departure` (per -1 day) | +$1.3 | Inventory thinning |
 | `load_factor_lag` (per +0.1) | +$8.0 | Demand-momentum lift |
 
-These match the team&apos;s domain priors within ~10%, which is the first
-sanity check Sarah does before any quantitative evaluation.
+These coefficients match the team&apos;s domain priors within ~10%, which is
+the first sanity check before any quantitative evaluation.
 
 ### Evaluation gate
 
-| Metric (on val cohort, with covariates) | Threshold |
-| ---------------------------------------- | --------- |
+| Metric (val cohort, with covariates) | Threshold |
+| ------------------------------------- | --------- |
 | MAPE | &le; 6.0% |
 | Q4-only MAPE | &le; 7.5% |
 | Holiday-day MAPE | &le; 9.0% |
 | 80% PI coverage | 78&ndash;82% |
 | Holiday-day 80% PI coverage | 75&ndash;85% |
 
-Stage 2 produces `aa-timesfm-2.5-200m-xreg-vYYYYMMDD`. Same registry, same
-loader, but now `forecast_with_covariates` returns AA-tuned predictions
-instead of generic ones.
+Stage A ships as `aa-timesfm-2.5-xreg-vYYYYMMDD` &mdash; just the head
+weights as a small (~1.2 MB) safetensors file. The base weights are
+unchanged.
 
 ---
 
-## 5. Stage 3 &mdash; Per-route-family LoRA adapters
+## 4. Stage B &mdash; Per-route-family LoRA adapters
 
 ### Goal
-Squeeze out the last 0.5&ndash;1 percentage point of MAPE on the **top 200
-OD-pairs by revenue**, where it actually moves the needle.
+Push the last 0.5&ndash;1 percentage point of MAPE on the **top 200
+OD-pairs by revenue**, where the dollar lift is large.
 
 ### Recipe
 
 - Group the 200 OD-pairs into ~20 route families (transcon, transatlantic,
-  Caribbean leisure, Mexico leisure, Asia, deep-South, etc.).
+  Caribbean leisure, Mexico leisure, etc.).
 - For each family, train **rank-8 LoRA adapters** on the attention
   Q/K/V/O projections of the transformer trunk.
-- 1 epoch per family; ~6 minutes each on 1&times;A10G; total ~2 hours for all
-  20 families.
+- 1 epoch per family over ~50K windows; ~6 minutes each on 1&times;A10G.
 - Adapter file: ~4 MB safetensors per family.
 
 ### Why LoRA, not full fine-tuning per family
 
 | Option | Disk per family | Train time per family | Inference cost |
-| ------ | --------------- | -------------------- | -------------- |
-| Full fine-tune | 800 MB | hours, on multi-GPU | re-load 800 MB per family |
-| LoRA rank-8 | ~4 MB | ~6 min on 1 GPU | hot-swap in &lt;10 ms |
-| Per-route ARIMAX (status quo) | ~50 KB &times; 200 = 10 MB | hours each | 6 ms inference, but stale cold-start |
+| ------ | --------------- | --------------------- | -------------- |
+| Full fine-tune | 800 MB | hours, multi-GPU | reload 800 MB |
+| LoRA rank-8 | ~4 MB | ~6 min, 1 GPU | hot-swap &lt;10 ms |
+| Per-route ARIMAX (status quo) | ~50 KB &times; 200 | hours each | 6 ms but stale |
 
-LoRA is the sweet spot for AA&apos;s scale. Marcus can store all 20 adapters
-on the inference node&apos;s local SSD and swap them at batch time.
+LoRA is the sweet spot for AA scale. All 20 adapters fit in 80 MB &mdash; the
+nightly inference node loads them once at startup and swaps per OD-pair
+during scoring.
+
+### Why we get away without continued pretraining
+
+The Google base model already saw 100B time-series points. The job of LoRA
+is *not* to teach the trunk what time series look like &mdash; it&apos;s to
+nudge attention patterns toward AA-specific cyclic structure on each route
+family. Rank-8 has more than enough capacity for that nudge, as confirmed
+by the ablation:
+
+| Configuration | Val MAPE | Notes |
+| ------------- | -------- | ----- |
+| Zero-shot (Google base) | 10.2% | Foundation prior only |
+| Stage A (XReg head only) | 6.0% | Covariate-aware, family-agnostic |
+| Stage A + LoRA rank-4 | 5.4% | Diminishing returns past this |
+| Stage A + LoRA rank-8 | 5.1% | **&larr; chosen** |
+| Stage A + LoRA rank-16 | 5.0% | Not worth 2&times; storage |
+| Stage A + full fine-tune | 4.7% | Out of budget |
+
+Going from 5.1% to 4.7% would cost ~$45K and a quarter of engineering. Not
+defensible.
 
 ### Evaluation per family
 
-A family ships only if its LoRA-adapted forecast beats the Stage 2 model on
-the same family by at least 0.5 percentage points MAPE on the val cohort and
+A family ships only if its LoRA-adapted forecast beats the Stage A model on
+the same family by &ge; 0.5 percentage points MAPE on the val cohort and
 maintains 80% PI coverage in [78%, 82%].
 
-If a family fails, the inference path falls back to the Stage 2 model with
-no adapter loaded. Marcus designed this fallback explicitly: an adapter
-failing at 02:00 CST should never block the nightly run.
+Failed families fall back to the Stage A model with no adapter loaded.
 
 ---
 
-## 6. Inference path with adapters
+## 5. Inference path with adapters
 
 ```
-AA Nightly Forecast Service (Marcus)
+AA Nightly Forecast Service
 +----------------------------------+
-| 1. Load aa-timesfm-2.5-xreg base |   <- once, ~14 GB on A10G with 64-batch
-|    + XReg layer                  |
-+----------------------------------+
-                |
-                v
-+----------------------------------+
-| 2. For each OD-pair:             |
-|    - lookup route_family         |
-|    - if family has live adapter: |
-|         hot-swap LoRA            |   <- ~10 ms
-|         forecast_with_covariates |
-|    - else:                       |
-|         forecast_with_covariates |   <- Stage 2 model only
-|         (no adapter)             |
+| 1. Load Google base + Stage A    |   <- once, ~1.5 GB on A10G
+|    XReg head                     |
 +----------------------------------+
                 |
                 v
 +----------------------------------+
-| 3. Write forecasts to feature    |
-|    store, partitioned by         |
-|    departure_date                |
+| 2. Pre-load all 20 LoRA          |   <- ~80 MB total in CPU pinned mem
+|    adapters into pinned memory   |
 +----------------------------------+
                 |
                 v
-       Existing C++ RMS optimizer
-       (reads from feature store)
++----------------------------------+
+| 3. For each batch of 64 OD-pairs:|
+|    - group by route_family       |
+|    - hot-swap LoRA per family    |   <- ~8 ms amortized
+|    - forecast_with_covariates    |
++----------------------------------+
+                |
+                v
++----------------------------------+
+| 4. Write forecasts to feature    |
+|    store, partitioned by day     |
++----------------------------------+
+                |
+                v
+        Existing C++ RMS optimizer
 ```
 
-### Marcus&apos;s SLOs for this service
-
-| SLO | Target | Alert |
-| --- | ------ | ----- |
-| Nightly run completion | by 02:30 CST | page on miss |
-| 80% PI coverage on top-200 routes (rolling 7d) | 78&ndash;82% | warn @ 75%, page @ 70% |
-| Forecast freshness (max staleness) | &lt; 24 h | page @ 36 h |
-| Adapter load failure rate | &lt; 0.1% | page @ 1% |
-| Cost per nightly run | &lt; $25 | warn @ $40 |
-
-If coverage drops, Sarah is paged. If runtime/cost drift, Marcus is paged.
-The split is deliberate: model issues vs system issues route to the right
-on-call.
+The full inference-optimization story (batching, BF16, `torch.compile`,
+adapter pinning, caching) is in
+[inference_optimization.md](inference_optimization.md).
 
 ---
 
-## 7. Retraining cadence
+## 6. Retraining cadence
 
 | Stage | Cadence | Trigger |
 | ----- | ------- | ------- |
-| Stage 1 (continued pretraining) | every 6 months | scheduled, plus regime-shift triggers |
-| Stage 2 (XReg head) | every 4 weeks | scheduled, plus elasticity drift &gt; 15% |
-| Stage 3 (LoRA per family) | every 2 weeks | scheduled, plus per-family MAPE drift |
+| Stage A (XReg head) | every 4 weeks | scheduled, plus elasticity drift &gt; 15% |
+| Stage B (LoRA per family) | every 2 weeks | scheduled, plus per-family MAPE drift |
 
-A single scheduled run never trains all three stages on the same night. The
-calendar staggers them so a bad Stage 1 update can&apos;t take down the
-whole service &mdash; and so the rollback path (always to the last passing
-artifact in each stage) is unambiguous.
+A bad Stage A update never takes down Stage B because they are independent
+files in the registry &mdash; rollback Stage A by reverting the head; LoRA
+adapters keep running on top of the old head.
 
 ---
 
-## 8. Audit, compliance, and the boring stuff that matters
-
-DOT regulations on fare display do not regulate the *model*, they regulate
-the *fare displayed to the customer*. But the optimizer that turns the
-forecast into a displayed fare is regulated. So:
+## 7. Audit & rollback
 
 1. Every forecast write is **immutable**, partitioned by run-id, retained
-   for 7 years.
-2. Every model artifact is signed with the engineer&apos;s key and the
-   training data hash.
+   7 years.
+2. Every artifact (head weights, LoRA file) is signed with the engineer&apos;s
+   key and the training data hash.
 3. Every adapter swap is logged with `(od_pair, departure_date, adapter_id,
    forecast_run_id)`.
-4. The `xreg + timesfm` decision boundary is explainable per-day: the
-   forecast can be decomposed into `timesfm_baseline + sum_of_covariate_contributions`,
-   which is what we hand to compliance when they ask "why did the fare go
-   up $87 on Thanksgiving?".
+4. The decomposition `forecast = timesfm_baseline + sum(covariate_contribs)`
+   is recorded per-day, which is what we hand to compliance when they ask
+   "why did the fare go up $87 on Thanksgiving?".
 
-The decomposition is exactly what panel (1,1) of the example
-visualization shows. That is not a coincidence &mdash; the synthetic example
-was deliberately built to mirror what production explainability looks like.
+Rollback is trivially per-stage: revert the XReg head OR a LoRA file OR
+both. Base weights never change, so they can never be the rollback target.
 
 ---
 
-## 9. The opening question, revisited
+## 8. The headline
 
-> **Marcus:** "How do the fine-tuned weights ship, who owns the audit log,
-> and how do we roll back?"
->
-> **Sarah:** "Stage 1 ships as a base-model artifact, Stage 2 ships as the
-> XReg head, Stage 3 ships as 20 LoRA files keyed by route family. Audit log
-> is per-stage, written to BigQuery, retained 7 years. Rollback is per-stage:
-> revert one of (base, head, adapter), the other two stay. The forecast
-> service can run with any combination, with adapter being the most
-> aggressive lever and base being the most conservative."
->
-> **Marcus:** "Good. I&apos;ll wire that into the registry next sprint. We
-> deploy Stage 2 to canary on five low-revenue OD-pairs first; if PI
-> coverage holds for 7 days we expand to 5%, then 25%, then full."
+The Applied Scientist running this project (you) ships:
 
-This doc is the artifact that conversation produced.
+- One frozen base model (Google).
+- One small AA-tuned head file (~1 MB).
+- 20 small AA-tuned LoRA files (~80 MB total).
+- Quarterly retrain budget: **~$7**.
+
+That is a defensible MLOps story for any RM director. It is also the kind
+of scope an Applied Scientist can own end-to-end &mdash; data, modeling,
+evaluation, deployment, and monitoring &mdash; without needing to hire a
+parallel ML Engineer team. See [user_stories.md](user_stories.md) for how
+that ownership played out across the 16-week project.

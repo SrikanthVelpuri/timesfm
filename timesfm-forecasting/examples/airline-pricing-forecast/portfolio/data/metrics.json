@@ -1,0 +1,48 @@
+{
+  "_comment": "Illustrative numbers used by the portfolio dashboards. Mirrors the synthetic example in forecast_aa_pricing.py. Replace with real production metrics when forking for real use.",
+  "headline": {
+    "mape_zero_shot_pct": 10.2,
+    "mape_xreg_head_pct": 6.0,
+    "mape_lora_pct": 5.1,
+    "inference_speedup_x": 47,
+    "quarterly_compute_usd": 7.20,
+    "annual_revenue_lift_usd_m": 48,
+    "nightly_wall_time_seconds": 41,
+    "project_duration_weeks": 16
+  },
+  "finetuning": {
+    "stages": [
+      { "name": "Zero-shot (Google base)", "mape": 10.2, "cost_usd": 0 },
+      { "name": "+ XReg head (Stage A)", "mape": 6.0, "cost_usd": 0.70 },
+      { "name": "+ LoRA r-4", "mape": 5.4, "cost_usd": 4.20 },
+      { "name": "+ LoRA r-8 (chosen)", "mape": 5.1, "cost_usd": 7.20 },
+      { "name": "+ LoRA r-16", "mape": 5.0, "cost_usd": 14.40 },
+      { "name": "Full fine-tune (rejected)", "mape": 4.7, "cost_usd": 12000 }
+    ]
+  },
+  "inference": {
+    "configs": [
+      { "name": "FP32, batch=1, eager", "latency_ms": 280, "throughput_per_sec": 3.6, "cost_usd": 0.205 },
+      { "name": "+ batch=64", "latency_ms": 18, "throughput_per_sec": 56, "cost_usd": 0.075 },
+      { "name": "+ BF16", "latency_ms": 9, "throughput_per_sec": 110, "cost_usd": 0.038 },
+      { "name": "+ torch.compile", "latency_ms": 6, "throughput_per_sec": 165, "cost_usd": 0.022 },
+      { "name": "+ LoRA hot-swap (final)", "latency_ms": 6, "latency_p99_ms": 14, "throughput_per_sec": 165, "cost_usd": 0.011 }
+    ]
+  },
+  "slos": {
+    "nightly_wall_time_target_seconds": 90,
+    "p99_latency_target_ms": 25,
+    "coverage_target_pct": [78, 82],
+    "coverage_alert_pct": 75,
+    "cost_per_run_target_usd": 0.10,
+    "lora_swap_failure_rate_pct": 0.0
+  },
+  "scenarios_per_year": {
+    "holiday_rush": 56,
+    "fuel_spike": 10,
+    "competitor_undercut": 7300,
+    "weather_irrops": 600,
+    "new_route_launch": 12,
+    "cabin_simulation": 4
+  }
+}
