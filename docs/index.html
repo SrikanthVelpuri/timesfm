@@ -35,6 +35,7 @@
   <button class="tab" data-tab="timeline" role="tab">Timeline</button>
   <button class="tab" data-tab="architecture" role="tab">Architecture</button>
   <button class="tab" data-tab="finetuning" role="tab">Fine-Tuning</button>
+  <button class="tab" data-tab="markets" role="tab">Markets</button>
   <button class="tab" data-tab="inference" role="tab">Inference</button>
   <button class="tab" data-tab="stories" role="tab">User Stories</button>
   <button class="tab" data-tab="scenarios" role="tab">Scenarios</button>
@@ -69,6 +70,10 @@
       <div class="kpi-label">Network MAPE<br>(zero-shot &rarr; final)</div>
     </div>
     <div class="kpi">
+      <div class="kpi-value">141 routes</div>
+      <div class="kpi-label">Fine-tuned across<br>20 families, 41 countries</div>
+    </div>
+    <div class="kpi">
       <div class="kpi-value">47&times;</div>
       <div class="kpi-label">Inference speedup<br>(280 ms &rarr; 6 ms / OD-pair)</div>
     </div>
@@ -78,7 +83,7 @@
     </div>
     <div class="kpi">
       <div class="kpi-value">~$48M</div>
-      <div class="kpi-label">Estimated annual<br>revenue lift</div>
+      <div class="kpi-label">Annual revenue lift<br>(domestic + international)</div>
     </div>
     <div class="kpi">
       <div class="kpi-value">41 s</div>
@@ -87,6 +92,10 @@
     <div class="kpi">
       <div class="kpi-value">16 weeks</div>
       <div class="kpi-label">Discovery &rarr; full network<br>rollout</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-value">800,000&times;</div>
+      <div class="kpi-label">ROI on compute<br>($48M lift / $60 cloud)</div>
     </div>
   </div>
 
@@ -100,22 +109,42 @@
     <li><strong>Self-monitoring</strong> &mdash; PI coverage drift on top-50 routes pages me at 2 a.m. with a one-command rollback path.</li>
   </ul>
 
-  <h2 id="cheatsheet">Quick reference</h2>
+  <h2 id="cheatsheet">Quick reference &amp; interview prep</h2>
   <div class="page-index-grid">
     <a class="page-index-card decision" href="pages/cheatsheet.html" style="border-left-color: var(--accent-amber);">
       <span class="tag" style="background: rgba(245,158,11,0.18); color: #b45309;">Cheat sheet</span>
       <h3 style="color: #b45309;">Interview cheat sheet</h3>
-      <p>Single-page quick-reference: numbers to memorize, math formulas, code snippets, killer Q&amp;A from all 11 deep dives, and a glossary. The night-before-interview page.</p>
+      <p>Single-page quick-reference: numbers to memorize, math formulas, code snippets, killer Q&amp;A from all deep dives, and a glossary. The night-before-interview page.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/interview-qa.html" style="border-left-color: var(--accent-purple);">
+      <span class="tag" style="background: rgba(168,85,247,0.18); color: #6b21a8;">100+ Q&amp;A</span>
+      <h3 style="color: #6b21a8;">Interview Q&amp;A by section</h3>
+      <p>100+ interview questions organised across 12 topics &mdash; foundations, data, model, fine-tuning, markets, inference, evaluation, deployment, monitoring, business, leadership, and trick questions. Every Q has a project-grounded A.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/tradeoffs-deepdive.html" style="border-left-color: var(--accent-cyan);">
+      <span class="tag" style="background: rgba(14,116,144,0.18); color: var(--accent-cyan);">18 tradeoffs</span>
+      <h3 style="color: var(--accent-cyan);">Tradeoffs deep-dive</h3>
+      <p>Every cross-cutting design decision: chosen path, runner-up, what we gave up, why. The flat list of &ldquo;X over Y because Z.&rdquo;</p>
     </a>
   </div>
 
   <h2 id="decisions">Deep-dive pages &mdash; design decisions</h2>
   <p>
-    Six interview-prep pages on the major design decisions behind the project. Each
+    Eight interview-prep pages on the major design decisions behind the project. Each
     page has a TL;DR, a decision matrix, code samples where relevant, trade-offs, and
     an interview Q&amp;A section.
   </p>
   <div class="page-index-grid">
+    <a class="page-index-card decision" href="pages/market-routes.html" style="border-left-color: var(--accent-green);">
+      <span class="tag" style="background: rgba(34,197,94,0.15); color: #15803d;">Markets</span>
+      <h3 style="color: #15803d;">Market routes &mdash; 141 OD-pairs across 41 countries</h3>
+      <p>Per-region MAPE (4.2% domestic, 4.6% intl-short, 6.1% intl-long), per-route revenue lift, family clustering rationale, and how one foundation model generalises across domestic + international.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/business-impact.html" style="border-left-color: var(--aa-red);">
+      <span class="tag" style="background: rgba(200,16,46,0.12); color: var(--aa-red);">Business</span>
+      <h3 style="color: var(--aa-red);">Business impact &mdash; $48M annual lift, by market</h3>
+      <p>ML metrics &rarr; business KPIs translation table. Revenue attribution by source. Per-region breakdown. Load factor +0.62 pp, denied boardings -9.1%, analyst overrides -27%.</p>
+    </a>
     <a class="page-index-card decision" href="pages/model-choice.html">
       <span class="tag">Decision</span>
       <h3>Model choice &mdash; Why TimesFM 2.5</h3>
@@ -472,6 +501,110 @@
   <p class="caption">Families that did not improve by &ge;0.5 pp MAPE fall back to head-only forecast. No service degradation.</p>
 
   <p class="see-also">&rarr; Full recipe + retraining cadence in <a href="https://github.com/SrikanthVelpuri/timesfm/blob/master/timesfm-forecasting/examples/airline-pricing-forecast/finetuning_aa_data.md">finetuning_aa_data.md</a>.</p>
+</section>
+
+<!-- ============== MARKETS ============== -->
+<section class="panel" id="markets" role="tabpanel">
+  <h1>Markets &mdash; 141 OD-pairs across 41 countries</h1>
+  <p class="lead">
+    The model is fine-tuned and serving on <strong>141 OD-pairs</strong> grouped into
+    <strong>20 route families</strong> across <strong>41 countries</strong>. One frozen TimesFM 2.5
+    trunk, one shared XReg head trained on all 128, plus 17 LoRA adapters covering the
+    families that materially benefit. The same architecture and training recipe applies
+    everywhere; the data is partitioned, not the model.
+  </p>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="kpi-value">141</div><div class="kpi-label">OD-pairs<br>fine-tuned</div></div>
+    <div class="kpi"><div class="kpi-value">76 / 65</div><div class="kpi-label">Domestic /<br>International split</div></div>
+    <div class="kpi"><div class="kpi-value">20</div><div class="kpi-label">Route families<br>(LoRA grouping)</div></div>
+    <div class="kpi"><div class="kpi-value">41</div><div class="kpi-label">Countries served<br>by the forecast</div></div>
+    <div class="kpi"><div class="kpi-value">17 / 20</div><div class="kpi-label">LoRA adapters<br>that ship</div></div>
+    <div class="kpi"><div class="kpi-value">$48M</div><div class="kpi-label">Annual revenue lift<br>across all markets</div></div>
+  </div>
+
+  <h2>Three concentric circles</h2>
+  <p>
+    Markets group naturally into three regions defined by horizon dynamics, currency exposure,
+    and data volume per OD-pair:
+  </p>
+
+  <div class="stage-grid">
+    <div class="stage-card" style="border-top-color: var(--aa-blue);">
+      <h3>Domestic backbone (76 routes)</h3>
+      <ul>
+        <li>Transcon hub-spoke, Florida hub, Northeast shuttle, Texas triangle, Mountain West, Hawaii.</li>
+        <li>Currency covariate <strong>off</strong>; US holiday calendar.</li>
+        <li>10 LoRA adapters cover all 76 pairs.</li>
+        <li><strong>MAPE 4.2%</strong> &middot; <strong>$28.4M annual lift</strong> &middot; +0.6 pp load factor.</li>
+      </ul>
+    </div>
+    <div class="stage-card" style="border-top-color: var(--accent-green);">
+      <h3>International short-haul (35 routes)</h3>
+      <ul>
+        <li>Mexico Leisure, Caribbean Hub &amp; Leisure, Canada cross-border, LatAm short.</li>
+        <li>Currency covariate <strong>on</strong> (USD/MXN, USD/CAD); both-country holiday flags.</li>
+        <li>5 LoRA adapters cover all 35 pairs.</li>
+        <li><strong>MAPE 4.6%</strong> &middot; <strong>$9.6M annual lift</strong> &middot; +0.8 pp load factor (highest %).</li>
+      </ul>
+    </div>
+    <div class="stage-card" style="border-top-color: var(--aa-red);">
+      <h3>International long-haul (30 routes)</h3>
+      <ul>
+        <li>Transatlantic Premium, Asia Long-haul, deep Latin America.</li>
+        <li>Currency on (USD/EUR, USD/JPY, USD/GBP); two-hemisphere holidays; rank-16 LoRA on Asia.</li>
+        <li>5 LoRA adapters cover all 30 pairs.</li>
+        <li><strong>MAPE 6.1%</strong> &middot; <strong>$10.0M annual lift</strong> &middot; +0.4 pp load factor.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Revenue lift share &mdash; where the $48M comes from</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-markets-revenue-share"></canvas>
+  </div>
+  <p class="caption">
+    Domestic dominates absolute lift ($28.4M, 59%) because of the revenue base.
+    International long-haul contributes 21% on a smaller route count but bigger fares.
+    International short-haul is the highest <em>percentage</em> lift (0.40%) because of
+    elasticity capture on Mexico/Caribbean leisure.
+  </p>
+
+  <h2>Per-family OD-pair count</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-markets-route-count"></canvas>
+  </div>
+  <p class="caption">
+    Color-coded by region: blue=domestic, green=intl-short, red=intl-long. Transatlantic
+    Premium (16 OD-pairs) and Asia Long-haul (14) are the largest international families.
+    Transcon Hub (16) is the largest domestic family.
+  </p>
+
+  <h2>Accuracy by region</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-region-mape"></canvas>
+  </div>
+  <p class="caption">
+    Each stage cuts MAPE in every region. Absolute MAPE is higher on long-haul because of
+    horizon/regime constraints; relative drops are consistent across all three regions
+    (~58%).
+  </p>
+
+  <h2>Revenue lift by region</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-region-revenue"></canvas>
+  </div>
+  <p class="caption">
+    Blue bars are absolute USD M lift; red line is percentage lift. The pattern: domestic
+    wins on volume, international short wins on percentage, international long wins on
+    per-route productivity (fewer routes, higher per-route lift).
+  </p>
+
+  <p class="see-also">
+    &rarr; Full per-region breakdown, top-20 routes table, and per-family scatter in
+    <a href="pages/market-routes.html">market-routes.html</a>. Business impact &amp;
+    revenue attribution in <a href="pages/business-impact.html">business-impact.html</a>.
+  </p>
 </section>
 
 <!-- ============== INFERENCE ============== -->
