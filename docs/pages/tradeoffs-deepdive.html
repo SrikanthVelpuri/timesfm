@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tradeoffs Deep-Dive &middot; AA Pricing Forecast</title>
+<meta name="description" content="Every major design decision on the project, why we made it, what we considered, and what we gave up. Cross-cutting view of model choice, fine-tuning, inference, evaluation, deployment, and monitoring tradeoffs." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Tradeoffs deep-dive</span>
+  </nav>
+
+  <h1>Tradeoffs deep-dive &mdash; every decision and what we gave up</h1>
+  <p class="lead">
+    This page is the cross-cutting summary of design decisions across the entire stack &mdash;
+    model choice, fine-tuning, inference, evaluation, deployment, monitoring &mdash; with
+    explicit tradeoffs called out. Read it as a flat list of &ldquo;we chose X over Y because Z,
+    and gave up A&rdquo; statements. The individual decision pages have the math; this page has
+    the rationale.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> 18 cross-cutting decisions, each with a chosen path, the
+    runner-up that almost won, and a one-paragraph rationale. The pattern: prefer cheaper,
+    more reversible decisions; pay for accuracy only when revenue attribution justifies it;
+    keep the operational surface small.
+  </div>
+
+  <h2>1. Foundation model vs per-route classical</h2>
+  <p><strong>Chose:</strong> TimesFM 2.5 (200M-param decoder transformer, 100B time-series points pretrain).<br><strong>Runner-up:</strong> per-route ARIMAX with hierarchical pooling.</p>
+  <div class="pros-cons-grid">
+    <div class="pros"><h4>Pros of foundation model</h4><ul><li>Cold-start on new routes works in zero-shot.</li><li>Cross-route information transfer is automatic.</li><li>One trunk + 17 LoRAs replaces 6,700 ARIMAX models.</li><li>Better calibration on long-horizon quantiles (CRPS &darr; 33%).</li></ul></div>
+    <div class="cons"><h4>What we gave up</h4><ul><li>~$200/quarter base inference cost vs ~$50 for ARIMAX (still trivial).</li><li>Lose interpretability of AR coefficients (SHAP-by-covariate replaces).</li><li>Harder for an analyst to debug a single weird route forecast.</li></ul></div>
+  </div>
+
+  <h2>2. TimesFM 2.5 vs Chronos-Bolt vs Lag-Llama</h2>
+  <p><strong>Chose:</strong> TimesFM 2.5 for the larger pretrain corpus and continuous quantile head.<br><strong>Runner-up:</strong> Chronos-Bolt-Base (very close on accuracy, 12% slower at inference).</p>
+  <p>
+    The decisive factor was the <code>use_continuous_quantile_head</code> behaviour for our
+    30-day horizon: TimesFM&apos;s long-horizon calibration was 8% better on the held-out
+    intl-long cohort. Chronos was 0.8 pp behind on network MAPE and would have required
+    custom logic to enforce monotonic quantiles for the optimizer.
+  </p>
+
+  <h2>3. PEFT (LoRA) vs full fine-tune vs continued pretraining</h2>
+  <p><strong>Chose:</strong> two-stage PEFT (XReg head + rank-8 LoRA per route family).<br><strong>Rejected:</strong> full fine-tune at $45K/quarter for 0.4 pp MAPE; continued pretraining at $12K/quarter with no measurable gain.</p>
+  <div class="insight">
+    <strong>Trade-off accepted.</strong> 0.4 pp MAPE gap to full fine-tune translates to roughly
+    $4M of revenue lift left on the table. We chose the $44.99K cost saving and a more
+    composable artifact. Re-evaluate if AA secures pretraining budget.
+  </div>
+
+  <h2>4. LoRA rank 8 vs 4 vs 16</h2>
+  <p><strong>Chose:</strong> rank 8 by default; rank 16 for Asia long-haul only.</p>
+  <p>
+    Rank 4 left 0.3 pp MAPE on the table for half the cost &mdash; not worth it. Rank 16 caught
+    one additional 0.1 pp on most families, mostly noise, but on Asia long-haul it was 0.4 pp
+    of real gain because Asia has more idiosyncrasy (currency cycles, two-hemisphere
+    holidays). We let one family run at rank 16 and the rest at rank 8.
+  </p>
+
+  <h2>5. Per-route adapters vs route-family adapters</h2>
+  <p><strong>Chose:</strong> route-family adapters (20 families covering 141 OD-pairs).<br><strong>Rejected:</strong> 141 per-route adapters.</p>
+  <p>
+    Per-route adapters would overfit on low-volume long-haul routes inside half an epoch
+    and would create 141 rollback decisions per quarter. Route families give each adapter
+    50K&ndash;200K windows, share a single PI calibration, and collapse on-call surface to 20
+    decisions. Cost: ~0.3 pp on the most idiosyncratic OD-pair.
+  </p>
+
+  <h2>6. XReg head architecture &mdash; MLP vs transformer-cross-attn</h2>
+  <p><strong>Chose:</strong> shallow MLP (2 layers, 1280 &rarr; 512 &rarr; 10 quantiles).<br><strong>Considered:</strong> cross-attention block conditioning the trunk output on covariate embeddings.</p>
+  <p>
+    The shallow MLP captures additive covariate effects, which is what AA pricing actually
+    is. Cross-attention introduced multiplicative interactions we couldn&apos;t justify
+    operationally and added 800K params. We&apos;d come back to it if elasticity coefficients
+    show second-order terms (they don&apos;t today).
+  </p>
+
+  <h2>7. Pinball loss vs Gaussian NLL vs CRPS</h2>
+  <p><strong>Chose:</strong> pinball loss across 10 quantiles + median MSE.<br><strong>Rejected:</strong> Gaussian NLL (parametric assumption invalid &mdash; fares are skewed); CRPS (computationally expensive across 30-day horizon).</p>
+  <p>
+    Pinball is the right loss when your downstream consumer wants quantiles &mdash; which our
+    bid-price optimizer does. Gaussian NLL would have been wrong for premium fares; CRPS
+    would have been correct but ~3&times; the training cost.
+  </p>
+
+  <h2>8. 90-day context vs 180 vs 360</h2>
+  <p><strong>Chose:</strong> 90-day context for nightly batch, 180-day for off-cycle re-score.</p>
+  <p>
+    90 days captures one full quarter of weekly + monthly seasonality and fits the patch
+    structure (3 patches of 32 + tail). 180 added 0.2 pp accuracy at 3&times; the inference
+    cost; we use it only for off-cycle re-score where latency budget is more relaxed.
+    360 added nothing beyond 180 because we&apos;d retrained the LoRA on quarterly cadence
+    anyway, capturing the longer trend implicitly.
+  </p>
+
+  <h2>9. 30-day horizon vs 14 vs 60</h2>
+  <p><strong>Chose:</strong> 30-day horizon to match the bid-price optimizer&apos;s decision window.</p>
+  <p>
+    The C++ optimizer makes pricing decisions on a 30-day forward window. Forecasting
+    further is wasted work; forecasting shorter forces the optimizer to extrapolate. We
+    aligned the model output to the consumer&apos;s decision horizon. A separate 90-day
+    forecast feeds long-range network planning, but uses different aggregation (weekly,
+    not daily).
+  </p>
+
+  <h2>10. Batch=64 vs 32 vs 128</h2>
+  <p><strong>Chose:</strong> batch=64 for nightly inference on A10G.</p>
+  <p>
+    Batch=32 left 30% throughput on the table; batch=128 spilled to global memory and
+    dropped throughput by 8%. 64 is the A10G sweet spot for our patch structure. Tuned
+    once with a profiler; revisit if hardware changes.
+  </p>
+
+  <h2>11. BF16 vs FP16 vs INT8</h2>
+  <p><strong>Chose:</strong> BF16 for inference; FP32 for training.<br><strong>Rejected:</strong> INT8 dynamic quantisation (PI coverage dropped to 73%); FP16 (overflow risk on premium-cabin fares &gt;$5K).</p>
+  <p>
+    BF16&apos;s wider exponent range matters because we have fares from $80 to $11,000 and
+    we don&apos;t want premium-cabin tail forecasts to overflow. INT8&apos;s precision hit was
+    visible directly in the q90/q10 spread &mdash; bid-price-grade quantiles couldn&apos;t take it.
+  </p>
+
+  <h2>12. <code>torch.compile</code> vs ONNX/TensorRT</h2>
+  <p><strong>Chose:</strong> <code>torch.compile</code> with reduced-overhead mode.<br><strong>Rejected:</strong> ONNX + TensorRT.</p>
+  <p>
+    TensorRT had a 5% kernel-coverage gap that fell back to CUDA, eliminating its
+    advantage. <code>torch.compile</code> sat us at 6 ms with one line of code and one
+    rollback path: drop the decorator. Operational complexity ratio decided this.
+  </p>
+
+  <h2>13. LoRA hot-swap protocol &mdash; pinned memory vs disk-load</h2>
+  <p><strong>Chose:</strong> pinned-memory state-dict updates with a per-family LRU cache.</p>
+  <p>
+    Disk-load was 800 ms per swap; pinned-memory hot-swap is 8 ms. The 100&times; gain matters
+    because nightly inference touches all 17 adapters in the 41-second window. We cache
+    all 17 adapters in pinned memory throughout the run; total memory cost is ~80 MB, which
+    is rounding error on an A10G.
+  </p>
+
+  <h2>14. Quantile crossing prevention</h2>
+  <p><strong>Chose:</strong> <code>fix_quantile_crossing=True</code> at inference; pinball training without monotonic constraint.</p>
+  <p>
+    Pinball loss does not enforce monotonicity. About 0.5% of horizon predictions had
+    q60 &gt; q70 in raw output. The bid-price optimizer requires monotonic quantiles
+    (it does inverse CDF lookups). Inference-time sort is a 12-line patch and resolves the
+    issue without affecting accuracy.
+  </p>
+
+  <h2>15. Quarterly retraining vs continuous learning</h2>
+  <p><strong>Chose:</strong> quarterly XReg refit + on-demand LoRA refit per family.<br><strong>Rejected:</strong> continuous online learning.</p>
+  <p>
+    Continuous learning makes rollback hard, makes A/B difficult, and makes auditability
+    impossible. We&apos;d be unable to answer &ldquo;why did fares move yesterday?&rdquo; if the
+    model itself was moving daily. Quarterly cadence is right for the regime-shift
+    frequency in airline pricing; on-demand is right for one-off shocks.
+  </p>
+
+  <h2>16. Per-route ARIMAX as fallback vs no fallback</h2>
+  <p><strong>Chose:</strong> shadow-mode ARIMAX runs in parallel for canary + first 6 weeks; head-only forecast as runtime fallback.</p>
+  <p>
+    Shadow ARIMAX gave us &ldquo;known-good&rdquo; comparison during canary; we retired it at
+    week 6 once the foundation model held SLOs. At runtime, head-only forecast (no LoRA)
+    is the fallback if an adapter fails to load &mdash; degrades gracefully to ~6.0% MAPE
+    instead of returning an error. We chose this over &ldquo;serve last good forecast&rdquo;
+    because pricing decisions need to reflect today&apos;s covariates, not yesterday&apos;s.
+  </p>
+
+  <h2>17. Bid-price optimizer ownership &mdash; ours vs separate team</h2>
+  <p><strong>Chose:</strong> separate team owns the optimizer; we own the forecast.</p>
+  <p>
+    Antitrust separation. Forecast is a probabilistic statement about future demand;
+    pricing policy is a business decision. Mixing them in one codebase makes legal
+    review harder and creates a feedback loop (model trains on its own past prices). The
+    contract between teams is a JSON spec for the q10/q50/q90 forecast and a separate
+    weekly elasticity refit owned by Operations Research.
+  </p>
+
+  <h2>18. Azure ML registry vs S3 + Manifest</h2>
+  <p><strong>Chose:</strong> Azure ML registry with cosign signatures pinned to training-data hash.<br><strong>Rejected:</strong> S3 + manifest file (less governance integration).</p>
+  <p>
+    AA is an Azure-first shop. The Azure ML registry gives us SBOM, signature
+    verification, and Microsoft Entra ID for access control out of the box. The
+    cost was 2 days of integration work; the benefit is a single source of truth for
+    &ldquo;what model is in prod&rdquo; that audit can query.
+  </p>
+
+  <h2>The decision framework I used</h2>
+  <p>
+    Every one of these 18 decisions ran through the same three questions. They&apos;re worth
+    writing down because they&apos;re portable to any ML project:
+  </p>
+  <ol>
+    <li><strong>What does it cost if I&apos;m wrong?</strong> Reversible decisions get a quick
+      yes; irreversible decisions need triple-checking. <code>torch.compile</code> is
+      reversible (one line). LoRA architecture choice is reversible (retrain takes 6 hours).
+      Quantile head architecture is much harder to reverse (it&apos;s downstream of every artifact).</li>
+    <li><strong>What does it cost if I&apos;m right but a year late?</strong> Timeline
+      cost matters. We chose <code>torch.compile</code> over TensorRT partly because the
+      time-to-ship was a week vs a month. The 0.5% potential extra speedup wasn&apos;t worth
+      a month of rollout delay.</li>
+    <li><strong>Can the on-call engineer fix it at 2 a.m.?</strong> If a decision creates
+      a system that requires me-specifically to debug, that&apos;s an operational tax. Pinned-memory
+      hot-swap is one Python file; ONNX + TensorRT is a toolchain. We chose the former.</li>
+  </ol>
+
+  <div class="callout">
+    Tradeoffs aren&rsquo;t about being clever. They&rsquo;re about being honest with yourself
+    about what you&rsquo;re willing to give up &mdash; and naming it explicitly so future-you,
+    or your replacement, can revisit the decision when the constraints change.
+  </div>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="business-impact.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Business impact &amp; revenue</div>
+    </a>
+    <a class="page-nav-item next" href="interview-qa.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Interview Q&amp;A by section</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>

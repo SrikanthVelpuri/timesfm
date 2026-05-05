@@ -609,6 +609,518 @@
     });
   }
 
+  // ============== MARKET-ROUTES PAGE ==============
+
+  function chartRegionMape() {
+    makeChart("chart-region-mape", {
+      type: "bar",
+      data: {
+        labels: ["Domestic (76 routes)", "Intl-short (31 routes)", "Intl-long (21 routes)"],
+        datasets: [
+          { label: "Zero-shot",   data: [9.8, 11.1, 14.9], backgroundColor: COLOR.greyLight, borderColor: COLOR.grey, borderWidth: 1.5, borderRadius: 3 },
+          { label: "+ XReg head", data: [5.5, 6.0, 7.3],   backgroundColor: COLOR.aaBlueLight, borderColor: COLOR.aaBlue, borderWidth: 1.5, borderRadius: 3 },
+          { label: "+ LoRA",      data: [4.2, 4.6, 6.1],   backgroundColor: COLOR.purple, borderRadius: 3 },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: "top" } },
+        scales: {
+          y: {
+            beginAtZero: true,
+            grid: { color: "#e5e7eb" },
+            ticks: { callback: function (v) { return v + "%"; } },
+            title: { display: true, text: "MAPE (%)" },
+          },
+          x: { grid: { display: false } },
+        },
+      },
+    });
+  }
+
+  function chartRegionRevenue() {
+    makeChart("chart-region-revenue", {
+      type: "bar",
+      data: {
+        labels: ["Domestic", "Intl-short", "Intl-long"],
+        datasets: [
+          {
+            type: "bar",
+            label: "Annual revenue lift (USD M)",
+            data: [28.4, 9.6, 10.0],
+            backgroundColor: [COLOR.aaBlue, COLOR.green, COLOR.amber],
+            borderRadius: 4,
+            yAxisID: "y",
+          },
+          {
+            type: "line",
+            label: "Lift % of base revenue",
+            data: [0.37, 0.40, 0.28],
+            borderColor: COLOR.aaRed,
+            backgroundColor: "transparent",
+            yAxisID: "y1",
+            tension: 0.2,
+            pointRadius: 5,
+            pointBackgroundColor: COLOR.aaRed,
+            borderWidth: 2,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: "top" },
+          tooltip: {
+            callbacks: {
+              label: function (ctx) {
+                if (ctx.datasetIndex === 0) return "$" + ctx.parsed.y + "M annual lift";
+                return ctx.parsed.y + "% of region baseline";
+              },
+            },
+          },
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            position: "left",
+            grid: { color: "#e5e7eb" },
+            title: { display: true, text: "Revenue lift (USD M)" },
+            ticks: { callback: function (v) { return "$" + v + "M"; } },
+          },
+          y1: {
+            beginAtZero: true,
+            position: "right",
+            grid: { display: false },
+            title: { display: true, text: "Lift %" },
+            ticks: { callback: function (v) { return v + "%"; } },
+          },
+          x: { grid: { display: false } },
+        },
+      },
+    });
+  }
+
+  function chartRouteMapeScatter() {
+    // Build scatter from embedded route data (mirrors metrics.json subset).
+    const ROUTES = [
+      // Domestic (orange) sample
+      {"od":"DFW-LAX","z":10.6,"l":4.2,"r":"D"},{"od":"DFW-JFK","z":10.4,"l":4.1,"r":"D"},
+      {"od":"DFW-SFO","z":10.3,"l":4.0,"r":"D"},{"od":"DFW-ORD","z":9.8,"l":4.0,"r":"D"},
+      {"od":"DFW-MIA","z":9.6,"l":4.1,"r":"D"},{"od":"ORD-LAX","z":10.4,"l":4.1,"r":"D"},
+      {"od":"ORD-JFK","z":10.5,"l":4.2,"r":"D"},{"od":"ORD-MIA","z":9.7,"l":4.2,"r":"D"},
+      {"od":"JFK-LAX","z":10.7,"l":4.3,"r":"D"},{"od":"JFK-MIA","z":9.5,"l":4.1,"r":"D"},
+      {"od":"LAX-SFO","z":9.4,"l":4.4,"r":"D"},{"od":"LAX-LAS","z":9.7,"l":4.5,"r":"D"},
+      {"od":"LAX-HNL","z":12.6,"l":5.2,"r":"D"},{"od":"LAX-OGG","z":12.8,"l":5.3,"r":"D"},
+      {"od":"BOS-LGA","z":8.7,"l":3.7,"r":"D"},{"od":"BOS-DCA","z":8.9,"l":3.9,"r":"D"},
+      {"od":"ORD-LGA","z":9.0,"l":3.9,"r":"D"},{"od":"ORD-BOS","z":9.0,"l":4.0,"r":"D"},
+      {"od":"PHX-LAS","z":10.1,"l":4.5,"r":"D"},{"od":"DEN-DFW","z":10.0,"l":4.3,"r":"D"},
+      {"od":"ATL-LAX","z":10.4,"l":4.2,"r":"D"},{"od":"CLT-LGA","z":9.4,"l":3.9,"r":"D"},
+      {"od":"AUS-DFW","z":9.4,"l":4.0,"r":"D"},{"od":"DFW-PHX","z":10.1,"l":4.4,"r":"D"},
+      {"od":"DFW-DEN","z":10.0,"l":4.3,"r":"D"},
+      // Intl-short (green)
+      {"od":"DFW-CUN","z":11.0,"l":4.5,"r":"S"},{"od":"DFW-MEX","z":10.8,"l":4.4,"r":"S"},
+      {"od":"DFW-SJD","z":11.1,"l":4.5,"r":"S"},{"od":"LAX-CUN","z":11.0,"l":4.5,"r":"S"},
+      {"od":"LAX-MEX","z":10.7,"l":4.4,"r":"S"},{"od":"ORD-CUN","z":11.1,"l":4.6,"r":"S"},
+      {"od":"MIA-NAS","z":11.2,"l":4.7,"r":"S"},{"od":"MIA-SJU","z":11.0,"l":4.6,"r":"S"},
+      {"od":"MIA-PUJ","z":11.3,"l":4.7,"r":"S"},{"od":"MIA-MBJ","z":11.4,"l":4.8,"r":"S"},
+      {"od":"JFK-SJU","z":11.0,"l":4.6,"r":"S"},{"od":"YYZ-LGA","z":10.4,"l":4.4,"r":"S"},
+      {"od":"YVR-LAX","z":10.3,"l":4.3,"r":"S"},
+      // Intl-long (red)
+      {"od":"JFK-LHR","z":14.5,"l":6.0,"r":"L"},{"od":"JFK-CDG","z":14.4,"l":5.9,"r":"L"},
+      {"od":"JFK-FCO","z":14.6,"l":6.1,"r":"L"},{"od":"DFW-LHR","z":14.6,"l":6.1,"r":"L"},
+      {"od":"DFW-CDG","z":14.5,"l":6.0,"r":"L"},{"od":"DFW-FRA","z":14.7,"l":6.1,"r":"L"},
+      {"od":"ORD-LHR","z":14.5,"l":6.0,"r":"L"},{"od":"ORD-FRA","z":14.6,"l":6.1,"r":"L"},
+      {"od":"DFW-NRT","z":15.1,"l":6.3,"r":"L"},{"od":"DFW-PVG","z":15.3,"l":6.4,"r":"L"},
+      {"od":"DFW-ICN","z":15.2,"l":6.3,"r":"L"},{"od":"DFW-HKG","z":15.4,"l":6.4,"r":"L"},
+      {"od":"LAX-NRT","z":15.0,"l":6.2,"r":"L"},{"od":"LAX-PVG","z":15.2,"l":6.3,"r":"L"},
+      {"od":"LAX-SYD","z":15.5,"l":6.5,"r":"L"},{"od":"JFK-DEL","z":15.3,"l":6.4,"r":"L"},
+      {"od":"MIA-GRU","z":11.4,"l":4.5,"r":"L"},{"od":"MIA-EZE","z":11.5,"l":4.6,"r":"L"},
+    ];
+    const dom = ROUTES.filter(function (r) { return r.r === "D"; });
+    const sho = ROUTES.filter(function (r) { return r.r === "S"; });
+    const lng = ROUTES.filter(function (r) { return r.r === "L"; });
+
+    makeChart("chart-route-mape-scatter", {
+      type: "scatter",
+      data: {
+        datasets: [
+          {
+            label: "Domestic",
+            data: dom.map(function (r) { return { x: r.z, y: r.l, label: r.od }; }),
+            backgroundColor: COLOR.aaBlue,
+            pointRadius: 5,
+          },
+          {
+            label: "International short-haul",
+            data: sho.map(function (r) { return { x: r.z, y: r.l, label: r.od }; }),
+            backgroundColor: COLOR.green,
+            pointRadius: 5,
+          },
+          {
+            label: "International long-haul",
+            data: lng.map(function (r) { return { x: r.z, y: r.l, label: r.od }; }),
+            backgroundColor: COLOR.aaRed,
+            pointRadius: 5,
+          },
+          {
+            label: "y = x (no improvement)",
+            type: "line",
+            data: [{ x: 5, y: 5 }, { x: 16, y: 16 }],
+            borderColor: COLOR.grey,
+            borderDash: [4, 4],
+            borderWidth: 1.5,
+            pointRadius: 0,
+            fill: false,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: "top" },
+          tooltip: {
+            callbacks: {
+              label: function (ctx) {
+                if (ctx.dataset.type === "line") return "no-improvement diagonal";
+                const d = ctx.raw;
+                return d.label + ": zero-shot " + d.x + "% → LoRA " + d.y + "%";
+              },
+            },
+          },
+        },
+        scales: {
+          x: {
+            title: { display: true, text: "Zero-shot MAPE (%)" },
+            grid: { color: "#e5e7eb" },
+            min: 5,
+            max: 16,
+            ticks: { callback: function (v) { return v + "%"; } },
+          },
+          y: {
+            title: { display: true, text: "Post-LoRA MAPE (%)" },
+            grid: { color: "#e5e7eb" },
+            min: 3,
+            max: 8,
+            ticks: { callback: function (v) { return v + "%"; } },
+          },
+        },
+      },
+    });
+  }
+
+  function chartRegionCoverage() {
+    const days = Array.from({ length: 30 }, function (_, i) { return "D-" + (29 - i); });
+    function jitter(seed, base, amp) {
+      const out = [];
+      for (let i = 0; i < 30; i++) {
+        out.push(base + amp * Math.sin(i * 0.7 + seed) + amp * 0.4 * Math.cos(i * 1.3 + seed));
+      }
+      return out;
+    }
+    makeChart("chart-region-coverage", {
+      type: "line",
+      data: {
+        labels: days,
+        datasets: [
+          { label: "Domestic", data: jitter(1.1, 80.3, 0.8), borderColor: COLOR.aaBlue, backgroundColor: "transparent", borderWidth: 2, tension: 0.3, pointRadius: 0 },
+          { label: "Intl-short", data: jitter(2.3, 79.5, 0.7), borderColor: COLOR.green, backgroundColor: "transparent", borderWidth: 2, tension: 0.3, pointRadius: 0 },
+          { label: "Intl-long", data: jitter(3.7, 78.2, 0.9), borderColor: COLOR.aaRed, backgroundColor: "transparent", borderWidth: 2, tension: 0.3, pointRadius: 0 },
+          { label: "Target band upper (82%)", data: Array(30).fill(82), borderColor: "rgba(34,197,94,0.5)", borderWidth: 1.2, borderDash: [4, 4], pointRadius: 0, fill: false },
+          { label: "Target band lower (78%)", data: Array(30).fill(78), borderColor: "rgba(34,197,94,0.5)", borderWidth: 1.2, borderDash: [4, 4], pointRadius: 0, fill: false },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: "top" } },
+        scales: {
+          y: {
+            min: 75,
+            max: 84,
+            grid: { color: "#e5e7eb" },
+            ticks: { callback: function (v) { return v + "%"; } },
+            title: { display: true, text: "80% PI coverage" },
+          },
+          x: { grid: { display: false }, ticks: { maxTicksLimit: 10 } },
+        },
+        interaction: { mode: "index", intersect: false },
+      },
+    });
+  }
+
+  // Populate the Top-20 routes table on market-routes.html from metrics.json.
+  function populateTopRoutesTable() {
+    const tbody = document.querySelector("#top-routes-table tbody");
+    if (!tbody) return;
+    fetch("../data/metrics.json")
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        const sorted = (data.routes || []).slice().sort(function (a, b) { return b.rev_lift_m - a.rev_lift_m; });
+        const top = sorted.slice(0, 20);
+        const rows = top.map(function (r) {
+          const region = r.region === "D" ? "Domestic" : "Intl";
+          return "<tr>" +
+            "<td><strong>" + r.od + "</strong></td>" +
+            "<td>" + r.family + "</td>" +
+            "<td>" + region + "</td>" +
+            "<td>" + r.mape_zs.toFixed(1) + "%</td>" +
+            "<td><strong>" + r.mape_lora.toFixed(1) + "%</strong></td>" +
+            "<td>" + r.cov.toFixed(1) + "%</td>" +
+            "<td>$" + r.fare + "</td>" +
+            "<td>$" + r.rev_base_m.toFixed(0) + "M</td>" +
+            "<td><strong>$" + r.rev_lift_m.toFixed(2) + "M</strong></td>" +
+            "</tr>";
+        }).join("");
+        tbody.innerHTML = rows;
+      })
+      .catch(function () {
+        tbody.innerHTML = "<tr><td colspan='9'>Could not load route data.</td></tr>";
+      });
+  }
+
+  // ============== BUSINESS-IMPACT PAGE ==============
+
+  function chartBiRevenueRegion() {
+    makeChart("chart-bi-revenue-region", {
+      type: "bar",
+      data: {
+        labels: ["Domestic", "Intl-short", "Intl-long"],
+        datasets: [
+          { label: "Baseline annual revenue (USD B)", data: [7.6, 2.4, 3.6], backgroundColor: COLOR.aaBlueLight, borderColor: COLOR.aaBlue, borderWidth: 1.5, borderRadius: 3, yAxisID: "y" },
+          { label: "Annual revenue lift (USD M)",     data: [28.4, 9.6, 10.0], backgroundColor: COLOR.aaRed, borderRadius: 3, yAxisID: "y1" },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: "top" } },
+        scales: {
+          y: {
+            beginAtZero: true, position: "left", grid: { color: "#e5e7eb" },
+            title: { display: true, text: "Baseline (USD B)" },
+            ticks: { callback: function (v) { return "$" + v + "B"; } },
+          },
+          y1: {
+            beginAtZero: true, position: "right", grid: { display: false },
+            title: { display: true, text: "Lift (USD M)" },
+            ticks: { callback: function (v) { return "$" + v + "M"; } },
+          },
+          x: { grid: { display: false } },
+        },
+      },
+    });
+  }
+
+  function chartBiMlByRegion() {
+    makeChart("chart-bi-ml-by-region", {
+      type: "bar",
+      data: {
+        labels: ["MAPE", "RMSE", "Pinball q90", "CRPS", "ECE (calibration)"],
+        datasets: [
+          { label: "Domestic",   data: [57.1, 38.5, 31.2, 33.6, 42.0], backgroundColor: COLOR.aaBlue, borderRadius: 3 },
+          { label: "Intl-short", data: [58.6, 41.0, 33.5, 35.4, 39.8], backgroundColor: COLOR.green,  borderRadius: 3 },
+          { label: "Intl-long",  data: [59.1, 35.8, 27.4, 29.1, 36.2], backgroundColor: COLOR.aaRed,  borderRadius: 3 },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: "top" },
+          tooltip: { callbacks: { label: function (ctx) { return ctx.dataset.label + ": -" + ctx.parsed.y + "%"; } } },
+        },
+        scales: {
+          y: {
+            beginAtZero: true, grid: { color: "#e5e7eb" },
+            title: { display: true, text: "Improvement vs zero-shot (%)" },
+            ticks: { callback: function (v) { return v + "%"; } },
+          },
+          x: { grid: { display: false } },
+        },
+      },
+    });
+  }
+
+  function chartBiRolloutTrajectory() {
+    const weeks = Array.from({ length: 16 }, function (_, i) { return "W" + (i + 1); });
+    // Synthetic cumulative annualised lift trajectory
+    const lift = [0, 0, 0, 0, 0, 0.4, 1.6, 4.8, 12.0, 18.4, 24.1, 28.6, 36.3, 41.8, 45.6, 48.0];
+    makeChart("chart-bi-rollout-trajectory", {
+      type: "line",
+      data: {
+        labels: weeks,
+        datasets: [
+          {
+            label: "Cumulative annualised lift (USD M)",
+            data: lift,
+            borderColor: COLOR.aaBlue,
+            backgroundColor: COLOR.aaBlueLight,
+            tension: 0.3,
+            fill: true,
+            pointRadius: 4,
+            pointBackgroundColor: COLOR.aaBlue,
+            borderWidth: 2.5,
+          },
+          {
+            label: "Floor target ($30M)",
+            data: Array(16).fill(30),
+            borderColor: COLOR.green,
+            borderWidth: 1.5,
+            borderDash: [4, 4],
+            pointRadius: 0,
+            fill: false,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: "top" },
+          tooltip: { callbacks: { label: function (ctx) { return "$" + ctx.parsed.y.toFixed(1) + "M"; } } },
+        },
+        scales: {
+          y: {
+            beginAtZero: true, grid: { color: "#e5e7eb" },
+            title: { display: true, text: "Cumulative annualised lift (USD M)" },
+            ticks: { callback: function (v) { return "$" + v + "M"; } },
+          },
+          x: { grid: { display: false } },
+        },
+      },
+    });
+  }
+
+  function chartBiFamilyRevenue() {
+    const families = [
+      "Transcon Hub", "Transatlantic Premium", "Asia Long-haul", "Florida Hub",
+      "Mexico Leisure", "Caribbean Hub", "Domestic East", "Mountain West",
+      "Northeast Shuttle", "Pac NW Leisure", "Caribbean Leisure", "Latin America",
+      "Hawaii", "Texas Triangle", "Domestic South", "Canada", "Atlantic Niche",
+      "Asia Niche", "South America Niche", "Deep South Niche",
+    ];
+    const lift = [11.4, 9.8, 6.8, 4.2, 4.4, 3.6, 2.8, 2.6, 2.4, 2.0, 1.8, 1.6, 1.4, 0.9, 0.7, 0.5, 0.2, 0.15, 0.12, 0.10];
+    const ships = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false];
+    makeChart("chart-bi-family-revenue", {
+      type: "bar",
+      data: {
+        labels: families,
+        datasets: [
+          {
+            label: "Annual revenue lift (USD M)",
+            data: lift,
+            backgroundColor: ships.map(function (s) { return s ? COLOR.aaBlue : COLOR.grey; }),
+            borderRadius: 3,
+          },
+        ],
+      },
+      options: {
+        indexAxis: "y",
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: function (ctx) {
+                return "$" + ctx.parsed.x.toFixed(2) + "M" + (ships[ctx.dataIndex] ? "" : " (head-only fallback)");
+              },
+            },
+          },
+        },
+        scales: {
+          x: {
+            beginAtZero: true,
+            grid: { color: "#e5e7eb" },
+            ticks: { callback: function (v) { return "$" + v + "M"; } },
+          },
+          y: { grid: { display: false }, ticks: { font: { size: 11 } } },
+        },
+      },
+    });
+  }
+
+  // ============== INDEX MARKETS TAB ==============
+
+  function chartMarketsRevenueShare() {
+    makeChart("chart-markets-revenue-share", {
+      type: "doughnut",
+      data: {
+        labels: ["Domestic ($28.4M)", "Intl-short ($9.6M)", "Intl-long ($10.0M)"],
+        datasets: [
+          {
+            data: [28.4, 9.6, 10.0],
+            backgroundColor: [COLOR.aaBlue, COLOR.green, COLOR.aaRed],
+            borderWidth: 2,
+            borderColor: "#ffffff",
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: "right" },
+          tooltip: {
+            callbacks: {
+              label: function (ctx) {
+                const total = 48;
+                const pct = ((ctx.parsed / total) * 100).toFixed(1);
+                return ctx.label + " — " + pct + "% of total lift";
+              },
+            },
+          },
+        },
+        cutout: "60%",
+      },
+    });
+  }
+
+  function chartMarketsRouteCount() {
+    makeChart("chart-markets-route-count", {
+      type: "bar",
+      data: {
+        labels: [
+          "Transcon Hub", "Florida Hub", "Mountain West", "Northeast Shuttle",
+          "Pac NW Leisure", "Texas Triangle", "Domestic East", "Domestic South", "Hawaii",
+          "Mexico Leisure", "Caribbean Hub", "Caribbean Leisure", "Canada",
+          "Latin America", "Transatlantic Premium", "Asia Long-haul",
+        ],
+        datasets: [
+          {
+            label: "OD-pairs fine-tuned",
+            data: [16, 9, 8, 8, 6, 5, 5, 4, 3, 12, 5, 7, 4, 10, 16, 14],
+            backgroundColor: function (ctx) {
+              const dom = ["Transcon Hub", "Florida Hub", "Mountain West", "Northeast Shuttle", "Pac NW Leisure", "Texas Triangle", "Domestic East", "Domestic South", "Hawaii"];
+              const sho = ["Mexico Leisure", "Caribbean Hub", "Caribbean Leisure", "Canada"];
+              const fam = ctx.chart.data.labels[ctx.dataIndex];
+              if (dom.indexOf(fam) >= 0) return COLOR.aaBlue;
+              if (sho.indexOf(fam) >= 0) return COLOR.green;
+              return COLOR.aaRed;
+            },
+            borderRadius: 3,
+          },
+        ],
+      },
+      options: {
+        indexAxis: "y",
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: function (ctx) { return ctx.parsed.x + " OD-pairs"; } } },
+        },
+        scales: {
+          x: { beginAtZero: true, grid: { color: "#e5e7eb" } },
+          y: { grid: { display: false }, ticks: { font: { size: 11 } } },
+        },
+      },
+    });
+  }
+
   // ============== TAB RENDERER ==============
 
   // Charts only render when their tab becomes visible (Chart.js needs a sized canvas).
@@ -617,6 +1129,9 @@
     inference:  [chartInferenceLatency, chartThroughputCost],
     scenarios:  [chartScenarioFrequency],
     dashboard:  [chartCoverageDrift, chartForecastActual, chartPerRouteMape],
+    markets:    [chartMarketsRevenueShare, chartMarketsRouteCount, chartRegionMape, chartRegionRevenue],
+    "market-routes":   [chartRegionMape, chartRegionRevenue, chartRouteMapeScatter, chartRegionCoverage, populateTopRoutesTable],
+    "business-impact": [chartBiRevenueRegion, chartBiMlByRegion, chartBiRolloutTrajectory, chartBiFamilyRevenue],
   };
 
   const renderedTabs = {};

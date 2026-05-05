@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Business Impact &amp; Revenue &middot; AA Pricing Forecast</title>
+<meta name="description" content="ML metrics translated into business impact: $48M annual revenue lift, 0.62 pp load-factor lift, 9% denied-boarding drop, 27% reduction in analyst overrides. Per-region breakdown across domestic and international markets." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Business impact &amp; revenue</span>
+  </nav>
+
+  <h1>Business impact &mdash; how ML metrics turned into revenue</h1>
+  <p class="lead">
+    The ML team measures MAPE, RMSE, pinball loss, and PI coverage. The CFO measures
+    revenue, load factor, denied boardings, and analyst time. This page is the bridge:
+    every ML metric has a documented business analogue and a revenue-attribution path.
+    All numbers below are post-rollout (week 16+) versus the per-route ARIMAX baseline.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Network MAPE 10.2% &rarr; 5.1% translated into <strong>$48M
+    annual revenue lift</strong> at <strong>$60/year compute cost</strong> &mdash; an 800,000&times;
+    ROI on compute. Domestic carries the largest absolute lift ($28.4M); intl-short the
+    highest percentage lift (0.40%); intl-long the largest per-route lift but smaller
+    network share. Load factor +0.62 pp, denied boardings -9.1%, analyst overrides -27%,
+    competitor-match speed median 14 minutes.
+  </div>
+
+  <h2>Headline business KPIs</h2>
+  <div class="kpi-grid">
+    <div class="kpi"><div class="kpi-value">$48.0M</div><div class="kpi-label">Annual revenue lift<br>(network-wide)</div></div>
+    <div class="kpi"><div class="kpi-value">+0.62 pp</div><div class="kpi-label">Load factor lift<br>vs ARIMAX baseline</div></div>
+    <div class="kpi"><div class="kpi-value">+$1.42</div><div class="kpi-label">Average fare lift<br>per ticket</div></div>
+    <div class="kpi"><div class="kpi-value">-9.1%</div><div class="kpi-label">Denied boardings<br>(better protection)</div></div>
+    <div class="kpi"><div class="kpi-value">-27%</div><div class="kpi-label">RM analyst<br>manual overrides</div></div>
+    <div class="kpi"><div class="kpi-value">$6.4M</div><div class="kpi-label">Ancillary revenue<br>uplift (assigned)</div></div>
+    <div class="kpi"><div class="kpi-value">14 min</div><div class="kpi-label">Median competitor<br>match speed</div></div>
+    <div class="kpi"><div class="kpi-value">$60</div><div class="kpi-label">Annual compute<br>cost (cloud)</div></div>
+  </div>
+
+  <h2>Revenue lift by region</h2>
+  <p>
+    Same model architecture, same training recipe, same inference path. Different markets
+    yield different revenue dynamics. Domestic dominates absolute lift because of the
+    revenue base; international short-haul yields the highest <em>percentage</em> lift
+    because Mexico/Caribbean leisure has the most price-elastic demand.
+  </p>
+
+  <div class="chart-wrapper">
+    <canvas id="chart-bi-revenue-region"></canvas>
+  </div>
+  <p class="caption">
+    Stacked: blue = baseline annual revenue, red = incremental annual lift from
+    foundation-model forecast. The 1.4&times; relative scale of intl-short&apos;s lift bar
+    reflects 0.40% lift on a $2.4B base; intl-long is 0.28% on $3.6B; domestic is 0.37%
+    on $7.6B.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>Region</th>
+          <th>Routes</th>
+          <th>Baseline revenue</th>
+          <th>Annual lift</th>
+          <th>% lift</th>
+          <th>Load factor &Delta;</th>
+          <th>Denied boarding &Delta;</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><strong>Domestic</strong></td><td>76</td><td>$7.6B</td><td>$28.4M</td><td>0.37%</td><td>+0.6 pp</td><td>-9.1%</td></tr>
+        <tr><td><strong>International short</strong> (Mexico, Caribbean, Canada, LatAm short)</td><td>35</td><td>$2.4B</td><td>$9.6M</td><td>0.40%</td><td>+0.8 pp</td><td>-10.4%</td></tr>
+        <tr><td><strong>International long</strong> (Transatlantic, Asia, deep LatAm)</td><td>30</td><td>$3.6B</td><td>$10.0M</td><td>0.28%</td><td>+0.4 pp</td><td>-7.6%</td></tr>
+        <tr><td><strong>Network total</strong></td><td>141</td><td>$13.6B</td><td>$48.0M</td><td>0.35%</td><td>+0.62 pp</td><td>-9.1%</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Mapping ML metrics to business metrics</h2>
+  <p>
+    Every business KPI has a model-side root cause. This is the table I bring to the
+    finance review when they ask &ldquo;why does coverage matter?&rdquo;
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>ML metric</th>
+          <th>Drives which business metric</th>
+          <th>Mechanism</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>MAPE</strong> (median accuracy)</td>
+          <td>Average fare; revenue per available seat mile (RASM)</td>
+          <td>Better point forecast &rarr; bid-price optimizer sets sharper price fences &rarr; less revenue left on table on under-priced seats and fewer empty seats from over-priced ones.</td>
+        </tr>
+        <tr>
+          <td><strong>RMSE</strong> (large-error penalty)</td>
+          <td>Tail loss; spoilage on premium cabins</td>
+          <td>Big misses cause expensive mistakes (selling premium too cheap or empty). RMSE drop directly lowers spoilage rate.</td>
+        </tr>
+        <tr>
+          <td><strong>Pinball loss q90</strong></td>
+          <td>Inventory protection; denied boardings</td>
+          <td>q90 quantile is the protection threshold for last-minute high-yield bookings. Sharper q90 &rarr; less spilled high-yield demand and fewer denied boardings.</td>
+        </tr>
+        <tr>
+          <td><strong>PI coverage</strong></td>
+          <td>Bid-price reliability; analyst trust</td>
+          <td>If 80% PI covers actuals 80% of the time, the optimizer&apos;s risk model is calibrated and analysts trust it. Below 70% &rarr; analysts override en masse, killing the lift.</td>
+        </tr>
+        <tr>
+          <td><strong>CRPS</strong> (full distribution score)</td>
+          <td>Long-horizon revenue</td>
+          <td>CRPS scores the full forecast distribution, not just mean or quantiles. It captures the &ldquo;is the shape right&rdquo; question that drives 30-day-out booking-curve decisions.</td>
+        </tr>
+        <tr>
+          <td><strong>ECE</strong> (calibration error)</td>
+          <td>Override rate; risk-adjusted yield</td>
+          <td>Probabilistic calibration drift triggers analyst overrides. ECE drop of 40% directly correlates with override drop of 27%.</td>
+        </tr>
+        <tr>
+          <td><strong>Forecast freshness</strong></td>
+          <td>Competitor match speed</td>
+          <td>6-hour freshness vs the old 24h means we can match a competitor undercut inside one OTA refresh cycle, holding share.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>ML uplift by region (relative drops vs zero-shot)</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-bi-ml-by-region"></canvas>
+  </div>
+  <p class="caption">
+    Percentage drop in each ML metric versus the zero-shot baseline, by region. Notice
+    the 35-42% RMSE drops &mdash; these translate almost 1:1 into spoilage drops on high-fare
+    cabins. ECE (calibration error) drops most on domestic where we have the most data
+    to calibrate against.
+  </p>
+
+  <h2>Where the $48M actually comes from</h2>
+  <p>
+    Revenue attribution is the part of an ML project that goes wrong most often. Three
+    rules I followed: (1) attribute only to changes I can A/B; (2) discount cross-effects
+    aggressively; (3) report a confidence interval, not a point estimate.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>Source of lift</th>
+          <th>Mechanism</th>
+          <th>Annual impact</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><strong>Sharper median forecast</strong></td><td>Better fare placement on hub-spoke domestic; mid-price fares move closer to optimal more days per year.</td><td>$22M</td></tr>
+        <tr><td><strong>Sharper q90 (premium protection)</strong></td><td>Last-minute business-class inventory better protected; fewer spoiled premium seats.</td><td>$11M</td></tr>
+        <tr><td><strong>Faster competitor matching</strong></td><td>14-min p50 vs old 4-hour cycle; share retention on price-elastic leisure markets.</td><td>$8M</td></tr>
+        <tr><td><strong>Holiday peak protection</strong></td><td>Pre-published holiday flags + adapter-aware peak shape; +$11M on Thanksgiving week alone (annualised).</td><td>$4M (residual after seasonality offsets)</td></tr>
+        <tr><td><strong>Cold-start on new routes</strong></td><td>10 new routes / year start at 10% MAPE on day 1 vs 6 months of poor pricing under ARIMAX cold-start.</td><td>$1M</td></tr>
+        <tr><td><strong>Ancillary revenue (assigned)</strong></td><td>Better fare placement &rarr; more sold seats &rarr; more bag/seat-select attach.</td><td>$2M</td></tr>
+        <tr><td><strong>Total (95% CI: $36M&ndash;$58M)</strong></td><td colspan="2" style="text-align:right;"><strong>$48M</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="insight">
+    <strong>Honesty note.</strong> The $48M point estimate is the midpoint. The 95% CI
+    is $36M&ndash;$58M based on holdout-cohort revenue diff during the 8-week canary. I report
+    both. Finance has every right to discount further.
+  </div>
+
+  <h2>Annual revenue trajectory through rollout</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-bi-rollout-trajectory"></canvas>
+  </div>
+  <p class="caption">
+    Cumulative annualised revenue lift, week-by-week, through the 16-week rollout.
+    Sharp inflection at week 8 when 25% &rarr; 50% rollout activated; second inflection
+    at week 13 when international long was added. Steady-state from week 16.
+  </p>
+
+  <h2>Operational metrics &mdash; what changed for the RM team</h2>
+  <p>
+    The Revenue Management team is the immediate consumer of the forecast. Their workflow
+    changed measurably:
+  </p>
+
+  <div class="lesson-grid">
+    <div class="lesson">
+      <div class="lesson-num">1</div>
+      <h3>Manual overrides down 27%</h3>
+      <p>Pre-rollout, RM analysts overrode the ARIMAX forecast on ~12% of OD-pairs daily. Post-rollout, that dropped to ~9%, and almost all the remaining overrides are policy decisions (e.g. corporate contract honor) not forecast disputes.</p>
+    </div>
+    <div class="lesson">
+      <div class="lesson-num">2</div>
+      <h3>Off-cycle re-score in 14 min</h3>
+      <p>When fuel spikes or a competitor moves, RM can request an off-cycle re-score. Median wall time from Slack request to fresh forecast: 14 minutes. p99: 31 minutes. Pre-rollout this was a 4-hour batch.</p>
+    </div>
+    <div class="lesson">
+      <div class="lesson-num">3</div>
+      <h3>Forecast freshness 6 h</h3>
+      <p>Forecast is regenerated nightly at 02:00 CST and on-demand within hours. Old system was 24-hour freshness; new system is 6-hour effective freshness because off-cycle re-score is cheap.</p>
+    </div>
+    <div class="lesson">
+      <div class="lesson-num">4</div>
+      <h3>Spill / spoilage both down</h3>
+      <p>Spill rate (high-fare passengers turned away) -4.7%. Spoilage (empty seats that should have sold cheaper) -6.3%. The old system was tuned to one, not both; the new q90/q10 spread lets the optimizer balance.</p>
+    </div>
+    <div class="lesson">
+      <div class="lesson-num">5</div>
+      <h3>CSAT unchanged</h3>
+      <p>Worth calling out: better revenue without any measurable change in customer-satisfaction surveys. The model is not extracting more from individual passengers; it&apos;s reducing waste in inventory placement.</p>
+    </div>
+    <div class="lesson">
+      <div class="lesson-num">6</div>
+      <h3>$60/year compute</h3>
+      <p>Total cloud bill end-to-end (training + inference + monitoring) is &lt;$60/year on a single Azure NV A10 v5 spot VM. 800,000&times; ROI on compute spend.</p>
+    </div>
+  </div>
+
+  <h2>Per-family revenue lift breakdown</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-bi-family-revenue"></canvas>
+  </div>
+  <p class="caption">
+    Annual revenue lift per route family (USD millions). Transatlantic Premium dominates
+    in absolute terms because each OD-pair carries ~$200M baseline. Mexico Leisure and
+    Caribbean Hub punch above their weight because of high elasticity capture. Bottom 3
+    families ship without LoRA and contribute via the shared head only.</p>
+
+  <h2>The CFO conversation</h2>
+  <p>The numbers above were the final slide of my Director-level review. The Director&apos;s
+  three questions:</p>
+
+  <ol>
+    <li><strong>&ldquo;What&apos;s the floor?&rdquo;</strong> $36M (lower 95% CI). I scoped the project on a $30M floor; $36M is comfortably inside that.</li>
+    <li><strong>&ldquo;What&apos;s the cannibalisation?&rdquo;</strong> Roughly zero. Better forecast doesn&apos;t come at the expense of CSAT, ancillary, or AAdvantage program performance. We compared month-over-month for each.</li>
+    <li><strong>&ldquo;What can I tell the CFO with high confidence?&rdquo;</strong> $40M annualised lift at $60 compute, with monitoring in place to roll back inside 5 minutes if any region drifts.</li>
+  </ol>
+
+  <div class="callout">
+    The job of an ML team isn&rsquo;t to maximise MAPE. It&rsquo;s to maximise risk-adjusted
+    revenue lift per dollar of compute. MAPE is the lever; revenue is the metric.
+  </div>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; business impact &amp; revenue attribution</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">How did you arrive at $48M?</div>
+        <div class="a">An 8-week canary on 5% of OD-pairs running shadow + live mode in parallel. We compared revenue per available seat mile (RASM) on the canary cohort vs a matched control cohort with similar elasticity, base revenue, and seasonality. The diff was 0.35% &plusmn; 0.06% (95% CI). Apply 0.35% to the $13.6B baseline annual revenue across the 141 OD-pairs and you get $47.6M; report $48M for round numbers and acknowledge the CI.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why isn&apos;t the percentage lift higher?</div>
+        <div class="a">Because the per-route ARIMAX baseline is a serious system, not a strawman. Most carriers have a thoughtful per-route forecast already. The 0.35% lift is realistic for &ldquo;good baseline + foundation model&rdquo;; if the baseline had been moving averages we&apos;d be reporting 1.5%+. The right comp is &ldquo;state-of-the-art statistical forecast&rdquo; not &ldquo;naive forecast.&rdquo;</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you avoid double-counting between MAPE drop and revenue lift?</div>
+        <div class="a">We measure them on independent cohorts. MAPE on the held-out validation cohort, revenue on the canary cohort. The two never cross-pollinate in the metrics ledger. When I report &ldquo;MAPE drop X led to revenue lift Y,&rdquo; that&apos;s an attribution model, not a measurement.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What if elasticity assumptions shift after rollout?</div>
+        <div class="a">Three protections. (1) The XReg head is retrained quarterly; elasticity coefficients update. (2) Coverage drift on q10/q90 fires alerts when reality stops matching the forecast distribution. (3) The bid-price optimizer is owned by a separate team; if elasticity drifts they update their own demand curve independently. We&apos;re forecasting fares, not policy.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why is intl-long&apos;s percentage lift lower than intl-short?</div>
+        <div class="a">Three factors. (1) Long-haul has longer purchase windows so the 30-day horizon spans a regime change more often. (2) Currency adds non-stationary noise that the foundation-model trunk wasn&apos;t pretrained on. (3) Premium cabin mix is high; PI is wider; optimizer protects more aggressively, leaving less upside to capture. We took 0.28% rather than push for 0.40% with a wider PI.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Is the $48M lift sustainable or one-off?</div>
+        <div class="a">Sustainable, modulo retraining. Quarterly XReg refit captures new fuel/holiday/competitor behaviour; LoRA refit catches family-specific drift. We modelled a degradation rate of ~12% per quarter without retraining and the cadence is set to keep us within 2% of peak.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you handle confounding from a marketing campaign or schedule change?</div>
+        <div class="a">Two-stage exclusion. First, the data extract excludes 14-day windows around schedule changes (retiming, equipment swap) since those create artificial bookings spikes. Second, the canary control cohort is matched on marketing exposure, so cohort-vs-control diff ignores network-wide marketing tides.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the cannibalisation against ancillary revenue?</div>
+        <div class="a">We measured. Bag and seat-select attach rate didn&apos;t change; AAdvantage redemption didn&apos;t change; CSAT survey scores didn&apos;t change. We&apos;re not extracting from existing customers; we&apos;re reducing waste in inventory placement.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What was the most expensive bug?</div>
+        <div class="a">Week 11 we shipped a LoRA adapter that hadn&apos;t been validated against the held-out international-short cohort. PI coverage on Mexico routes drifted to 73% for 36 hours before alert fire and rollback. Post-incident: ~$140K of revenue impact (estimated), zero customer-facing harm. We added a CI gate that blocks adapter ship without held-out validation.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why don&apos;t you report 800,000&times; ROI more loudly?</div>
+        <div class="a">It&apos;s a marketing number. The right framing is &ldquo;we shipped a $48M lift project on a $60 compute bill,&rdquo; which puts it in the &ldquo;don&apos;t worry about the cost, worry about the work&rdquo; bucket. Comparing to the team headcount and quarterly running cost (in the millions) gives a more honest 30&ndash;50&times; ROI.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If MAPE went up 0.5 pp, would revenue drop linearly?</div>
+        <div class="a">Approximately, but not exactly. The relationship between MAPE and revenue lift is concave because the optimizer does non-linear protection: at MAPE 4% the optimizer is fully &ldquo;trusting&rdquo;; at MAPE 8% it widens its safety margins, ceding revenue. We empirically estimated ~$5M lift at 1 pp of MAPE drop in the 4&ndash;7% range. Outside that the relationship breaks down.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you compare to industry benchmarks?</div>
+        <div class="a">Public airline RM literature reports 0.2&ndash;0.5% revenue lift from forecast improvements above a strong baseline. Our 0.35% sits squarely in that range. Foundation-model approaches in non-airline retail report 0.5&ndash;1%; airline has tighter optimizer policy constraints so we expect to be at the lower end of that.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What KPIs do you watch on the production dashboard?</div>
+        <div class="a">Six. (1) Coverage on top-50 OD-pairs (alert &lt;75%). (2) p99 latency (alert &gt;25 ms). (3) Forecast freshness (alert &gt;24h). (4) LoRA swap failure rate (alert &gt;0). (5) MAPE on yesterday&apos;s actuals (informational). (6) Revenue lift on canary cohort vs control (weekly informational).</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Could a smaller airline replicate this lift?</div>
+        <div class="a">The model architecture and training pipeline transfer essentially unchanged. The lift would scale with their revenue base. The harder thing to transfer is the operational scaffolding: feature store, eval harness, CI gate, on-call runbook. Those took us 6 weeks of the 16-week timeline; they would take a smaller team longer because the &ldquo;ML Engineer&rdquo; role wouldn&apos;t already be partially filled.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="market-routes.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Market routes fine-tuning</div>
+    </a>
+    <a class="page-nav-item next" href="tradeoffs-deepdive.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Tradeoffs deep-dive</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+<script src="../assets/js/charts.js"></script>
+<script>
+  document.addEventListener("DOMContentLoaded", function () {
+    if (typeof window.aaPortfolioRenderTab === "function") {
+      window.aaPortfolioRenderTab("business-impact");
+    }
+  });
+</script>
+</body>
+</html>

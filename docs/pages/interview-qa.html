@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interview Q&amp;A by Section &middot; AA Pricing Forecast</title>
+<meta name="description" content="Comprehensive interview prep: 100+ questions across foundations, model choice, fine-tuning, inference, evaluation, deployment, monitoring, market generalisation, and business impact. Each Q with a concrete A grounded in the project." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <span>Interview Q&amp;A by section</span>
+  </nav>
+
+  <h1>Interview Q&amp;A &mdash; section by section</h1>
+  <p class="lead">
+    100+ interview questions organised by topic. Each section maps to a part of the project
+    and to a deep-dive page. Use this as the master prep doc &mdash; the individual decision
+    pages have the math, this one has the answers.
+  </p>
+
+  <div class="tldr">
+    <strong>How to use this page.</strong> Skim section headings to find the topic. Each
+    Q has a concrete, project-grounded A &mdash; numbers, files, decisions. If a question can
+    be answered with &ldquo;it depends,&rdquo; the A says <em>on what</em>.
+  </div>
+
+  <h2 id="section-toc">Sections</h2>
+  <ol>
+    <li><a href="#section-foundations">Foundations &amp; problem framing</a></li>
+    <li><a href="#section-data">Data engineering &amp; feature store</a></li>
+    <li><a href="#section-model">Model architecture &amp; TimesFM internals</a></li>
+    <li><a href="#section-finetuning">Fine-tuning, PEFT, and LoRA</a></li>
+    <li><a href="#section-markets">Market generalisation across 141 routes</a></li>
+    <li><a href="#section-inference">Inference optimization &amp; latency</a></li>
+    <li><a href="#section-evaluation">Evaluation, calibration, and probabilistic forecasting</a></li>
+    <li><a href="#section-deployment">Deployment, MLOps, and rollout</a></li>
+    <li><a href="#section-monitoring">Monitoring, drift detection, and rollback</a></li>
+    <li><a href="#section-business">Business impact &amp; revenue attribution</a></li>
+    <li><a href="#section-leadership">Leadership, scope, and on-call</a></li>
+    <li><a href="#section-trick">Trick &amp; failure-mode questions</a></li>
+  </ol>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-foundations">
+    <h2>1. Foundations &amp; problem framing</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">What problem are you solving in one sentence?</div>
+        <div class="a">Forecast the daily average fare for AA OD-pairs over a 30-day horizon with calibrated quantiles, so the bid-price optimizer can do risk-aware inventory decisions.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why was this worth a quarter of effort?</div>
+        <div class="a">A 1 pp drop in MAPE was estimated at $5M of annual revenue lift. We had &ge;5 pp of headroom over the per-route ARIMAX baseline. Even a partial win cleared the cost-of-capital bar.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why a foundation model and not just better ARIMAX?</div>
+        <div class="a">Three reasons: (1) cold-start &mdash; ARIMAX needs ~6 months of data per new route, (2) cross-route information transfer &mdash; ARIMAX is per-route by construction, (3) probabilistic calibration &mdash; per-route quantile regression is wildly noisy with 90 windows.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What are you NOT solving?</div>
+        <div class="a">We&apos;re not making pricing decisions. We forecast fares; the bid-price optimizer (separate team) makes pricing policy. We&apos;re not modeling demand directly &mdash; demand curve is owned by Operations Research. Antitrust requires that separation.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What does &quot;daily average fare&quot; mean exactly?</div>
+        <div class="a">Volume-weighted average of fares booked on a given OD-pair on a given calendar day, in USD, net of taxes/fees, by cabin. We forecast per cabin separately; main-cabin is the headline series.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Who consumes the output?</div>
+        <div class="a">A C++ bid-price optimizer that runs nightly and on-demand. It expects a JSON of q10/q50/q90 fare forecasts for 30 days forward, indexed by OD-pair and cabin. Schema is versioned in <code>aa-rm-spec/forecast-v3.json</code>.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What was the success criterion?</div>
+        <div class="a">$30M floor on annual revenue lift, &lt;90s nightly batch wall time, &lt;$0.10 per run, 80% PI coverage in [78, 82]. We hit $48M, 41s, $0.011, and 79.3% respectively.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How long did the project take?</div>
+        <div class="a">16 weeks discovery to full network rollout. 8 two-week sprints, each with an exit gate. Single Applied Scientist (me) for the modeling work, ML Engineering picked up infra-only items in sprints 7&ndash;8.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-data">
+    <h2>2. Data engineering &amp; feature store</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">What does the training dataset look like?</div>
+        <div class="a">~2.8M (OD-pair, day) windows over 24 months, sliced into 90-day context + 30-day horizon. ~250K windows after stratified sampling for the XReg head. Per-family LoRA training shards range 50K&ndash;200K windows.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How is the feature store organized?</div>
+        <div class="a">Azure Synapse-fronted Parquet on Azure Blob Storage, partitioned by OD-pair / yearmonth. Schema-versioned via Microsoft Purview. Daily 03:00 CST extract job populates &mdash; same source serves training and nightly inference.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you handle missing data?</div>
+        <div class="a">Three sources of missingness: (1) day with zero bookings on low-volume routes &mdash; fill with NaN, mask in attention via padding flag; (2) covariate publication delay (e.g. fuel price T+1) &mdash; freeze with last-good value, never future-leak; (3) outliers (fares &gt;3&sigma; from family median) &mdash; flag with binary feature, don&apos;t drop.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you avoid data leakage between train and validation?</div>
+        <div class="a">Time-based split: train on months 1&ndash;18, validate on months 19&ndash;21, test on months 22&ndash;24. Within each split, no OD-pair appears in two splits. We hold out 5 OD-pairs per family entirely for measuring adapter generalisation.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What covariates do you use?</div>
+        <div class="a">8 dynamic + 3 static. Dynamic numerical: jet fuel USD/gal, competitor fare, days-to-departure, load factor lag. Dynamic categorical: holiday flag, day-of-week, school break, weather disruption. Static categorical: route type, cabin, equipment.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why isn&apos;t the booking curve a covariate?</div>
+        <div class="a">Endogeneity. Fares affect bookings affect future fares; including booking curve as a covariate creates a feedback loop with the bid-price optimizer. We use load-factor lag (yesterday&apos;s realised) as a regularised proxy.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you handle currency for international routes?</div>
+        <div class="a">USD/local-currency spot as a dynamic numerical covariate, 7-day moving average to smooth daily noise. Per-currency XReg coefficient. On macro shock days (&gt;2% intraday move), an off-cycle re-score fires.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How long does the daily extract take?</div>
+        <div class="a">Azure Data Factory pipeline; ~22 minutes for the full panel. SLA: complete by 04:00 CST so training/inference at 02:00 next morning has fresh data.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you reproduce a specific training run?</div>
+        <div class="a">Every training artifact is signed with cosign and tagged with: data hash (SHA256 of the Parquet manifest), config hash, seed, code git SHA. The notebook can re-run any past experiment from those four hashes.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-model">
+    <h2>3. Model architecture &amp; TimesFM internals</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Walk me through the TimesFM forward pass.</div>
+        <div class="a">(1) 90 daily fares are patched into 3 patches of 32 (with mask-aware padding). (2) Per-patch z-norm + 2-layer MLP &rarr; 1280-d patch embeddings. (3) 20 transformer blocks (causal self-attention with RoPE, SwiGLU FFN, pre-LayerNorm) &mdash; trunk frozen for AA. (4) Output head produces 128-step forecast at 10 quantiles. (5) XReg head adds AA covariate residuals. (6) LoRA adapter (rank-8 on Q/K/V/O) modulates per route family.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why decoder-only and not encoder-decoder?</div>
+        <div class="a">Time-series forecasting maps cleanly to causal generation: condition on past, generate future. Encoder-decoder would have been overkill. TimesFM&apos;s decoder-only design also lets us use standard transformer optimizations (kv-cache, flash attention) downstream.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why patches and not per-token?</div>
+        <div class="a">Patches reduce sequence length 32&times; which makes attention quadratic-scaling tractable on a 90-day context. They also provide an inductive bias: patches encode &ldquo;weeks worth&rdquo; of context, which matches weekly seasonality structure in our data.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why z-normalize per patch and not globally?</div>
+        <div class="a">Fares range from $80 (low-cost domestic) to $11,000 (Asia first). Global normalization would compress signal in the low-fare regime. Per-patch normalization (with the patch&apos;s mean/std encoded as side info) gives the trunk a scale-invariant representation.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What does <code>force_flip_invariance</code> do and why?</div>
+        <div class="a">Enforces f(-x) = -f(x). Prevents pathological behaviour on the few routes where reverse-direction fares are negatively correlated. Empirically reduced PI variance on transcon hub-spoke by ~3%. Set to True for AA.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What does <code>infer_is_positive</code> do?</div>
+        <div class="a">Constrains output to non-negative values. Fares are strictly positive, so this clips noise tail rather than allowing physically meaningless negative quantiles. Cheap, mandatory.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why <code>fix_quantile_crossing=True</code>?</div>
+        <div class="a">The bid-price optimizer does inverse-CDF lookups; quantiles must be monotonic. Pinball loss does not enforce monotonicity, and ~0.5% of horizon predictions had crossing. Inference-time sort fixes it without affecting accuracy.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What is the XReg head exactly?</div>
+        <div class="a">Two-layer MLP (1280 &rarr; 512 &rarr; 10 quantiles &times; 30 days). Takes the trunk&apos;s last-patch hidden state plus future covariates, outputs residuals added to the trunk&apos;s baseline forecast. Trained end-to-end on residuals after pinball + median MSE loss.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How does LoRA modify the model exactly?</div>
+        <div class="a">For each attention projection W (1280&times;1280), we learn A (8&times;1280) and B (1280&times;8) and replace W with W + (alpha / r) &middot; B&middot;A. Only A and B are trained; W stays frozen. Per route family, that&apos;s 1.6M extra params on top of 200M frozen.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-finetuning">
+    <h2>4. Fine-tuning, PEFT, and LoRA</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Why two-stage and not one-stage?</div>
+        <div class="a">Stage A (XReg head) learns AA-specific covariate elasticities globally. Stage B (LoRA) captures family-specific cyclic patterns. Doing them simultaneously caused gradient interference: the head and the adapter would fight over the same residual signal. Sequential training resolved it.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you choose LoRA rank?</div>
+        <div class="a">Empirical sweep on the validation cohort. Rank 4 too small (0.3 pp behind); rank 8 the knee; rank 16 marginal except on Asia long-haul (0.4 pp gain there because of more idiosyncrasy); rank 32 overfits.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why apply LoRA to attention only and not FFN?</div>
+        <div class="a">Empirically attention LoRA caught 90% of the gain. FFN LoRA added 0.05 pp at 2&times; the parameter count. The attention path captures temporal dependencies which is where AA-specific patterns live; FFN is mostly feature transformation.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s the LoRA hot-swap?</div>
+        <div class="a">17 LoRA adapter state-dicts pinned in GPU memory. At inference time per OD-pair, we copy the relevant adapter&apos;s weights into the trunk&apos;s low-rank slots in &lt;10 ms. Pinned memory is the key &mdash; disk loads were 800 ms each.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What if a LoRA adapter fails to load?</div>
+        <div class="a">Graceful fallback to head-only forecast (XReg head without LoRA modulation). Increases family MAPE by ~1 pp but keeps the service up. Alert fires; on-call investigates next morning.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Did you consider QLoRA?</div>
+        <div class="a">Yes. QLoRA (quantize base to 4-bit, LoRA on top) saves training memory but the accuracy hit on q90 calibration was 0.6%. We have plenty of training memory ($3 of compute either way); QLoRA solves a problem we didn&apos;t have.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Did you consider IA<sup>3</sup> or BitFit?</div>
+        <div class="a">IA<sup>3</sup> evaluated at 5.7% MAPE vs LoRA&apos;s 5.1%. BitFit was worse, ~6.3%. Both have lower parameter counts than LoRA but our parameter count was never the constraint. We optimised for accuracy at fixed-cheap cost.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What loss function do you train with?</div>
+        <div class="a">Pinball loss across 10 quantiles (q05, q10, q20, q50, q80, q90, q95, etc.) plus median MSE as a stabiliser. Pinball gets the quantiles right; MSE keeps the median locked.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How long does fine-tuning take?</div>
+        <div class="a">XReg head: 40 minutes on 1&times;A10G, ~$0.70 of spot. Per-family LoRA: 6 minutes each, ~$0.10 each. 17 adapters total: ~$2 of incremental cost. Quarterly all-in compute: ~$7.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-markets">
+    <h2>5. Market generalisation across 141 routes</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">How many markets does the model serve?</div>
+        <div class="a">141 OD-pairs across 20 route families across 41 countries. 76 domestic, 35 intl-short (Mexico, Caribbean, Canada, LatAm short), 30 intl-long (Transatlantic, Asia long-haul, deep LatAm).</div>
+      </div>
+      <div class="qa">
+        <div class="q">How were route families clustered?</div>
+        <div class="a">Hierarchical clustering on (a) Fourier coefficients of weekly + annual seasonality, (b) elasticity from baseline regression, (c) holiday-sensitivity vector. Cut at 20 clusters; validated by checking within-family LoRA gain &gt; 0.5 pp.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why does international long-haul MAPE stay above 6%?</div>
+        <div class="a">Three structural factors. (1) 30-day horizon spans regime change more often (purchase windows are 60&ndash;90 days). (2) Currency volatility is non-stationary noise. (3) Premium-cabin mix is high; PI is necessarily wider. We accepted 6.1% rather than narrow PI artificially.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why not train per-currency-pair instead of per-region?</div>
+        <div class="a">Currency is one signal among many. Family clusters happen to align well with major currency pairs (Mexico Leisure = USD/MXN, Transatlantic = USD/EUR + USD/GBP). Adding currency as a covariate was sufficient; splitting families further would have shrunk training shards below the statistical safety threshold.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What happens when a new route launches?</div>
+        <div class="a">Day 1: zero-shot from trunk + cold-start synthetic prior from 3&ndash;5 analog OD-pairs in the same region; PI inflated 1.4&times;. Days 2&ndash;14: real bookings replace synthetic prior; PI tapers. Day 60: route added to its family for the next quarterly LoRA refit.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Which routes don&apos;t benefit from fine-tuning?</div>
+        <div class="a">3 of 20 families: Asia Niche (LAX-SYD, JFK-BOM), Atlantic Niche (PHL-DUB, DFW-BCN), South America Niche (deep tail). They fall back to head-only forecast because LoRA didn&apos;t improve them by &ge;0.5 pp on held-out validation.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why does Mexico/Caribbean punch above its weight on revenue lift?</div>
+        <div class="a">High elasticity capture. Leisure travelers shop competitively; 0.5 pp better forecast translates to noticeably better fence placement. Mexico Leisure&apos;s 0.40% revenue lift on a $1.4B base is $5.6M alone &mdash; the highest per-route productivity in the network.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you validate generalisation to a route the model didn&apos;t train on?</div>
+        <div class="a">Held-out cohort: 5 OD-pairs per family, never seen in training. Adapter ships only if it generalises (delta MAPE &gt; 0.5 pp on held-out cohort). 3 families fail this gate today.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How does the model handle peak-vs-shoulder for international leisure?</div>
+        <div class="a">Two channels: XReg head sees holiday flag + school-break flag (per-country); LoRA adapter captures family-specific peak shape (Caribbean carnival is short-tall, Mexico spring break is wide-flat). Optimizer protects per q90, not median.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Can you onboard a new region (say, Africa) without retraining the trunk?</div>
+        <div class="a">Yes, in three steps: (1) curate the OD-pairs into 1&ndash;3 new route families, (2) add an XReg-head retraining cycle including the new families, (3) train LoRA per new family. Total cost: ~$1.50 of compute. Time: 2 weeks for data engineering, 1 day for training.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-inference">
+    <h2>6. Inference optimization &amp; latency</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Walk me through the 47&times; speedup.</div>
+        <div class="a">Baseline FP32 batch=1 eager: 280 ms per OD-pair. Step 1: batch=64 &rarr; 18 ms (kernel launch overhead disappears). Step 2: BF16 &rarr; 9 ms. Step 3: <code>torch.compile</code> &rarr; 6 ms. Step 4: LoRA hot-swap (no perf change but enables family-conditioned forecasting): 6 ms median, 14 ms p99.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why batch=64 and not larger?</div>
+        <div class="a">A10G memory limit. Batch=128 spilled to global memory and dropped throughput 8%. Batch=32 left 30% on the table. 64 is the A10G sweet spot for our patch size.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why BF16 and not FP16?</div>
+        <div class="a">FP16 has narrower exponent range; we have fares from $80 to $11,000 and don&apos;t want premium-cabin tail forecasts to overflow. BF16 has FP32&apos;s exponent range with FP16&apos;s memory footprint &mdash; right tool for the job.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why <code>torch.compile</code> over TensorRT/ONNX?</div>
+        <div class="a">TensorRT had a 5% kernel-coverage gap that fell back to CUDA, eliminating its advantage. <code>torch.compile</code> is one decorator, one rollback path. We were already at 6 ms; the operational simplicity of <code>torch.compile</code> won.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why did INT8 quantization fail?</div>
+        <div class="a">PI coverage on top-50 routes dropped from 80% to 73%. The bid-price optimizer requires bid-price-grade quantiles; that precision drop was unacceptable. Median latency went from 6 to 4 ms but at a quality cost we couldn&apos;t pay.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How does LoRA hot-swap work in production?</div>
+        <div class="a">All 17 adapter state-dicts are loaded at startup into pinned (page-locked) GPU memory. Per OD-pair, we look up the family, copy the adapter&apos;s weights into the trunk&apos;s low-rank slots (~8 ms), forward-pass, write result. LRU eviction is unused because all 17 fit in memory.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s the nightly batch wall time?</div>
+        <div class="a">41 seconds for 6,700 OD-pairs (105 batches of 64). Plus 30s spot spin-up, 6s adapter load, 12s torch.compile warm-up, 8s feature-store write, 2s telemetry, 1s spot release. End-to-end: 1m 40s.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why a single A10G and not multi-GPU?</div>
+        <div class="a">Multi-GPU sharding gave 1.6&times; speedup at 2&times; cost. Doubling cost to halve a 41-second job is bad business. Single A10G runs at $0.011 per nightly run; 2&times; A10G would run $0.022.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s the p99 latency story?</div>
+        <div class="a">14 ms p99 vs 6 ms median. The p99 tail comes from LoRA hot-swap when the adapter has just been evicted from L2 cache &mdash; forced refetch from pinned memory. Within the 25 ms SLO with margin.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-evaluation">
+    <h2>7. Evaluation, calibration, and probabilistic forecasting</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Why MAPE and not MASE or sMAPE?</div>
+        <div class="a">Business stakeholders intuit percent-error; MAPE communicates well. We use sMAPE in monitoring as a complement. MASE was rejected because the seasonal-naive baseline isn&apos;t meaningful for fare forecasting.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s pinball loss?</div>
+        <div class="a">L<sub>tau</sub>(y, y_hat) = (y - y_hat) &middot; tau if y &ge; y_hat else (y_hat - y) &middot; (1 - tau). Asymmetric loss that penalises under- and over-prediction proportionally to the desired quantile. Sum across 10 quantiles to optimise the full forecast distribution.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s CRPS and why do you compute it?</div>
+        <div class="a">Continuous Ranked Probability Score: integral over (F(y) - 1[y &ge; y_obs])^2 dy. Scores the full predictive distribution. We use it as a complement to pinball because it captures &ldquo;is the shape right&rdquo; questions that pinball misses at non-evaluated quantiles.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s prediction interval coverage?</div>
+        <div class="a">Empirical fraction of actual values that fall inside the predicted [q10, q90] interval. Should be 80% by construction. We check it on top-50 routes daily; alert if rolling 7-day &lt;75% on any family.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s ECE (expected calibration error)?</div>
+        <div class="a">Average absolute deviation between predicted quantile probability and empirical frequency, weighted by sample count. ECE drops 36&ndash;42% across regions in our LoRA model vs zero-shot. Lower ECE means analyst trust in the forecast holds.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you handle quantile crossing?</div>
+        <div class="a">Inference-time sort. Output the 10 raw quantiles, then sort. Affects ~0.5% of horizon predictions; no measurable accuracy impact. <code>fix_quantile_crossing=True</code> in ForecastConfig wraps this.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Did you consider conformal prediction?</div>
+        <div class="a">Yes, for an extra layer of calibration on intl-long where coverage drifts. We didn&apos;t ship it because the marginal coverage gain (1.2 pp) wasn&apos;t worth the operational complexity (one more layer of state). Revisit if coverage drift becomes a recurring issue.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How is your evaluation harness structured?</div>
+        <div class="a">A single Python module, <code>aa_eval</code>, callable from training, CI, and the dashboard. Every metric has a unit test for the math. The CI gate fails the build if a model checkpoint regresses MAPE by &gt;0.3 pp on the held-out cohort.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you A/B in production?</div>
+        <div class="a">Shadow mode + canary. Shadow runs the new model alongside the old in parallel for 7 days, comparing forecasts but not affecting policy. Canary then routes 5% of OD-pairs to the new model live while the rest stay on baseline. Diff in revenue per ASM is the success signal.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-deployment">
+    <h2>8. Deployment, MLOps, and rollout</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">What&apos;s the Azure deployment topology?</div>
+        <div class="a">Azure ML for the model registry (cosign-signed safetensors), Azure Blob Storage for feature parquet, Azure Cosmos DB for forecast outputs, Azure Kubernetes Service for the on-demand re-score API, NV A10 v5 spot VM for the nightly batch, Application Insights for telemetry, Microsoft Entra ID for access.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why Azure ML registry over plain S3?</div>
+        <div class="a">Native cosign integration, SBOM tracking, Microsoft Entra ID for access. AA is Azure-first; matching the org&apos;s identity / governance plane saved us 2&times; the integration work compared to bolting governance onto S3.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you sign model artifacts?</div>
+        <div class="a">cosign sign with a key tied to the training-data hash + code git SHA. The signing key lives in Azure Key Vault. At inference startup, we verify the signature; mismatch &rarr; refuse to load, alert on-call.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s the rollout sequence?</div>
+        <div class="a">Shadow (5 OD-pairs, 7 days) &rarr; 5% canary (Director sign-off) &rarr; 25% &rarr; 50% &rarr; 75% &rarr; 100%. Each step gated on PI coverage, MAPE, and revenue diff. Rollback is one command at every stage.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How long was the canary?</div>
+        <div class="a">8 weeks (sprints 7&ndash;8). Shadow: 1 week. 5%: 2 weeks. 25%: 1 week. 50%: 1 week. 75%: 1 week. 100%: 2 weeks. Each ramp gated on a director-level review of the diff.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s the rollback procedure?</div>
+        <div class="a">Single command: <code>aa-rm-rollback --to=prev-tag</code>. Swaps the active model tag in Azure ML registry; nightly batch picks up the new pointer; on-demand API picks it up on next health check (~30 s). End-to-end rollback &lt;5 min.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you handle config drift between dev and prod?</div>
+        <div class="a">Single ForecastConfig file checked into the repo, hashed, and shipped alongside the model. Inference verifies the config hash matches the one signed into the artifact. Mismatch &rarr; refuse to load.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s in your CI pipeline?</div>
+        <div class="a">Linting, unit tests, eval-harness math tests, schema validation, MAPE regression check on a fixed validation cohort, PI-coverage check, build the artifact, sign it, push to staging registry. Production promotion is a separate manual step gated by Director approval.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-monitoring">
+    <h2>9. Monitoring, drift detection, and rollback</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">What do you monitor in production?</div>
+        <div class="a">Six core SLOs: (1) PI coverage on top-50 OD-pairs, (2) p99 latency, (3) nightly batch wall time, (4) cost per run, (5) LoRA swap failure rate, (6) forecast freshness. Plus secondary: per-family MAPE, ECE drift, covariate distribution drift (PSI).</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s PSI?</div>
+        <div class="a">Population Stability Index: sum over bins of (actual_pct - expected_pct) &times; ln(actual_pct / expected_pct). PSI &gt; 0.25 on a covariate distribution flags drift. Triggers a sanity-check job on the affected covariate.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What page thresholds did you set?</div>
+        <div class="a">Coverage &lt;75% on top-50 routes (any family) for 3 hours. p99 latency &gt;25 ms for 1 hour. LoRA swap failure rate &gt;0% for any window. Forecast freshness &gt;24 h. Each pages me at 2 a.m. via PagerDuty.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Tell me about a real production incident.</div>
+        <div class="a">Week 11: shipped a Mexico Leisure LoRA adapter that hadn&apos;t passed held-out validation. PI coverage drifted to 73% on Mexico routes for 36 hours before alerting. Estimated $140K revenue impact. Root cause: CI gate bypassed because validation cohort was empty. Fix: adapter ship blocked unless the held-out validation cohort has &ge;3 OD-pairs.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you detect concept drift vs covariate drift vs label drift?</div>
+        <div class="a">Three independent monitors. Covariate drift: PSI on each covariate. Label drift: KL divergence on the empirical fare distribution. Concept drift: rolling MAPE on yesterday&apos;s actuals (the only one that catches &ldquo;model is wrong even though inputs look fine&rdquo;).</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s your runbook structure?</div>
+        <div class="a">One markdown file per alert. Each has: the alert text verbatim, what the alert means in business terms, three diagnostic commands to run, three likely root causes ranked by probability, the rollback procedure, and the escalation contact. Half-asleep on-call should be able to follow it.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How often does the model retrain?</div>
+        <div class="a">Quarterly XReg head + LoRA refit. On-demand LoRA refit if a family&apos;s coverage drops below 76% for 7 days. On-demand XReg refit if a covariate&apos;s PSI &gt; 0.25 for 14 days.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you avoid retraining-induced regression?</div>
+        <div class="a">Every retrain runs through the CI pipeline: held-out MAPE, coverage, ECE, latency. Promotion to prod requires the new artifact to be no worse than the current artifact on each metric. If the model is genuinely worse, the old artifact stays.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-business">
+    <h2>10. Business impact &amp; revenue attribution</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">How did you arrive at $48M annual lift?</div>
+        <div class="a">8-week canary. Compared revenue per ASM on canary cohort (5% of OD-pairs) vs matched control cohort. Diff was 0.35% &plusmn; 0.06% (95% CI). Apply 0.35% to $13.6B baseline annual revenue across the 141 OD-pairs &rarr; $47.6M. Report $48M.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s the confidence interval?</div>
+        <div class="a">95% CI: $36M&ndash;$58M. The lower bound is the &ldquo;safe number to put in front of finance.&rdquo; Project was scoped on a $30M floor; $36M clears it.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What drives the lift?</div>
+        <div class="a">Six sources: sharper median ($22M), sharper q90 / premium protection ($11M), faster competitor matching ($8M), holiday peak protection ($4M residual), cold-start on new routes ($1M), ancillary attach ($2M).</div>
+      </div>
+      <div class="qa">
+        <div class="q">Which region carries the most lift?</div>
+        <div class="a">Domestic at $28.4M absolute (76 routes &times; 0.37% lift on $7.6B). International short is highest <em>percentage</em> at 0.40%. Intl-long is $10M absolute on a $3.6B base (0.28% &mdash; lower because of horizon/regime constraints).</div>
+      </div>
+      <div class="qa">
+        <div class="q">How much of the lift is from the foundation model and how much from XReg covariates?</div>
+        <div class="a">Decomposition (canary diff vs ARIMAX baseline): foundation-model trunk ~25%, XReg head ~50%, LoRA adapter ~25%. The XReg head dominates because that&apos;s where AA-specific elasticities live.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you avoid attribution to network-wide effects?</div>
+        <div class="a">Matched control cohort. Canary OD-pairs are matched on revenue base, elasticity, and seasonality with control OD-pairs that stay on baseline. Cohort-vs-control diff is the lift attribution; network-wide effects cancel.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s the ROI on compute?</div>
+        <div class="a">Annualised: $48M lift / $60 compute = 800,000&times;. Headline-friendly. The honest framing is &ldquo;the compute bill isn&apos;t the constraint, the work is.&rdquo;</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s the cannibalisation?</div>
+        <div class="a">Approximately zero on tested dimensions: bag attach unchanged, seat-select unchanged, AAdvantage redemption unchanged, CSAT survey scores unchanged. We&apos;re reducing waste in inventory placement, not extracting more from individual customers.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Is the lift sustainable?</div>
+        <div class="a">Yes, modulo retraining. Without quarterly XReg refit, MAPE degrades ~12% per quarter (estimated). Retraining cadence is set to keep us within 2% of peak. Annual retraining cost: ~$28 in compute.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-leadership">
+    <h2>11. Leadership, scope, and on-call</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Why did you, an Applied Scientist, own deployment?</div>
+        <div class="a">ML Engineering org was headcount-constrained. Team lead asked me to own end-to-end. Pragmatically &mdash; if I&apos;d waited for ML Engineering, the project would have died of starvation. I picked up the parts that wouldn&apos;t happen otherwise.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s the difference between an Applied Scientist and an ML Engineer?</div>
+        <div class="a">Artificial. The real boundary is between &ldquo;work that ends in a notebook&rdquo; and &ldquo;work that ends in a system another human can rely on.&rdquo; I crossed that boundary because the project required it.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How did you negotiate scope?</div>
+        <div class="a">v1 had 8 covariates (not 47), 200 routes for LoRA (not 6,700), nightly batch (not real-time). Each cut was a fight; each was right for the timeline. Wrote them down as &ldquo;v2 candidates&rdquo; and re-evaluated in retro.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What would you do differently next time?</div>
+        <div class="a">Sprint 2 (eval harness) deserved 3 weeks not 2. Started Director updates in Sprint 5; should have been Sprint 1. Synthetic on-call drill in Sprint 7; should have done a paper drill in Sprint 4. Shipped 17 LoRA adapters; bottom 5 contributed almost nothing &mdash; should have shipped 12.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you pick what to delegate vs what to own?</div>
+        <div class="a">Two questions: (1) is this on the critical path? (2) is the cost of me doing it wrong &gt; the cost of me doing it slowly? Critical-path items I owned end-to-end (modeling, eval harness, runbook). Non-critical items I either skipped (v1 cuts) or paired with ML Eng (Airflow DAG hardening).</div>
+      </div>
+      <div class="qa">
+        <div class="q">Tell me about a hard conversation.</div>
+        <div class="a">Week 7. Director wanted us to ship to all 6,700 routes immediately to claim the lift. I pushed back: canary at 5%, ramp staged, 8-week rollout. Argued that a $50K incident from a too-fast rollout would erase 6 months of credibility. He agreed; we ramped over 8 weeks. No incidents.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you onboard a peer to on-call?</div>
+        <div class="a">Three days of paired on-call. Day 1: walk through the runbook, simulate 3 alerts. Day 2: they handle alerts I drive. Day 3: I shadow while they handle. After Day 3, they own a slot in the rotation. Same approach I&apos;d want as a new joiner.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-trick">
+    <h2>12. Trick &amp; failure-mode questions</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">What if TimesFM is deprecated tomorrow?</div>
+        <div class="a">Two-week migration path. The XReg head and LoRA adapters are model-agnostic in concept; only the trunk changes. Chronos-Bolt is the runner-up; we benchmarked it during model selection. Estimated 0.8 pp MAPE regression initially, recoverable in 2&ndash;3 quarters.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What if AA hires 10 ML Engineers tomorrow?</div>
+        <div class="a">First priority: split ownership of the runbook so I&apos;m not single-point-of-failure on-call. Second: add a real-time forecast path (today is nightly + on-demand). Third: integrate with the demand-curve fitting so the Operations Research team and the ML team co-iterate.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What if the bid-price optimizer&apos;s assumptions break?</div>
+        <div class="a">We forecast fares; they own policy. If their elasticity model breaks, our forecast is still calibrated; their policy decisions need fixing. The split is intentional. Coverage drift on our end is independent.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What if a regulator wants to audit a price decision?</div>
+        <div class="a">Every forecast that fed a pricing decision is reproducible from (data hash, code SHA, model SHA, config hash). We can re-run it deterministically. The pricing policy is owned by the bid-price team; their audit trail is separate. Both sides cooperate on requests.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What if your training data is poisoned?</div>
+        <div class="a">Three protections. (1) Schema validation on extract. (2) Outlier flagging (fares &gt;3&sigma; from family median get a binary feature, not silently dropped). (3) PSI on covariate distribution at training time vs reference distribution. Combined, these would catch typical poisoning attacks on the order of weeks.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s the worst incident you can imagine?</div>
+        <div class="a">Adapter ships to all routes that drives all q90 forecasts to $0 for 30 days, optimizer dumps inventory, ~$5M revenue loss. Mitigations in place: CI gate, canary, coverage alert at 75%, rollback in 5 min. Worst-case bounded to ~$200K.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What&apos;s the worst incident that has actually happened?</div>
+        <div class="a">~$140K in week 11 from a Mexico Leisure adapter that bypassed the held-out validation gate. Coverage drifted 36 hours before alert; rollback was clean. Post-incident: CI gate now blocks adapter ship if held-out cohort is empty.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you keep the model fresh without continuous learning?</div>
+        <div class="a">Quarterly retrain captures regime shifts at the right cadence; on-demand retrain handles macro shocks. Continuous learning would buy us another ~5% accuracy at the cost of auditability and rollback. Not worth the trade for revenue management.</div>
+      </div>
+      <div class="qa">
+        <div class="q">If you could change one architectural decision retroactively, which?</div>
+        <div class="a">I&apos;d add a second context window (180-day) earlier in the project for international long-haul. The 0.5 pp gap to domestic is mostly horizon-driven, and a longer context partially fixes it. We tested it in week 14; integration would have taken another 3 weeks.</div>
+      </div>
+      <div class="qa">
+        <div class="q">If you joined a new team, what&apos;s the first thing you&apos;d do?</div>
+        <div class="a">Read the eval harness. If it doesn&apos;t exist, build it. Every other ML decision is unsafe without one. The eval harness is the first thing I built on this project; it&apos;s what enabled everything else.</div>
+      </div>
+    </div>
+  </div>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="tradeoffs-deepdive.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Tradeoffs deep-dive</div>
+    </a>
+    <a class="page-nav-item next" href="cheatsheet.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Interview cheat sheet</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>
