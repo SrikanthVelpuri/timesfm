@@ -51,8 +51,10 @@
       Adapted Google&rsquo;s TimesFM 2.5 foundation model to American Airlines pricing data
       through two cheap surgical fine-tuning surfaces &mdash; an XReg regression head and
       per-route-family LoRA adapters &mdash; then optimized inference 47&times; to fit a single
-      A10G GPU and a $50/year cloud bill. Owned end-to-end as the Applied Scientist:
-      data, modeling, evaluation, deployment, and on-call.
+      Azure NV A10 v5 spot VM and a ~$60/year cloud bill. Owned end-to-end as the Applied
+      Scientist: data, modeling, evaluation, deployment, and on-call. Deployed on AA&apos;s
+      Azure footprint &mdash; Azure ML registry, Blob Storage, Cosmos DB, AKS, Application
+      Insights, Microsoft Entra ID.
     </p>
     <div class="hero-actions">
       <a class="btn btn-primary" href="#" data-tab-link="role">Read my role &rarr;</a>
@@ -98,9 +100,18 @@
     <li><strong>Self-monitoring</strong> &mdash; PI coverage drift on top-50 routes pages me at 2 a.m. with a one-command rollback path.</li>
   </ul>
 
+  <h2 id="cheatsheet">Quick reference</h2>
+  <div class="page-index-grid">
+    <a class="page-index-card decision" href="pages/cheatsheet.html" style="border-left-color: var(--accent-amber);">
+      <span class="tag" style="background: rgba(245,158,11,0.18); color: #b45309;">Cheat sheet</span>
+      <h3 style="color: #b45309;">Interview cheat sheet</h3>
+      <p>Single-page quick-reference: numbers to memorize, math formulas, code snippets, killer Q&amp;A from all 11 deep dives, and a glossary. The night-before-interview page.</p>
+    </a>
+  </div>
+
   <h2 id="decisions">Deep-dive pages &mdash; design decisions</h2>
   <p>
-    Five interview-prep pages on the major design decisions behind the project. Each
+    Six interview-prep pages on the major design decisions behind the project. Each
     page has a TL;DR, a decision matrix, code samples where relevant, trade-offs, and
     an interview Q&amp;A section.
   </p>
@@ -129,6 +140,11 @@
       <span class="tag">Decision</span>
       <h3>Production monitoring &amp; rollback</h3>
       <p>PSI, concept drift, calibration drift. SLO table, alert design, runbook, real incidents from production.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/azure-architecture.html">
+      <span class="tag">Decision</span>
+      <h3>Azure deployment architecture</h3>
+      <p>AA&apos;s actual Azure topology: Azure ML, NV A10 v5 spot, Blob Storage, Cosmos DB, AKS, Application Insights, Microsoft Entra ID. AWS-to-Azure service mapping.</p>
     </a>
   </div>
 
@@ -170,7 +186,7 @@
     </a>
   </div>
 
-  <h2>Tech stack</h2>
+  <h2>Tech stack &mdash; Azure-native</h2>
   <div class="stack-grid">
     <span class="stack-tag">Python 3.11</span>
     <span class="stack-tag">PyTorch 2.x</span>
@@ -178,14 +194,23 @@
     <span class="stack-tag">LoRA (PEFT)</span>
     <span class="stack-tag">torch.compile</span>
     <span class="stack-tag">BF16 mixed precision</span>
-    <span class="stack-tag">Airflow</span>
-    <span class="stack-tag">S3 + Parquet</span>
-    <span class="stack-tag">Redis cache</span>
-    <span class="stack-tag">Datadog</span>
+    <span class="stack-tag">Azure ML</span>
+    <span class="stack-tag">Azure Blob Storage</span>
+    <span class="stack-tag">Azure Cosmos DB</span>
+    <span class="stack-tag">Azure Cache for Redis</span>
+    <span class="stack-tag">Azure Synapse</span>
+    <span class="stack-tag">Azure Data Factory</span>
+    <span class="stack-tag">Azure Kubernetes Service</span>
+    <span class="stack-tag">Azure Container Registry</span>
+    <span class="stack-tag">Application Insights</span>
+    <span class="stack-tag">Azure Monitor</span>
+    <span class="stack-tag">Azure DevOps</span>
+    <span class="stack-tag">Microsoft Entra ID</span>
+    <span class="stack-tag">Microsoft Purview</span>
+    <span class="stack-tag">Azure Key Vault</span>
     <span class="stack-tag">PagerDuty</span>
     <span class="stack-tag">cosign</span>
-    <span class="stack-tag">DataHub</span>
-    <span class="stack-tag">A10G spot</span>
+    <span class="stack-tag">NV A10 v5 spot</span>
   </div>
 </section>
 

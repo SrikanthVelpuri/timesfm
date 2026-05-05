@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interview Cheat Sheet &middot; AA Pricing Forecast</title>
+<meta name="description" content="One-page quick-reference of the AA pricing forecast project: numbers, math, code, decision rules, killer Q&A, and a glossary. Built for the night before an interview." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+<style>
+  /* Cheat-sheet specific niceties */
+  .cheat-toc {
+    position: sticky;
+    top: 70px;
+    background: var(--bg-card);
+    padding: 12px 16px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    margin-bottom: 24px;
+    z-index: 50;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-size: 12.5px;
+  }
+  .cheat-toc a {
+    color: var(--text-muted);
+    padding: 4px 10px;
+    border-radius: 4px;
+    background: var(--bg-muted);
+    text-decoration: none;
+    font-weight: 500;
+  }
+  .cheat-toc a:hover { background: var(--aa-blue); color: white; text-decoration: none; }
+
+  .cheat-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    margin: 14px 0;
+    box-shadow: var(--shadow);
+  }
+  .cheat-box h3 { margin: 0 0 10px 0; color: var(--aa-blue); font-size: 15px; }
+  .cheat-box p { margin: 0 0 6px 0; font-size: 14px; }
+  .cheat-box ul { margin: 0; padding-left: 20px; font-size: 14px; }
+
+  .cheat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+    margin: 14px 0;
+  }
+
+  .formula {
+    background: #fffbeb;
+    border-left: 3px solid var(--accent-amber);
+    padding: 10px 16px;
+    margin: 8px 0;
+    font-family: "Cambria Math", "STIX Two Math", Georgia, serif;
+    font-size: 14px;
+    border-radius: 0 6px 6px 0;
+  }
+  .formula em { color: var(--aa-blue); font-style: italic; }
+  .formula strong { color: var(--aa-red); font-weight: 700; }
+
+  .glossary { display: grid; gap: 8px; }
+  .glossary-row {
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: 16px;
+    padding: 10px 14px;
+    background: var(--bg-card);
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    font-size: 13.5px;
+  }
+  .glossary-row dt { font-weight: 700; color: var(--aa-blue); margin: 0; }
+  .glossary-row dd { margin: 0; color: var(--text-muted); }
+  @media (max-width: 600px) {
+    .glossary-row { grid-template-columns: 1fr; gap: 4px; }
+  }
+
+  .killer-qa { display: grid; gap: 12px; }
+  .killer-qa .qa { padding: 14px 18px; }
+  .killer-qa .qa .a { font-size: 13.5px; }
+
+  .pitch-box {
+    background: linear-gradient(135deg, #0078d2 0%, #005ba6 100%);
+    color: white;
+    padding: 24px 28px;
+    border-radius: var(--radius-lg);
+    margin: 12px 0 24px;
+  }
+  .pitch-box h2 { color: white; margin: 0 0 10px 0; border: none; padding: 0; }
+  .pitch-box p { color: rgba(255,255,255,0.95); margin: 0 0 6px 0; font-size: 15px; line-height: 1.55; }
+</style>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <span>Interview cheat sheet</span>
+  </nav>
+
+  <h1>Interview cheat sheet</h1>
+  <p class="lead">
+    Single-page quick-reference for the night before an interview. Pulls the
+    highest-signal content from all 11 deep-dive pages: numbers, math, code, decision
+    rules, killer Q&amp;A, glossary. Skim from top to bottom in 10 minutes.
+  </p>
+
+  <nav class="cheat-toc">
+    <a href="#pitch">30-sec pitch</a>
+    <a href="#numbers">Numbers</a>
+    <a href="#arch">Architecture</a>
+    <a href="#ft">Fine-tuning</a>
+    <a href="#inf">Inference</a>
+    <a href="#eval">Evaluation</a>
+    <a href="#drift">Drift</a>
+    <a href="#scen">Scenarios</a>
+    <a href="#math">Math</a>
+    <a href="#code">Code</a>
+    <a href="#qa">Killer Q&amp;A</a>
+    <a href="#rules">Decision rules</a>
+    <a href="#gloss">Glossary</a>
+  </nav>
+
+  <!-- ============ 30-SEC PITCH ============ -->
+  <h2 id="pitch">The 30-second pitch</h2>
+  <div class="pitch-box">
+    <h2>What I built</h2>
+    <p>
+      Took Google&apos;s TimesFM 2.5 foundation model and fine-tuned it for AA daily-fare
+      forecasting across 6,700 OD-pairs &mdash; <strong>without continued pretraining</strong>
+      because we had no budget for it. Two PEFT surfaces: an XReg regression head for AA
+      covariate elasticities, and per-route-family LoRA adapters for high-revenue routes.
+      Optimized inference 47&times; through batching + BF16 + <code>torch.compile</code> +
+      pinned-memory LoRA hot-swap. <strong>Deployed on AA&apos;s Azure footprint</strong>
+      &mdash; Azure ML registry, NV A10 v5 spot VMs, Blob Storage, Cosmos DB, AKS,
+      Application Insights, Microsoft Entra ID. Owned end-to-end as the Applied Scientist:
+      data, modeling, eval, deployment, on-call.
+    </p>
+    <p>
+      <strong>Result:</strong> network MAPE 10.2% &rarr; 5.1%, 80% PI coverage 79.3%,
+      nightly batch 41 s on one Azure NV A10 v5 spot VM, ~$48M estimated annual
+      revenue lift, ~$60/year cloud cost.
+    </p>
+  </div>
+
+  <!-- ============ NUMBERS ============ -->
+  <h2 id="numbers">Numbers to memorize</h2>
+  <table class="decision-matrix">
+    <thead><tr><th>Metric</th><th>Value</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>OD-pairs</td><td>6,700</td><td>Scale &mdash; one-model approach beats per-route artifacts</td></tr>
+      <tr><td>Cold-start fraction</td><td>~28%</td><td>Why foundation model wins; ARIMAX cold-starts to global mean</td></tr>
+      <tr><td>Context length</td><td>90 days</td><td>One quarter; enough to capture DOW + monthly cycle</td></tr>
+      <tr><td>Horizon</td><td>30 days</td><td>RMS bid-pricing window</td></tr>
+      <tr><td>Covariates</td><td>8 dynamic + 3 static</td><td>fuel, comp fare, DTD, LF lag, holiday, DOW, school, weather + route_type, cabin, eqpt</td></tr>
+      <tr><td>Model size</td><td>200 M params, 800 MB</td><td>Fits A10G; 1 GB VRAM at inference</td></tr>
+      <tr><td>Network MAPE</td><td>10.2% &rarr; 6.0% &rarr; 5.1%</td><td>Zero-shot &rarr; +XReg head &rarr; +LoRA</td></tr>
+      <tr><td>Coverage on 80% PI</td><td>79.3%</td><td>Target [78%, 82%]; ECE &le; 0.04</td></tr>
+      <tr><td>LoRA rank</td><td>8 (on Q/K/V/O)</td><td>Sweet spot; rank-16 added 0.1 pp for 2&times; cost</td></tr>
+      <tr><td>LoRA params per family</td><td>1.6 M</td><td>~80&times; less than full FT of same matrices</td></tr>
+      <tr><td>Adapter file size</td><td>~4 MB</td><td>17 families ship; 80 MB total in pinned memory</td></tr>
+      <tr><td>LoRA hot-swap</td><td>~8 ms</td><td>Pinned CPU mem &rarr; GPU; 8&times; faster than pageable</td></tr>
+      <tr><td>Inference latency</td><td>280 ms &rarr; 6 ms</td><td>47&times; speedup; p99 14 ms</td></tr>
+      <tr><td>Batch size</td><td>64 (Azure NV A10 v5)</td><td>VRAM 3.1 GB peak; 50% headroom</td></tr>
+      <tr><td>Nightly batch wall time</td><td>41 s</td><td>Target &lt;90 s</td></tr>
+      <tr><td>Cost per nightly run</td><td>$0.011</td><td>Annual inference cost &lt;$50</td></tr>
+      <tr><td>Quarterly retrain cost</td><td>~$7.20</td><td>Vs ~$45K for rejected continued pretraining</td></tr>
+      <tr><td>Project duration</td><td>16 weeks</td><td>8 sprints, discovery to full rollout</td></tr>
+      <tr><td>Annual revenue lift</td><td>~$48M</td><td>Validated by Pricing A/B on staggered rollout</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ============ ARCHITECTURE ============ -->
+  <h2 id="arch">Architecture in five steps</h2>
+  <ol>
+    <li><strong>Patching:</strong> 90 daily fares grouped into 32-point patches (3 patches).</li>
+    <li><strong>Input residual MLP:</strong> per-patch z-normalize + 2-layer MLP &rarr; 1280-d patch embedding.</li>
+    <li><strong>Transformer trunk:</strong> 20 blocks, causal self-attention with RoPE, SwiGLU FFN. <strong>Frozen</strong> for AA &mdash; no pretraining.</li>
+    <li><strong>Output head:</strong> 128-step output patch + 10-quantile head (q10..q90). Monotonicity enforced with <code>fix_quantile_crossing=True</code>.</li>
+    <li><strong>XReg layer (AA fine-tuned):</strong> regression on residuals: <code>final = TimesFM_baseline + XReg(future_covariates)</code>. <strong>+ LoRA rank-8 on attention Q/K/V/O</strong> per route family.</li>
+  </ol>
+
+  <!-- ============ FINE-TUNING ============ -->
+  <h2 id="ft">Fine-tuning in three lines</h2>
+  <div class="cheat-grid">
+    <div class="cheat-box">
+      <h3>Stage A: XReg head</h3>
+      <ul>
+        <li>Frozen trunk; only the regression head trains.</li>
+        <li>Loss: pinball + 0.5 &middot; median MSE.</li>
+        <li>~250K windows, 3 epochs, ~40 min on A10G, $0.70.</li>
+        <li>Output: ~1.2 MB safetensors. Always loaded.</li>
+        <li><strong>Result: 10.2% &rarr; 6.0% MAPE.</strong></li>
+      </ul>
+    </div>
+    <div class="cheat-box">
+      <h3>Stage B: LoRA per family</h3>
+      <ul>
+        <li>Rank-8 on attention Q/K/V/O in all 20 blocks.</li>
+        <li>&alpha; = 16 (so &alpha;/r = 2.0).</li>
+        <li>~50K windows per family, ~6 min, ~$0.30.</li>
+        <li>17 of 20 families pass &ge;0.5 pp gate.</li>
+        <li><strong>Result: 6.0% &rarr; 5.1% MAPE.</strong></li>
+      </ul>
+    </div>
+    <div class="cheat-box">
+      <h3>Why we passed on full FT</h3>
+      <ul>
+        <li>Full FT: 4.7% MAPE at $45K/quarter.</li>
+        <li>LoRA r-8: 5.1% MAPE at $7/quarter.</li>
+        <li>Going from 5.1% &rarr; 4.7% costs &gt;100&times; and is not defensible.</li>
+        <li>Foundation prior preserved by frozen trunk.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ============ INFERENCE ============ -->
+  <h2 id="inf">Inference optimization stack</h2>
+  <table class="decision-matrix">
+    <thead><tr><th>Layer</th><th>Latency</th><th>Speedup</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td>Baseline (FP32, batch=1)</td><td>280 ms</td><td>1.0&times;</td><td>Eager mode</td></tr>
+      <tr><td>+ Batching (batch=64)</td><td>18 ms</td><td>15.6&times;</td><td>Tensor cores fully utilized; family-grouped to minimize swap</td></tr>
+      <tr><td>+ BF16 mixed precision</td><td>9 ms</td><td>31.1&times;</td><td>2&times; throughput; same dynamic range as FP32</td></tr>
+      <tr><td>+ <code>torch.compile</code> reduce-overhead</td><td>6 ms</td><td>46.7&times;</td><td>CUDA graphs eliminate kernel launch overhead</td></tr>
+      <tr><td>+ Pinned-mem LoRA hot-swap</td><td>6 ms / p99 14 ms</td><td>same</td><td>Adapter swap 800 ms &rarr; 8 ms</td></tr>
+    </tbody>
+  </table>
+
+  <div class="cheat-grid">
+    <div class="cheat-box">
+      <h3>Rejected approaches</h3>
+      <ul>
+        <li>INT8 quant &mdash; coverage dropped to 73%</li>
+        <li>ONNX + TensorRT &mdash; 5% kernel coverage gap</li>
+        <li>Speculative decoding &mdash; horizon math doesn&apos;t fit</li>
+        <li>Multi-GPU &mdash; doubles cost for 1.6&times; speed</li>
+      </ul>
+    </div>
+    <div class="cheat-box">
+      <h3>Why batching wins so much</h3>
+      <ul>
+        <li>GPU tensor cores execute fixed-size tiles (16&times;16 BF16).</li>
+        <li>Batch=1 leaves most of the tile unused.</li>
+        <li>Batch=64 fully utilizes the tile.</li>
+        <li>Same kernel-launch cost amortized over 64 items.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ============ EVALUATION ============ -->
+  <h2 id="eval">Evaluation stack &mdash; seven metrics</h2>
+  <table class="decision-matrix">
+    <thead><tr><th>Metric</th><th>What it catches</th><th>Release gate</th></tr></thead>
+    <tbody>
+      <tr><td>MAPE</td><td>Median accuracy</td><td>&le; 6.0% network</td></tr>
+      <tr><td>sMAPE</td><td>Symmetric, bounded</td><td>&le; 5.5%</td></tr>
+      <tr><td>RMSE</td><td>Tail-sensitive errors (holiday spikes)</td><td>monitored</td></tr>
+      <tr><td>Pinball loss</td><td>Per-quantile accuracy</td><td>monitored</td></tr>
+      <tr><td>80% PI coverage</td><td>Calibration of one band</td><td>78&ndash;82%</td></tr>
+      <tr><td>ECE</td><td>Calibration across all 9 quantile levels</td><td>&le; 0.04</td></tr>
+      <tr><td>CRPS</td><td>Full distribution quality</td><td>monitored</td></tr>
+    </tbody>
+  </table>
+  <div class="insight">
+    <strong>Most important:</strong> calibration matters more than median accuracy for
+    revenue management. The optimizer trusts the uncertainty band; a tighter q90 with
+    miscalibrated coverage burns more revenue than 1 pp of MAPE drift.
+  </div>
+
+  <!-- ============ DRIFT ============ -->
+  <h2 id="drift">Three kinds of drift in production</h2>
+  <table class="decision-matrix">
+    <thead><tr><th>Type</th><th>Detector</th><th>Threshold</th><th>Cause</th></tr></thead>
+    <tbody>
+      <tr><td>Data drift</td><td>PSI (Population Stability Index)</td><td>&gt; 0.25</td><td>Inputs changed (distribution shift)</td></tr>
+      <tr><td>Concept drift</td><td>Rolling 7d MAPE on actuals</td><td>&gt; 1.5&sigma; train MAPE</td><td>Input&rarr;target relationship changed</td></tr>
+      <tr><td>Calibration drift</td><td>Rolling 7d 80% PI coverage</td><td>&lt; 75% (page) / &lt; 78% (warn)</td><td>Quantile head no longer calibrated</td></tr>
+    </tbody>
+  </table>
+  <div class="insight">
+    <strong>~80% of "drift" alerts are upstream feature-feed issues</strong> (stale data,
+    missed updates), not actual concept drift. First check PSI on covariates, then check
+    feature-store freshness before assuming the model is wrong.
+  </div>
+
+  <!-- ============ SCENARIOS ============ -->
+  <h2 id="scen">Six production scenarios in one line each</h2>
+  <table class="decision-matrix">
+    <thead><tr><th>Scenario</th><th>Trigger</th><th>Forecast effect</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td>Holiday rush</td><td>Holiday flag = 2 in horizon</td><td>+$95 median, q90 +$160</td><td>Optimizer protects high-yield</td></tr>
+      <tr><td>Fuel spike</td><td>Brent +9%, fuel curve updates</td><td>+$3.20 / OD-pair (hub-corp)</td><td>Off-cycle re-score at &gt;5% threshold</td></tr>
+      <tr><td>Competitor undercut</td><td>Delta drops $20</td><td>-$11 hub-corp, -$17 leisure (elasticity)</td><td>14-min latency to customer fare</td></tr>
+      <tr><td>Weather irrops</td><td>Storm flag = 1, days D+1, D+2</td><td>-$22 median, q10 widens</td><td>Optimizer dumps low-class inventory</td></tr>
+      <tr><td>New route launch</td><td>Zero history</td><td>Synthetic prior + 30% PI inflation</td><td>Tapers as real history accumulates</td></tr>
+      <tr><td>Cabin upsell</td><td>Static cabin flag = premium-economy</td><td>2.6&times; median, 4&times; PI width</td><td>Strategy team simulates cabin mix</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ============ MATH ============ -->
+  <h2 id="math">Math you should be able to write on a whiteboard</h2>
+
+  <h3>Pinball loss (training)</h3>
+  <div class="formula">
+    <em>L</em><sub>&tau;</sub>(<em>y</em>, <em>q&#770;</em><sub>&tau;</sub>) = max( &tau;(<em>y</em> &minus; <em>q&#770;</em><sub>&tau;</sub>), &nbsp;(&tau; &minus; 1)(<em>y</em> &minus; <em>q&#770;</em><sub>&tau;</sub>) )
+  </div>
+  <p style="font-size:13.5px;">For &tau;=0.9 the loss penalizes under-prediction 9&times; more &mdash; pushes q90 high enough.</p>
+
+  <h3>LoRA decomposition</h3>
+  <div class="formula">
+    <em>W&apos;</em> = <em>W</em> + (&alpha;/<em>r</em>) &middot; <em>B A</em>, where <em>A</em> &isin; &reals;<sup><em>r</em>&times;<em>k</em></sup>, <em>B</em> &isin; &reals;<sup><em>d</em>&times;<em>r</em></sup>, <em>r</em> &lt;&lt; min(<em>d</em>, <em>k</em>)
+  </div>
+  <p style="font-size:13.5px;">For a 1280&times;1280 matrix at rank 8: 20,480 params instead of 1.638 M (~80&times; reduction).</p>
+
+  <h3>PSI for data drift</h3>
+  <div class="formula">
+    PSI = &Sigma;<sub>bins</sub> ( <em>p</em><sub>recent</sub> &minus; <em>p</em><sub>train</sub> ) &middot; ln( <em>p</em><sub>recent</sub> / <em>p</em><sub>train</sub> )
+  </div>
+  <p style="font-size:13.5px;">PSI &lt; 0.1 stable, 0.1&ndash;0.25 watch, &gt; 0.25 investigate.</p>
+
+  <h3>ECE (expected calibration error)</h3>
+  <div class="formula">
+    ECE = &Sigma;<sub>&tau; &isin; bins</sub> | empirical_coverage(&tau;) &minus; &tau; |
+  </div>
+  <p style="font-size:13.5px;">Sum across 9 quantile bins; release gate ECE &le; 0.04.</p>
+
+  <h3>CRPS (approximation)</h3>
+  <div class="formula">
+    CRPS &approx; (2/<em>K</em>) &Sigma;<sub><em>k</em>=1</sub><sup><em>K</em></sup> <em>L</em><sub>&tau;<sub><em>k</em></sub></sub>(<em>y</em>, <em>q&#770;</em><sub>&tau;<sub><em>k</em></sub></sub>)
+  </div>
+  <p style="font-size:13.5px;">Average pinball loss across quantiles is a Monte-Carlo CRPS estimate.</p>
+
+  <!-- ============ CODE SNIPPETS ============ -->
+  <h2 id="code">Code snippets to memorize</h2>
+
+  <h3>1. The headline forecast call</h3>
+  <pre><code>point, q = model.forecast_with_covariates(
+    inputs=[fare_a, fare_b, fare_c],
+    dynamic_numerical_covariates={
+        "jet_fuel_usd_gal": [fuel,  fuel,  fuel],
+        "competitor_fare":  [comp_a, comp_b, comp_c],
+        "days_to_departure":[dtd_a, dtd_b, dtd_c],
+        "load_factor_lag":  [lf_a,  lf_b,  lf_c],
+    },
+    dynamic_categorical_covariates={
+        "holiday_flag":      [hol, hol, hol],
+        "day_of_week":       [dow, dow, dow],
+        "school_break":      [sb,  sb,  sb],
+        "weather_disruption":[wx,  wx,  wx],
+    },
+    static_categorical_covariates={
+        "route_type": ["domestic-hub", "leisure-hub", "event-leisure"],
+        "cabin":      ["main", "main", "main"],
+        "equipment":  ["narrowbody", "narrowbody", "narrowbody"],
+    },
+    xreg_mode="xreg + timesfm",
+)</code></pre>
+
+  <h3>2. ForecastConfig flags that matter</h3>
+  <pre><code>cfg = timesfm.ForecastConfig(
+    max_context=90,
+    max_horizon=30,
+    normalize_inputs=True,                # fares vary $80 - $11,000
+    per_core_batch_size=64,               # tuned for A10G
+    use_continuous_quantile_head=True,    # better long-horizon calibration
+    fix_quantile_crossing=True,           # required by the optimizer
+    infer_is_positive=True,               # fares strictly positive
+)</code></pre>
+
+  <h3>3. Pinned-memory LoRA hot-swap</h3>
+  <pre><code># At service startup
+adapters = {}
+for family in FAMILIES:
+    sd = safetensors.load_file(f"adapters/{family}.safetensors")
+    adapters[family] = {k: v.pin_memory() for k, v in sd.items()}
+
+# Per batch
+if family != current_family:
+    with torch.no_grad():
+        for k, v in adapters[family].items():
+            model.get_parameter(k).copy_(v, non_blocking=True)
+    torch.cuda.synchronize()
+    current_family = family</code></pre>
+
+  <h3>4. The eval harness in 30 lines</h3>
+  <pre><code>def evaluate(model, dataset):
+    point, q = model.forecast_with_covariates(...)
+    y = np.asarray(dataset["actuals"])
+    yhat = point
+    q10, q90 = q[..., 1], q[..., 9]
+
+    mape  = np.mean(np.abs(y - yhat) / np.abs(y)) * 100
+    cov80 = np.mean((y &gt;= q10) &amp; (y &lt;= q90)) * 100
+
+    levels = np.arange(1, 10) / 10.0
+    ece = sum(abs(np.mean(y &lt;= q[..., k+1]) - tau)
+              for k, tau in enumerate(levels))
+
+    return {"mape": mape, "coverage_80pct": cov80, "ece": ece}</code></pre>
+
+  <!-- ============ KILLER Q&A ============ -->
+  <h2 id="qa">Killer Q&amp;A &mdash; one per deep-dive page</h2>
+  <div class="killer-qa">
+
+    <div class="qa">
+      <div class="q">Why TimesFM and not [Prophet/DeepAR/LLM/etc]?</div>
+      <div class="a">Foundation prior + native covariate API + calibrated quantile head, all in one 200&nbsp;M-param artifact. Chronos was the closest competitor but lacks <code>forecast_with_covariates()</code> and uses sampling-based quantiles. ARIMAX (status quo) cold-starts to global mean and produces 6,700 unmonitorable artifacts. LLMs are wrong tool &mdash; tokenization of real numbers is lossy, no calibrated probabilities, 100&times; cost.</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">Why LoRA over full fine-tuning?</div>
+      <div class="a">Three reasons. (1) Cost: LoRA r-8 captures &gt;85% of the achievable accuracy gain at &lt;1% of full FT compute (~$7/qtr vs ~$45K). (2) Storage: 4 MB per family vs 800 MB. (3) Catastrophic-forgetting protection: frozen trunk preserves the foundation prior on long-tail OD-pairs that don&apos;t see fine-tune examples.</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">Walk me through the 47&times; inference speedup.</div>
+      <div class="a">Batching first &mdash; 80% of the win. 280 ms &rarr; 18 ms by going from batch=1 to batch=64 (better tensor-core utilization). Then BF16 (2&times;), <code>torch.compile</code> with reduce-overhead mode (1.5&times;, eliminates kernel-launch overhead via CUDA graphs), and pinned-memory LoRA hot-swap (~8 ms instead of 800 ms). Each layer is independently rollback-able.</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">How do you know your 80% prediction intervals are calibrated?</div>
+      <div class="a">Two checks in CI gate. (1) Empirical coverage: fraction of actuals between q10 and q90 should be ~80%; ours is 79.3%. (2) Expected Calibration Error (ECE): sum of |empirical - nominal| across 9 quantile bins. Release blocks if coverage drifts outside [78%, 82%] or ECE &gt; 0.04.</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">Walk me through your 2 a.m. coverage-drift response.</div>
+      <div class="a">First 30 s: open Datadog dashboard, find which family is red. 30s&ndash;90s: check covariate PSI &mdash; if any covariate red, it&apos;s upstream. 90s&ndash;3 min: if upstream, mark feature stale and re-score the family. 3&ndash;5 min: if not upstream, roll back the family&apos;s LoRA via <code>aa_pricing_cli rollback --stage lora --family X</code>. Investigation next morning. Runbook says explicitly: do NOT debug at 2 a.m.</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">How does TimesFM know it&apos;s Thanksgiving on Nov 27?</div>
+      <div class="a">It doesn&apos;t &mdash; not from history. The <code>holiday_flag</code> covariate explicitly tells it. The XReg head learned that flag=2 means +$87 on the median. The covariate is a known-future input, populated months ahead by the pricing team. This is the value of covariate-conditioning: known structure feeds directly in.</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">How is the fuel coefficient validated?</div>
+      <div class="a">Cross-validated against the OR team&apos;s independent bottom-up calculation: average fuel burn per passenger-mile, hedging policy (35%), pass-through ratio (60%) &rarr; expected $11.0/$1. Our learned coefficient: $11.4. Within 4%. The cross-validation against domain knowledge is one of the strongest sanity checks an Applied Scientist can do.</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">Why isn&apos;t competitor matching done explicitly?</div>
+      <div class="a">Two reasons. (1) Antitrust risk: explicit "match Delta exactly" rules are visible in artifacts and create regulatory exposure. (2) Loyalty math: ~28% of hub-corp bookings are AAdvantage / corp contracts; they&apos;ll pay an AA premium. Explicit matching leaves money on the table. The model produces an expected fare given competitor moves; the optimizer applies a conservative buffer ($3 on hub, $5 on leisure, $1 on event-leisure).</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">Why train weather covariates on scheduled flags, not realized outcomes?</div>
+      <div class="a">Feedback loop. If trained on realized irrops, lower forecasts &rarr; lower bid-prices &rarr; cheaper sold seats &rarr; lower realized fares &rarr; more negative coefficient on next retrain. The coefficient amplifies. Training on the day-ahead scheduled flag breaks the loop &mdash; coefficient measures expected effect of <em>predicted</em> irrops, not realized fare collapse.</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">How do you forecast a brand-new OD-pair with zero history?</div>
+      <div class="a">Synthetic-prior bootstrap. Build a 90-day context by averaging normalized fare curves from analog routes (e.g., for JFK-PVG: JFK-HKG, JFK-NRT, ORD-PVG). Scale by the new route&apos;s base fare. Run <code>forecast_with_covariates()</code> on synthetic context + real AA covariates. Inflate q10/q90 PIs by 30% to reflect the synthetic context&apos;s reduced informativeness. Tapers to 0 inflation as real history accumulates over 90 days.</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">Why is the premium-economy PI 4&times; wider than main cabin?</div>
+      <div class="a">Three drivers learned from history: (1) smaller sample &mdash; ~30 seats vs ~150, daily averages noisier. (2) Customer mix &mdash; corporate / last-minute upsell / schedule-driven, less predictable than vacationing main cabin. (3) Wider price discrimination &mdash; 6 fare classes spanning $700 vs 10 classes spanning $200. The wider PI is calibrated and correct &mdash; pretending otherwise would have the optimizer over-protect.</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">How did you go from Applied Scientist to shipping production ML?</div>
+      <div class="a">Picked up the pieces ML Engineering would normally own &mdash; Airflow DAGs, eval-as-code with CI gates, signed model artifacts, runbooks, on-call rotation. The mindset shift: stop optimizing for "the notebook works" and start optimizing for the failure modes I&apos;d have to debug at 2 a.m. The technical work is the same; the operational discipline is new.</div>
+    </div>
+
+  </div>
+
+  <!-- ============ DECISION RULES ============ -->
+  <h2 id="rules">Decision rules I apply by reflex</h2>
+  <div class="cheat-grid">
+    <div class="cheat-box">
+      <h3>When to use a foundation TS model</h3>
+      <ul>
+        <li>Long-tail / cold-start matters (&gt;10% of series have &lt;90 days)</li>
+        <li>You need probabilistic output (PI bands)</li>
+        <li>You have known-future covariates (holidays, schedules)</li>
+        <li>Operational simplicity matters (one artifact)</li>
+      </ul>
+    </div>
+    <div class="cheat-box">
+      <h3>When NOT to use a foundation TS model</h3>
+      <ul>
+        <li>&lt;100 series &mdash; per-series fits are fine</li>
+        <li>Real-time serving &lt;10ms (foundation models are too slow)</li>
+        <li>Hard interpretability constraints (regulatory)</li>
+        <li>Multivariate joint forecasting (TimesFM is univariate-conditional)</li>
+      </ul>
+    </div>
+    <div class="cheat-box">
+      <h3>When to use LoRA</h3>
+      <ul>
+        <li>You have budget &lt;1% of full FT</li>
+        <li>You need many small adapter variants (per-family, per-tenant)</li>
+        <li>You want hot-swap at inference</li>
+        <li>You need to preserve foundation prior</li>
+      </ul>
+    </div>
+    <div class="cheat-box">
+      <h3>When to use full fine-tuning</h3>
+      <ul>
+        <li>You have budget and your team can audit 200M+ param diff</li>
+        <li>One unified model for one well-defined domain</li>
+        <li>Last 0.5 pp of accuracy is worth &gt;100&times; cost</li>
+      </ul>
+    </div>
+    <div class="cheat-box">
+      <h3>When to add a covariate to the XReg head</h3>
+      <ul>
+        <li>It&apos;s known for the entire forecast horizon</li>
+        <li>It&apos;s available in the live feature store at 02:00 CST</li>
+        <li>It has theoretical (domain) justification</li>
+        <li>SHAP / coefficient stability holds out of sample</li>
+      </ul>
+    </div>
+    <div class="cheat-box">
+      <h3>When to fall back vs page</h3>
+      <ul>
+        <li>Adapter load failure &rarr; fall back to head-only (graceful)</li>
+        <li>Coverage &lt;75% on top-50 family for 3 nights &rarr; page</li>
+        <li>Nightly batch &gt;180s wall time &rarr; page</li>
+        <li>Single-night MAPE excursion (holiday) &rarr; do not alert</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ============ GLOSSARY ============ -->
+  <h2 id="gloss">Glossary &mdash; key terms in one line</h2>
+  <dl class="glossary">
+    <div class="glossary-row"><dt>OD-pair</dt><dd>Origin-Destination flight pair, e.g., DFW-LAX. The unit of forecasting.</dd></div>
+    <div class="glossary-row"><dt>RMS</dt><dd>Revenue Management System &mdash; the C++ optimizer that turns forecasts into bid-prices.</dd></div>
+    <div class="glossary-row"><dt>Bid price</dt><dd>The minimum fare at which RMS is willing to sell one more seat in a given fare class.</dd></div>
+    <div class="glossary-row"><dt>DTD</dt><dd>Days to Departure. The booking-curve clock; closer = inventory thinning = higher fare.</dd></div>
+    <div class="glossary-row"><dt>Load factor</dt><dd>% of seats sold. Lagged 7-day load factor is a demand-momentum proxy.</dd></div>
+    <div class="glossary-row"><dt>Irrops</dt><dd>Irregular operations (weather, mechanical). Triggers cancellations and re-accommodation.</dd></div>
+    <div class="glossary-row"><dt>Sabre PSS</dt><dd>Passenger Service System &mdash; the booking transaction backbone AA reads from.</dd></div>
+    <div class="glossary-row"><dt>ATPCO</dt><dd>Industry consortium for fare filings. Source of competitor fare data.</dd></div>
+    <div class="glossary-row"><dt>Patching (TimesFM)</dt><dd>Grouping every 32 input points into one transformer "token". Reduces sequence length 32&times;.</dd></div>
+    <div class="glossary-row"><dt>XReg</dt><dd>TimesFM&apos;s "exogenous regression" layer: regression on residuals to incorporate covariates.</dd></div>
+    <div class="glossary-row"><dt>LoRA</dt><dd>Low-Rank Adaptation. <em>W&apos;</em> = <em>W</em> + (&alpha;/r)BA. Cheap, mergeable, hot-swappable PEFT.</dd></div>
+    <div class="glossary-row"><dt>QLoRA</dt><dd>4-bit base + LoRA. Memory-efficient; not used here because we had VRAM headroom.</dd></div>
+    <div class="glossary-row"><dt>BF16</dt><dd>Brain Floating Point 16-bit: same exponent as FP32, fewer mantissa bits. 2&times; throughput on tensor cores.</dd></div>
+    <div class="glossary-row"><dt>Pinball loss</dt><dd>Quantile-regression loss. Minimizing it produces conditional quantiles.</dd></div>
+    <div class="glossary-row"><dt>CRPS</dt><dd>Continuous Ranked Probability Score. Generalizes MAE to distributions.</dd></div>
+    <div class="glossary-row"><dt>ECE</dt><dd>Expected Calibration Error: deviation of empirical coverage from nominal across quantile bins.</dd></div>
+    <div class="glossary-row"><dt>Coverage</dt><dd>Fraction of actuals falling inside the predicted PI. Target 80% for the 80% PI.</dd></div>
+    <div class="glossary-row"><dt>PSI</dt><dd>Population Stability Index. Per-covariate distribution-shift detector.</dd></div>
+    <div class="glossary-row"><dt>Conformal prediction</dt><dd>Model-agnostic post-hoc PI calibration with finite-sample coverage guarantees.</dd></div>
+    <div class="glossary-row"><dt>SLO</dt><dd>Service Level Objective. The target for a metric below which on-call gets paged.</dd></div>
+    <div class="glossary-row"><dt>Off-cycle re-score</dt><dd>Mid-day re-run of the forecast triggered by covariate updates above threshold.</dd></div>
+    <div class="glossary-row"><dt>Cold-start</dt><dd>Forecasting a series with no history. Solved here by synthetic-prior bootstrap.</dd></div>
+    <div class="glossary-row"><dt>Shadow mode</dt><dd>Deploy that produces forecasts but doesn&apos;t feed the optimizer &mdash; for safe canary testing.</dd></div>
+    <div class="glossary-row"><dt>Foundation prior</dt><dd>The implicit knowledge baked into TimesFM&apos;s pretraining over 100B time-series points.</dd></div>
+    <div class="glossary-row"><dt>fix_quantile_crossing</dt><dd>ForecastConfig flag enforcing q10 &le; q20 &le; ... &le; q90. Required by the optimizer.</dd></div>
+  </dl>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="../index.html">
+      <div class="label">&larr; Back</div>
+      <div class="title">Portfolio home</div>
+    </a>
+    <a class="page-nav-item next" href="model-choice.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Deep dive: Model choice</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>
