@@ -293,17 +293,20 @@ out = forecast_fn(inputs=chunk, ...)</code></pre>
     benchmark suite, separate rollback target. Not an engineering win.
   </p>
 
-  <h2>End-to-end nightly timeline</h2>
+  <h2>End-to-end nightly timeline (Azure)</h2>
+  <p class="caption">AA runs on Azure. The full Azure topology is in <a href="azure-architecture.html">azure-architecture.html</a>. Below is the nightly batch on Azure NV A10 v5 spot.</p>
   <table class="decision-matrix">
-    <thead><tr><th>Step</th><th>Duration</th><th>Cumulative</th></tr></thead>
+    <thead><tr><th>Step</th><th>Azure service</th><th>Duration</th><th>Cumulative</th></tr></thead>
     <tbody>
-      <tr><td>Spin A10G spot, attach EFS</td><td>30 s</td><td>02:00:30</td></tr>
-      <tr><td>Load base + head + 17 LoRA &rarr; pinned mem</td><td>6 s</td><td>02:00:36</td></tr>
-      <tr><td><code>torch.compile</code> warm-up (one batch)</td><td>12 s</td><td>02:00:48</td></tr>
-      <tr><td>Score 6,700 OD-pairs (105 batches of 64)</td><td>41 s</td><td>02:01:29</td></tr>
-      <tr><td>Write to feature store</td><td>8 s</td><td>02:01:37</td></tr>
-      <tr><td>Dispatch metrics &rarr; Datadog</td><td>2 s</td><td>02:01:39</td></tr>
-      <tr><td>Spot release</td><td>1 s</td><td><strong>02:01:40</strong></td></tr>
+      <tr><td>Azure Data Factory schedule trigger</td><td>ADF</td><td>0 s</td><td>02:00:00</td></tr>
+      <tr><td>Spin NV A10 v5 spot VM</td><td>AKS + Azure ML compute</td><td>30 s</td><td>02:00:30</td></tr>
+      <tr><td>Pull image from Azure Container Registry</td><td>ACR (geo-replicated)</td><td>4 s</td><td>02:00:34</td></tr>
+      <tr><td>Load base + head + 17 LoRA &rarr; pinned mem</td><td>Blob Storage hot tier</td><td>6 s</td><td>02:00:40</td></tr>
+      <tr><td><code>torch.compile</code> warm-up (one batch)</td><td>(local)</td><td>12 s</td><td>02:00:52</td></tr>
+      <tr><td>Score 6,700 OD-pairs (105 batches of 64)</td><td>(local GPU)</td><td>41 s</td><td>02:01:33</td></tr>
+      <tr><td>Write forecasts to Cosmos DB (partitioned by departure_date)</td><td>Cosmos DB SDK</td><td>8 s</td><td>02:01:41</td></tr>
+      <tr><td>Dispatch metrics &rarr; Application Insights</td><td>App Insights SDK</td><td>2 s</td><td>02:01:43</td></tr>
+      <tr><td>Spot VM release</td><td>AKS</td><td>1 s</td><td><strong>02:01:44</strong></td></tr>
     </tbody>
   </table>
 

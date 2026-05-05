@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Azure Deployment Architecture &middot; AA Pricing Forecast</title>
+<meta name="description" content="The Azure deployment topology for the AA pricing forecast service: Azure ML, NV A10 v5 spot VMs, Blob Storage, Cosmos DB, Synapse, AKS, Application Insights. With service mapping and AA-specific compliance considerations." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Azure deployment</span>
+  </nav>
+
+  <h1>Azure deployment architecture</h1>
+  <p class="lead">
+    American Airlines runs on Microsoft Azure. This page is the Azure-specific
+    deployment topology for the AA pricing forecast service: which Azure services
+    handle which responsibilities, why each was chosen over alternatives, and the
+    AA-specific compliance considerations (data residency, FedRAMP, FAA audit trails).
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> The service runs entirely on Azure: <strong>Azure Machine
+    Learning</strong> for the model registry and training jobs, <strong>NV A10 v5 spot
+    VMs</strong> for nightly inference, <strong>Azure Blob Storage</strong> (hot tier
+    for the feature store), <strong>Azure Cosmos DB</strong> for low-latency model-pointer
+    reads, <strong>Azure Cache for Redis</strong> for forecast caching, <strong>Azure
+    Synapse</strong> for the analytical warehouse, <strong>Azure Data Factory</strong>
+    (with a self-hosted Airflow alternative on AKS) for orchestration, <strong>Azure
+    Container Registry</strong> for images, and <strong>Application Insights + Azure
+    Monitor</strong> for telemetry. Microsoft Entra ID handles auth. Total monthly
+    cloud spend: ~$340 (compute) + ~$60 (storage / monitoring).
+  </div>
+
+  <h2>Why Azure</h2>
+  <p>
+    Not a model decision &mdash; an org decision made years before this project. AA chose
+    Azure as its primary cloud for several reasons that shape how we build:
+  </p>
+  <ul>
+    <li><strong>Microsoft Enterprise Agreement:</strong> AA has a multi-year EA that gives volume discounts and committed-spend pricing. Building on Azure capitalizes on those discounts; building on AWS would be billed at retail.</li>
+    <li><strong>Microsoft Entra ID integration:</strong> The corporate identity provider is Entra ID (formerly Azure AD). Native Azure services federate without extra IdP setup.</li>
+    <li><strong>Compliance posture:</strong> Azure Government Cloud and FedRAMP High coverage matter for the regulated parts of AA&apos;s footprint (DOT-touching systems). The ML service does not need FedRAMP High but lives next to systems that do.</li>
+    <li><strong>Existing ML platform:</strong> Azure ML has been the org-standard ML platform since 2022. Reusing the registry, compute targets, and pipelines beats building parallel infrastructure on another cloud.</li>
+    <li><strong>Data gravity:</strong> The AAdvantage warehouse, Sabre PSS extracts, and the operational telemetry all land in Azure-native stores. Egress to AWS would be both expensive and slow.</li>
+  </ul>
+
+  <h2>The deployment topology</h2>
+  <pre><code>+---------------------------------------------------------------+
+|  AA Pricing Forecast Service &mdash; Azure deployment              |
+|                                                               |
+|  +---------------------+        +---------------------+      |
+|  | Azure Data Factory  | -----&gt;| Azure ML Pipeline   |      |
+|  | (orchestration)     |        | (training jobs)     |      |
+|  +---------------------+        +---------------------+      |
+|             |                              |                  |
+|             v                              v                  |
+|  +---------------------+        +---------------------+      |
+|  | Azure Blob Storage  |        | Azure ML Registry   |      |
+|  | (feature store /    |        | base model + head + |      |
+|  |  parquet / hot tier)|        | LoRA safetensors    |      |
+|  +---------------------+        +---------------------+      |
+|             |                              |                  |
+|             |    nightly batch read        |                  |
+|             v                              v                  |
+|  +-------------------------------------------------+         |
+|  | NV A10 v5 spot VM (24 GB GPU, 1 GPU)           |         |
+|  | + AKS-managed lifecycle                         |         |
+|  | + Azure ML inference container                  |         |
+|  +-------------------------------------------------+         |
+|             |                                                 |
+|             v                                                 |
+|  +---------------------+        +---------------------+      |
+|  | Azure Cosmos DB     |        | Azure Cache for     |      |
+|  | (forecast pointer / |        | Redis (forecast     |      |
+|  |  partitioned by day)|        | caching, 24h TTL)   |      |
+|  +---------------------+        +---------------------+      |
+|             |                              |                  |
+|             v                              v                  |
+|  +-------------------------------------------------+         |
+|  | RMS C++ optimizer (separate service)            |         |
+|  | reads forecasts via Cosmos DB API               |         |
+|  +-------------------------------------------------+         |
+|                                                               |
+|  Cross-cutting:                                               |
+|  &middot; Microsoft Entra ID (auth)                                  |
+|  &middot; Azure Container Registry (ACR) for images                  |
+|  &middot; Application Insights + Azure Monitor (telemetry)            |
+|  &middot; Azure Key Vault (secrets, signing keys)                    |
+|  &middot; Microsoft Purview (data lineage / governance)               |
+|  &middot; Azure DevOps (CI/CD, the eval-gate pipeline)                 |
++---------------------------------------------------------------+</code></pre>
+
+  <h2>Service mapping &mdash; AWS to Azure equivalents</h2>
+  <p>
+    Many TimesFM tutorials assume AWS. Here is the explicit mapping for AA&apos;s build.
+  </p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Responsibility</th><th>Common AWS choice</th><th>AA Azure choice</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>GPU VM (inference)</td><td>EC2 g5 (A10G)</td><td>Standard NV A10 v5</td><td>Azure&apos;s Standard NV36ads A10 v5: full A10 24 GB, ~$0.40/hr spot</td></tr>
+      <tr><td>Object storage</td><td>S3</td><td>Azure Blob Storage (hot tier)</td><td>Native auth via Entra ID; ABFS driver for Spark / Synapse</td></tr>
+      <tr><td>Key-value pointer</td><td>DynamoDB</td><td>Azure Cosmos DB</td><td>Low-latency reads, partitioned by departure date</td></tr>
+      <tr><td>In-memory cache</td><td>ElastiCache Redis</td><td>Azure Cache for Redis</td><td>Same Redis API; AA-managed in same VNet</td></tr>
+      <tr><td>Analytical warehouse</td><td>Redshift / BigQuery</td><td>Azure Synapse Analytics</td><td>AAdvantage warehouse already runs on Synapse</td></tr>
+      <tr><td>Orchestration</td><td>Airflow on MWAA / Step Functions</td><td>Azure Data Factory (or self-hosted Airflow on AKS)</td><td>ADF for the data pipeline; Airflow on AKS for ML-specific workflows where ADF is too rigid</td></tr>
+      <tr><td>Model registry</td><td>SageMaker / MLflow on EC2</td><td>Azure Machine Learning Registry</td><td>Native Azure-ML artifact tracking with Entra ID auth</td></tr>
+      <tr><td>Container registry</td><td>ECR</td><td>Azure Container Registry (ACR)</td><td>Geo-replicated; integrated with AKS</td></tr>
+      <tr><td>Compute orchestration</td><td>ECS / EKS</td><td>Azure Kubernetes Service (AKS)</td><td>Schedules the spot VM lifecycle for nightly + off-cycle jobs</td></tr>
+      <tr><td>Auth / identity</td><td>IAM</td><td>Microsoft Entra ID</td><td>Corporate IdP; managed identities for Azure-to-Azure auth</td></tr>
+      <tr><td>Secrets</td><td>AWS Secrets Manager</td><td>Azure Key Vault</td><td>Holds cosign signing keys, Sabre API credentials</td></tr>
+      <tr><td>Telemetry</td><td>CloudWatch + Datadog</td><td>Application Insights + Azure Monitor (+ Datadog optional)</td><td>App Insights for app traces; Azure Monitor for infra; Datadog optional for cross-cloud teams</td></tr>
+      <tr><td>Data lineage / catalog</td><td>Glue Data Catalog / DataHub</td><td>Microsoft Purview</td><td>Native Azure lineage; integrates with Synapse and Blob</td></tr>
+      <tr><td>Audit log store</td><td>S3 + Glue / BigQuery</td><td>Azure Synapse + Blob append-only</td><td>7-year retention, immutable Blob storage tier</td></tr>
+      <tr><td>CI/CD</td><td>CodePipeline</td><td>Azure DevOps Pipelines</td><td>Eval-gate runs as a stage; releases to Azure ML registry</td></tr>
+    </tbody>
+  </table>
+
+  <h2>The nightly batch &mdash; Azure-native timeline</h2>
+  <table class="decision-matrix">
+    <thead><tr><th>Step</th><th>Azure service</th><th>Duration</th><th>Cumulative</th></tr></thead>
+    <tbody>
+      <tr><td>Trigger</td><td>Azure Data Factory schedule (cron)</td><td>0 s</td><td>02:00:00</td></tr>
+      <tr><td>Spin NV A10 v5 spot VM</td><td>AKS + Azure ML compute</td><td>30 s</td><td>02:00:30</td></tr>
+      <tr><td>Pull image</td><td>Azure Container Registry (geo-replicated, same region)</td><td>4 s</td><td>02:00:34</td></tr>
+      <tr><td>Load base model + Stage A head + 17 LoRA into pinned mem</td><td>Blob Storage hot tier &rarr; VM</td><td>6 s</td><td>02:00:40</td></tr>
+      <tr><td><code>torch.compile</code> warm-up (one batch)</td><td>(local)</td><td>12 s</td><td>02:00:52</td></tr>
+      <tr><td>Score 6,700 OD-pairs (105 batches of 64)</td><td>(local GPU)</td><td>41 s</td><td>02:01:33</td></tr>
+      <tr><td>Write forecasts to Cosmos DB (partitioned by departure_date)</td><td>Cosmos DB SDK, batched writes</td><td>8 s</td><td>02:01:41</td></tr>
+      <tr><td>Update Application Insights custom metrics</td><td>App Insights SDK</td><td>2 s</td><td>02:01:43</td></tr>
+      <tr><td>Spot VM release</td><td>AKS</td><td>1 s</td><td><strong>02:01:44</strong></td></tr>
+    </tbody>
+  </table>
+  <p>
+    <strong>Total:</strong> ~1 m 44 s. <strong>Cost:</strong> ~$0.012 per run on
+    Standard NV36ads A10 v5 spot at ~$0.40/hr. Annualized: ~$5/year compute, plus
+    ~$45/year for Cosmos DB + Blob + Redis. <strong>Total &lt;$60/year for inference.</strong>
+  </p>
+
+  <h2>Choosing the GPU SKU</h2>
+  <p>
+    Azure&apos;s NV-family A10 SKUs come in fractions:
+  </p>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>SKU</th><th>A10 fraction</th><th>VRAM</th><th>vCPU</th><th>RAM</th><th>Spot price (illustrative)</th><th>Verdict for AA</th></tr>
+    </thead>
+    <tbody>
+      <tr class="row-rejected"><td>Standard NV6ads A10 v5</td><td>1/6 GPU</td><td>4 GB</td><td>6</td><td>55 GB</td><td>~$0.07/hr</td><td>VRAM too small &mdash; model is 1 GB + batch overhead</td></tr>
+      <tr class="row-rejected"><td>Standard NV12ads A10 v5</td><td>1/3 GPU</td><td>8 GB</td><td>12</td><td>110 GB</td><td>~$0.13/hr</td><td>Marginal &mdash; would constrain batch=32 max</td></tr>
+      <tr class="row-rejected"><td>Standard NV18ads A10 v5</td><td>1/2 GPU</td><td>12 GB</td><td>18</td><td>220 GB</td><td>~$0.20/hr</td><td>Workable but no headroom</td></tr>
+      <tr class="row-chosen"><td>Standard NV36ads A10 v5</td><td>1 full GPU</td><td>24 GB</td><td>36</td><td>440 GB</td><td>~$0.40/hr</td><td><strong>Chosen</strong> &mdash; full A10, batch=64 with safety margin</td></tr>
+      <tr class="row-rejected"><td>Standard NV72ads A10 v5</td><td>2 GPUs</td><td>48 GB</td><td>72</td><td>880 GB</td><td>~$0.80/hr</td><td>Multi-GPU not needed for our workload</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Why we use Azure spot VMs</h2>
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>Azure Spot (chosen)</h4>
+      <ul>
+        <li>~70-80% discount on compute vs pay-as-you-go.</li>
+        <li>Eviction is rare in the 02:00-02:30 CST window (low demand).</li>
+        <li>The job is fault-tolerant: if evicted, we re-trigger and re-run (idempotent writes to Cosmos).</li>
+        <li>Annual compute bill ~$5 vs ~$25 on-demand.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Why we don&apos;t use reserved instances</h4>
+      <ul>
+        <li>The job runs ~2 minutes/day. Reserving 24/7 capacity is wasteful.</li>
+        <li>Off-cycle re-scoring is bursty &mdash; doesn&apos;t map well to fixed reservation.</li>
+        <li>Spot eviction risk is acceptable because we have a 30-minute SLA buffer (02:30 CST deadline vs ~02:02 actual).</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>The Azure ML pipeline for training</h2>
+  <p>
+    Stage A and Stage B retrains run as Azure ML pipelines, not as ad-hoc scripts.
+    Each pipeline is versioned in Azure DevOps, runs in a managed compute cluster, and
+    publishes signed artifacts to the Azure ML registry.
+  </p>
+  <pre><code># azureml/pipelines/stage_a_xreg_head.yaml
+$schema: https://azuremlschemas.azureedge.net/latest/pipelineJob.schema.json
+type: pipeline
+display_name: aa_pricing_stage_a_xreg_head
+experiment_name: aa-pricing
+compute: azureml:gpu-cluster-a10  # NV36ads A10 v5
+
+settings:
+  default_datastore: azureml:aapricing_blob_hot
+  continue_on_step_failure: false
+
+inputs:
+  train_data:
+    type: uri_folder
+    path: azureml:aa_pricing_train_v1@latest
+  base_model:
+    type: custom_model
+    path: azureml:timesfm-2.5-200m@latest
+  config:
+    type: uri_file
+    path: azureml:stage_a_config@latest
+
+outputs:
+  trained_head:
+    type: custom_model
+    name: aa-timesfm-xreg-head
+  metrics:
+    type: uri_file
+
+jobs:
+  train_step:
+    type: command
+    component: azureml:train_xreg_head_component@latest
+    inputs:
+      train_data: \${{parent.inputs.train_data}}
+      base_model: \${{parent.inputs.base_model}}
+      config: \${{parent.inputs.config}}
+    outputs:
+      trained_head: \${{parent.outputs.trained_head}}
+
+  eval_gate:
+    type: command
+    component: azureml:eval_gate_component@latest
+    inputs:
+      candidate: \${{parent.jobs.train_step.outputs.trained_head}}
+      gate_thresholds:
+        mape_max: 6.0
+        coverage_min: 78
+        coverage_max: 82
+        ece_max: 0.04
+    outputs:
+      decision: \${{parent.outputs.metrics}}</code></pre>
+
+  <h2>Cost comparison &mdash; Azure vs AWS for this workload</h2>
+  <table class="decision-matrix">
+    <thead>
+      <tr><th>Component</th><th>AWS equivalent cost</th><th>Azure actual cost</th><th>Delta</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Nightly inference compute</td><td>$0.011 (g5.xlarge spot)</td><td>$0.012 (NV36ads A10 v5 spot)</td><td>+9%</td></tr>
+      <tr><td>Storage (Blob hot)</td><td>$0.023/GB-mo S3 Standard</td><td>$0.018/GB-mo Blob Hot</td><td>-22%</td></tr>
+      <tr><td>Cosmos DB / DynamoDB</td><td>$1.25/M req DDB on-demand</td><td>$8/M RU Cosmos provisioned</td><td>variable</td></tr>
+      <tr><td>Redis cache (managed)</td><td>$0.10/hr ElastiCache T4 Small</td><td>$0.09/hr Azure Cache for Redis C0</td><td>-10%</td></tr>
+      <tr><td>Egress to internet</td><td>$0.09/GB</td><td>$0.087/GB</td><td>-3%</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Net: Azure cost is within 10% of AWS for this workload. The decision was not driven
+    by cost differences but by the existing Azure footprint and the EA discount, which
+    moves the absolute pricing in our favor.
+  </p>
+
+  <h2>AA-specific compliance considerations</h2>
+  <ul>
+    <li><strong>Data residency.</strong> All AA US-domestic OD-pair data lives in <code>eastus2</code> region; transatlantic data lives in <code>westeurope</code>. The model artifacts are registered separately per region; no cross-region replication of fare data without explicit legal sign-off.</li>
+    <li><strong>FAA audit trail.</strong> Every forecast write is append-only to a Blob container with the <strong>immutable storage tier</strong> (legal hold) and 7-year retention. Forecast decomposition (<code>baseline + sum(covariate_contributions)</code>) is stored alongside the forecast. Auditors can reconstruct any historical fare decision.</li>
+    <li><strong>PII boundary.</strong> The forecast service never touches PNRs or named-passenger data. Inputs are aggregated daily fare and load-factor metrics. PII separation is enforced at the Synapse warehouse level via row-level security.</li>
+    <li><strong>Antitrust / fare-rule compliance.</strong> The model produces a forecast distribution; the C++ optimizer applies pricing policy. Both are versioned and independently auditable. The pricing policy is reviewed by AA Legal quarterly; the model is reviewed against bias / disparate-impact heuristics by Compliance.</li>
+    <li><strong>Vendor risk for foundation models.</strong> Google&apos;s TimesFM weights are pinned at v2.5 in the AA-internal Azure ML registry. We do not auto-pull the latest from HuggingFace at inference. Re-pulling new versions requires a Compliance review.</li>
+  </ul>
+
+  <h2>What I would build differently if I had to start over</h2>
+  <ol>
+    <li><strong>Use Azure ML batch endpoints from day one</strong> for the inference path. We initially rolled our own AKS-scheduled spot VMs because Azure ML batch endpoints had a 10-minute cold-start at the time of project start; the new Managed Compute features cut that to ~30 s. Batch endpoints would be one less Kubernetes manifest to maintain.</li>
+    <li><strong>Microsoft Fabric Real-Time Analytics</strong> for the calibration drift dashboard. Currently we use Application Insights custom metrics + Azure Monitor workbook, which works but is rigid. Fabric&apos;s KQL-based explore would be faster.</li>
+    <li><strong>Azure Confidential Computing</strong> for the audit-log component. The 7-year forecast retention is sensitive; a confidential VM would give us tamper-evident logs with hardware attestation. Not currently in scope but on the roadmap.</li>
+  </ol>
+
+  <h2>The short Azure-Native bash for the deployment</h2>
+  <pre><code># 1. Push the inference image to ACR
+az acr build \
+  --registry aapricingacr \
+  --image aa-pricing/inference:v1.4.2 \
+  --file Dockerfile.inference .
+
+# 2. Register the model artifacts in Azure ML
+az ml model create \
+  --name aa-timesfm-xreg-head \
+  --version 20251201 \
+  --path ./artifacts/xreg_head_v20251201.safetensors \
+  --type custom_model \
+  --workspace-name aa-rms-mlw
+
+# 3. Trigger the nightly Data Factory pipeline manually
+az datafactory pipeline create-run \
+  --resource-group aa-rms-rg \
+  --factory-name aa-rms-adf \
+  --pipeline-name nightly_pricing_forecast
+
+# 4. Tail the inference logs from App Insights
+az monitor app-insights query \
+  --app aa-pricing-ai \
+  --analytics-query 'traces \
+    | where customDimensions.service == "pricing-forecast" \
+    | order by timestamp desc \
+    | take 50'</code></pre>
+
+  <section class="interview-section">
+    <h2>Interview Q&amp;A</h2>
+    <div class="qa-grid">
+      <div class="qa">
+        <div class="q">Why did you build this on Azure rather than AWS or GCP?</div>
+        <div class="a">Org-level decision, not a model decision. AA has a Microsoft Enterprise Agreement that gives committed-spend discounts; corporate identity is on Microsoft Entra ID; the AAdvantage warehouse, Sabre extracts, and operational telemetry already live in Azure (data gravity). Building on AWS would have been retail-priced compute and cross-cloud egress. Building on Azure capitalizes on the existing footprint.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Walk me through how the nightly batch survives Azure spot eviction.</div>
+        <div class="a">Three layers. (1) The batch is idempotent: Cosmos DB writes are upserts keyed by (route, departure_date, run_id), so a re-run overwrites the same partition with no duplication. (2) Azure Data Factory&apos;s job-retry policy kicks in within 60 seconds of an eviction, with exponential backoff. (3) The full job is 2 minutes; even with one eviction we hit the 02:30 CST SLA. We&apos;ve seen ~3 evictions in 26 weeks; all recovered automatically.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why Cosmos DB instead of Azure SQL for forecast storage?</div>
+        <div class="a">Read pattern. The optimizer reads forecasts ~200M times a day, partitioned by departure_date and route. Cosmos DB&apos;s partitioned point-read latency is &lt;5 ms p99 at this query pattern; Azure SQL would need careful index design and would not match it. Storage volume is small (~30 MB/day), so Cosmos&apos;s storage cost isn&apos;t a factor. The cost is in RU/s &mdash; we provisioned 4,000 RU/s based on the read pattern.</div>
+      </div>
+      <div class="qa">
+        <div class="q">How do you handle Microsoft Entra ID for service-to-service auth?</div>
+        <div class="a">Managed identities. The inference VM has a system-assigned managed identity that has Storage Blob Data Reader on the feature-store container, Cosmos DB Data Contributor on the forecast container, and Key Vault Secrets User on the cosign-key vault. No passwords or keys in code. The identity is provisioned by an ARM template (managed via Azure DevOps) so revocation is auditable.</div>
+      </div>
+      <div class="qa">
+        <div class="q">What does Microsoft Purview give you that Azure ML doesn&apos;t?</div>
+        <div class="a">Cross-system lineage. Azure ML tracks the model artifacts and training jobs but not the upstream data sources (Sabre, AAdvantage warehouse, ATPCO). Purview catalogs all of those, builds the column-level lineage from source &rarr; Synapse &rarr; Blob &rarr; Azure ML training input, and lets compliance reviewers trace any production fare back to its raw inputs. This is the FAA audit story end-to-end.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Why use Application Insights instead of Datadog?</div>
+        <div class="a">Two reasons. (1) Native integration: App Insights instruments Azure-deployed code with one SDK call and integrates with Entra ID auth automatically. Datadog requires per-service API keys and a sidecar agent. (2) Cost: at our log volume (~200 GB/month), App Insights is ~30% cheaper. We do export aggregated metrics to Datadog for cross-cloud teams that prefer one pane of glass, but App Insights is the source of truth.</div>
+      </div>
+      <div class="qa">
+        <div class="q">Could this run on Azure Government Cloud if needed?</div>
+        <div class="a">Yes &mdash; the architecture maps 1:1 to Azure Government services. The TimesFM weights are open-source; they would need to be re-vetted under the Government Cloud&apos;s third-party software policy. The Azure ML, Cosmos DB, Blob Storage, Synapse, and AKS services all have Government variants. The application code would not change; only the deployment target ARM templates would. Not currently in scope but architecturally feasible.</div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a class="page-nav-item" href="../index.html">
+      <div class="label">&larr; Back</div>
+      <div class="title">Portfolio home</div>
+    </a>
+    <a class="page-nav-item next" href="cheatsheet.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Interview cheat sheet</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; no proprietary AA systems are connected. Trademarks used illustratively. Microsoft, Azure, and Microsoft Entra ID are trademarks of Microsoft Corporation; American Airlines and AAdvantage are trademarks of American Airlines, Inc. Use here is illustrative and educational only.</p>
+    <p class="footer-meta">Applied Scientist portfolio &middot; <a href="../index.html">return to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>
