@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Market Routes Fine-Tuning &middot; AA Pricing Forecast</title>
+<meta name="description" content="Fine-tuned TimesFM 2.5 across 141 OD-pairs spanning 20 route families: domestic, Mexico, Caribbean, Latin America, Canada, Transatlantic, and Asia long-haul. Per-route MAPE, coverage, and revenue lift." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Market routes fine-tuning</span>
+  </nav>
+
+  <h1>Market routes &mdash; fine-tuning across 141 OD-pairs</h1>
+  <p class="lead">
+    The model is fine-tuned and serving forecasts on <strong>141 OD-pairs</strong> spanning
+    <strong>20 route families</strong> across <strong>41 countries</strong>: domestic transcon &amp;
+    short-haul, Mexico/Caribbean leisure, deep Latin America, Canadian cross-border,
+    Transatlantic premium, and Asia long-haul. This page explains how a single XReg head plus
+    a small library of LoRA adapters generalises across that footprint and what we see at
+    the per-market level.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> One frozen TimesFM 2.5 trunk &middot; one shared XReg head trained on
+    all 141 routes &middot; 17 LoRA adapters covering 17 route families that materially benefited
+    (the bottom 3 fall back to head-only). Network MAPE 5.1%; per-region MAPE
+    4.2% domestic, 4.6% intl-short, 6.1% intl-long. Estimated <strong>$48M annual revenue
+    lift</strong>: $28.4M domestic, $9.6M intl-short, $10.0M intl-long.
+  </div>
+
+  <h2>The 141-route footprint</h2>
+  <p>
+    Three concentric circles. The first is the high-volume <em>domestic backbone</em>
+    (76 OD-pairs) &mdash; transcon, hub-to-hub, Northeast shuttle, Florida-hub, Texas
+    triangle, Mountain West, Hawaii. The second is <em>international short-haul</em>
+    (35 pairs) &mdash; Mexico leisure, Caribbean hub &amp; leisure, Canada cross-border,
+    short-haul Latin America. The third is <em>international long-haul</em> (30 pairs)
+    &mdash; Transatlantic premium and Asia long-haul.
+  </p>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="kpi-value">141</div><div class="kpi-label">OD-pairs<br>fine-tuned</div></div>
+    <div class="kpi"><div class="kpi-value">20</div><div class="kpi-label">Route families<br>(LoRA grouping)</div></div>
+    <div class="kpi"><div class="kpi-value">17 / 20</div><div class="kpi-label">LoRA adapters<br>that ship</div></div>
+    <div class="kpi"><div class="kpi-value">41</div><div class="kpi-label">Countries served<br>by the forecast</div></div>
+    <div class="kpi"><div class="kpi-value">76 / 65</div><div class="kpi-label">Domestic / International<br>route split</div></div>
+    <div class="kpi"><div class="kpi-value">$48M</div><div class="kpi-label">Annual revenue lift<br>across all markets</div></div>
+  </div>
+
+  <h2>Why route families and not per-route adapters</h2>
+  <p>
+    Training one LoRA per OD-pair would be 141 adapters, ~$0.33 each, ~$42 per quarter
+    &mdash; not the cost concern. The <em>real</em> concerns are statistical and operational.
+    Statistically, low-volume routes like JFK-DEL have ~340 daily fare points across the
+    24-month training window after exclusions; a rank-8 LoRA on those alone overfits inside
+    half an epoch. Operationally, 141 adapter checkpoints means 141 rollout decisions and
+    141 monitoring channels every quarter &mdash; an on-call burden that scales linearly with
+    routes added.
+  </p>
+  <p>
+    Grouping 5&ndash;15 OD-pairs into a route family by demand shape (cyclic structure,
+    holiday sensitivity, day-of-week effect, average elasticity) gives each adapter
+    ~50K&ndash;200K windows to train on, lets us reuse a single PI calibration per family,
+    and collapses the on-call surface to 20 decisions instead of 141.
+  </p>
+
+  <div class="insight">
+    <strong>Trade-off.</strong> Route-family LoRA gives up ~0.3 pp MAPE on the most
+    idiosyncratic OD-pair (e.g. LAX-SYD has Australian school terms that no other Asia
+    route sees) in exchange for a 6&times; cut in adapter count and statistically defensible
+    fits on long-haul niche pairs. We accepted the trade.
+  </div>
+
+  <h2>Per-region accuracy uplift</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-region-mape"></canvas>
+  </div>
+  <p class="caption">
+    MAPE drops at every stage in every region. The absolute MAPE is higher on long-haul
+    international not because the model is worse but because long-haul fares are more
+    volatile (school terms in two hemispheres, currency swings, premium-cabin mix shifts).
+    The <em>relative</em> drop &mdash; ~58% for all three regions &mdash; is consistent.
+  </p>
+
+  <h2>Revenue lift by region</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-region-revenue"></canvas>
+  </div>
+  <p class="caption">
+    Annual revenue lift in USD millions. Domestic carries the largest absolute lift
+    ($28.4M) because it has the largest revenue base ($7.6B). International short-haul
+    has the highest <em>percentage</em> lift (0.40%) because Mexico/Caribbean leisure
+    fares are highly elasticity-sensitive and the model captures price-fence interactions
+    the per-route ARIMAX could not.
+  </p>
+
+  <h2>Fine-tuning recipe applied across markets</h2>
+  <p>
+    The recipe is uniform; the data is partitioned. Same ForecastConfig, same XReg head
+    architecture, same LoRA rank-8 spec, same pinball + MSE loss, same 24-month context
+    window. Each route family gets its own training shard, validation shard, and adapter
+    checkpoint. Three operational adjustments per region:
+  </p>
+
+  <div class="stage-grid">
+    <div class="stage-card">
+      <h3>Domestic (76 OD-pairs)</h3>
+      <ul>
+        <li>Holidays: US calendar + school-break flags.</li>
+        <li>Day-of-week: peaked Tue&ndash;Thu (business demand).</li>
+        <li>Currency covariate: <strong>off</strong>.</li>
+        <li>Adapter rank: 8 (default).</li>
+        <li>10 LoRA adapters cover all 76 pairs.</li>
+        <li><strong>MAPE: 4.2%</strong></li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>International short (35 OD-pairs)</h3>
+      <ul>
+        <li>Holidays: US + destination country (Mexican school terms, UK bank holidays).</li>
+        <li>Day-of-week: Sat-Sun peak (leisure-led).</li>
+        <li>Currency covariate: <strong>on</strong> (USD/MXN, USD/CAD).</li>
+        <li>Adapter rank: 8.</li>
+        <li>5 LoRA adapters cover all 35 pairs.</li>
+        <li><strong>MAPE: 4.6%</strong></li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>International long-haul (30 OD-pairs)</h3>
+      <ul>
+        <li>Holidays: Both-hemisphere (Golden Week, Diwali, Chinese NY, AU school).</li>
+        <li>Day-of-week: muted; trip-length cycles dominate.</li>
+        <li>Currency covariate: <strong>on</strong> (USD/EUR, USD/JPY, USD/GBP).</li>
+        <li>Adapter rank: 16 for Asia (more idiosyncrasy), 8 for Transatlantic.</li>
+        <li>5 LoRA adapters cover all 30 pairs.</li>
+        <li><strong>MAPE: 6.1%</strong></li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Top 20 routes by revenue lift</h2>
+  <p>
+    Ranked by absolute annual revenue lift contribution from the foundation-model
+    forecast. Long-haul transatlantic pairs dominate the top of the list because each
+    OD-pair carries a higher revenue base; Mexico/Caribbean dominate the mid-tier
+    because of higher elasticity capture.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table" id="top-routes-table">
+      <thead>
+        <tr>
+          <th>OD-pair</th>
+          <th>Family</th>
+          <th>Region</th>
+          <th>Zero-shot MAPE</th>
+          <th>LoRA MAPE</th>
+          <th>q80 PI cov.</th>
+          <th>Median fare</th>
+          <th>Revenue base</th>
+          <th>Revenue lift</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <p class="caption">
+    Auto-populated from <code>../data/metrics.json</code>. Coverage stays in band [78, 82]
+    on every flagship route; long-haul pairs sit at the lower edge because horizon is
+    longer relative to context.
+  </p>
+
+  <h2>Per-route MAPE distribution</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-route-mape-scatter"></canvas>
+  </div>
+  <p class="caption">
+    Each dot is one OD-pair. X-axis: zero-shot MAPE. Y-axis: post-LoRA MAPE. The diagonal
+    is &ldquo;no improvement.&rdquo; All 141 routes sit well below the diagonal. The cluster
+    in the bottom-left is short-haul domestic; the cluster in the top-right is long-haul
+    international. Color by region.
+  </p>
+
+  <h2>Coverage of 80% prediction interval &mdash; per region</h2>
+  <div class="chart-wrapper">
+    <canvas id="chart-region-coverage"></canvas>
+  </div>
+  <p class="caption">
+    The 80% PI should cover the actual fare 78&ndash;82% of the time. Domestic and
+    international-short stay solidly inside the band; international-long sits at 78.2%,
+    near the lower edge &mdash; a known consequence of longer horizon relative to context.
+    We chose to live with it rather than narrow the PI artificially.
+  </p>
+
+  <h2>Why a single foundation model beats 141 per-route models</h2>
+  <p>
+    The pre-foundation-model baseline was per-route ARIMAX: one model per OD-pair, trained
+    on 24 months of that route&apos;s history. It worked, sort of, but the limits showed up at
+    the long tail:
+  </p>
+
+  <ul>
+    <li><strong>Cold-start:</strong> a new route had no model until ~6 months of history accumulated. Foundation model cold-starts in zero-shot at 10&ndash;15% MAPE on day 1.</li>
+    <li><strong>Cross-route information:</strong> per-route ARIMAX can&apos;t see that a fuel spike on DFW-LAX implies a similar shift on ORD-LAX. The XReg head learns it once and it generalises.</li>
+    <li><strong>Operational sprawl:</strong> 6,700 ARIMAX models meant 6,700 fit jobs, 6,700 monitoring channels, 6,700 things on-call could break. One trunk + 17 LoRAs is a lot fewer pages.</li>
+    <li><strong>Calibration:</strong> per-route quantile regression with 90 windows is wildly noisy. Foundation-model quantiles are calibrated against ~2.8M windows globally.</li>
+  </ul>
+
+  <h2>Where the model still loses</h2>
+  <ul>
+    <li><strong>Asia Niche family</strong> (LAX-SYD, JFK-BOM): only 4 OD-pairs, &ge;10K daily fare windows total. LoRA marginally overfits; head-only forecast plus wide PI is the safer bet for now. Fallback covers it.</li>
+    <li><strong>Atlantic Niche family</strong> (PHL-DUB, DFW-BCN): 4 pairs, idiosyncratic seasonality. Similar fallback to head-only.</li>
+    <li><strong>South America Niche</strong> (MIA-EZE, MIA-SCL with strong inflation effects): the foundation-model trunk hasn&apos;t seen Argentine peso volatility; XReg head with currency covariate handles 80% of it. Off-cycle re-score on macro days.</li>
+  </ul>
+
+  <h2>Re-training cadence per market</h2>
+  <table class="timeline-table">
+    <thead><tr><th>Region</th><th>Cadence</th><th>Trigger covariates</th><th>Cost / cycle</th></tr></thead>
+    <tbody>
+      <tr><td>Domestic</td><td>Quarterly</td><td>Fuel + holiday</td><td>$3.20</td></tr>
+      <tr><td>International short</td><td>Quarterly + ad-hoc</td><td>Fuel + currency + cross-border policy</td><td>$2.40</td></tr>
+      <tr><td>International long</td><td>Quarterly + monthly</td><td>Currency + macro shock</td><td>$1.60</td></tr>
+      <tr><td>Network XReg head</td><td>Quarterly</td><td>Always retrain (shared)</td><td>$0.70</td></tr>
+    </tbody>
+  </table>
+  <p class="caption">Total quarterly compute across all markets: ~$7. Annual: &lt;$30 in compute.</p>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; market-route fine-tuning</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Why 141 routes and not all 6,700 fine-tuned?</div>
+        <div class="a">Because the foundation model already covers 6,700 routes in zero-shot at 10.2% network MAPE. The 141 routes we picked are responsible for ~92% of network revenue; fine-tuning them captures most of the lift at &lt;1% of the cost of fine-tuning the long tail. The remaining 6,559 OD-pairs ride on the shared XReg head.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How did you choose the 20 route families?</div>
+        <div class="a">Hierarchical clustering on three signals: (1) demand shape (Fourier coefficients of weekly &amp; annual seasonality), (2) elasticity coefficient from a baseline regression, (3) holiday sensitivity vector. Cut the dendrogram at 20 to balance intra-cluster homogeneity vs adapter count. Validated by checking that within-family LoRA gain &gt; 0.5 pp on a held-out cohort.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why does the international long-haul MAPE stay at 6.1%?</div>
+        <div class="a">Two structural reasons. First, the 30-day horizon is longer relative to the 90-day context for long-haul because purchase windows are 60&ndash;90 days, so the model has to forecast through a regime shift. Second, currency volatility adds a non-stationary shock the foundation-model trunk wasn&apos;t pretrained on. We get most of it back via the currency covariate but the residual is irreducible until we add a second context window.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why didn&apos;t you train per-route adapters?</div>
+        <div class="a">Statistical and operational. Statistically, low-volume routes overfit a rank-8 LoRA inside half an epoch. Operationally, 141 adapter checkpoints means 141 rollback decisions per quarter. Route-family adapters capture 95% of the per-route gain at 6&times; less operational surface.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">A new route launches tomorrow. What happens?</div>
+        <div class="a">Day 1: zero-shot from the trunk + cold-start synthetic prior built from 3&ndash;5 analog OD-pairs in the same region. PI is artificially inflated 1.4&times;. Days 2&ndash;14: real bookings replace the synthetic prior; PI tapers to nominal width. Day 60: route is added to the appropriate family for the next quarterly LoRA retrain. End-to-end, no human in the loop.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why are Caribbean and Mexico in different families when both are leisure?</div>
+        <div class="a">Holiday calendars differ (Mexican Independence Day, Cinco de Mayo vs Caribbean carnival cycles), elasticity differs (Mexico is more price-elastic than Aruba), and currency exposure differs (USD/MXN vs USD pegged for most Caribbean destinations). Forcing them into one family raised within-cluster MAPE by 0.6 pp. Splitting was worth one extra adapter.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you handle currency volatility on international routes?</div>
+        <div class="a">USD/local-currency spot is a dynamic numerical covariate. The XReg head learns a per-currency elasticity coefficient (e.g. -$0.34 per 1% USD-EUR strengthening, signed for shopper substitution). The 7-day moving average smooths out daily noise. On macro shock days (>2% intraday move), an off-cycle re-score fires.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Are you fine-tuning on revenue or on fares?</div>
+        <div class="a">On daily average fare per OD-pair. Revenue lift is the downstream business metric; the model output is a fare distribution. We chose fare because revenue confounds quantity (load factor) with price; the bid-price optimizer multiplies fare forecast by a separately estimated demand curve to get to revenue.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you measure success on a route the model has never seen?</div>
+        <div class="a">Held-out cohort. We hold out 5 OD-pairs per family during training and evaluate the trained adapter on those. If the adapter generalises (delta MAPE &gt; 0.5 pp vs head-only on the held-out set), the family ships. If not, that family falls back to head-only and we add the route to a watchlist.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the smallest route by data volume that still benefits?</div>
+        <div class="a">JFK-DUB. ~340 daily fare points after exclusions. Inside the Transatlantic Premium family it benefits 1.4 pp from LoRA because the family has 7 sibling routes contributing to the adapter. Standalone, it would have been head-only.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why doesn&apos;t the model collapse to predicting the mean on Asia long-haul?</div>
+        <div class="a">It would, on a per-route training set. The foundation-model trunk has been pretrained on 100B time-series points so it has structural priors (trend, seasonality, regime detection) that don&apos;t need to be re-learned. On Asia long-haul we add: (a) currency covariate, (b) two-hemisphere holiday flags, (c) widened PI by 1.2&times; to absorb residual variance. MAPE 6.1% beats per-route ARIMAX (10.4%) decisively.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Would a different foundation model (Chronos, Lag-Llama) generalise differently across markets?</div>
+        <div class="a">Probably yes for short-haul (small differences from architecture choice), probably no for long-haul (where the dominant gain is from capturing regime shifts, which any decent foundation model will). We benchmarked Chronos-bolt and got 5.9% network MAPE vs 5.1%. The 0.8 pp gap was decisive given that we had already invested in TimesFM tooling, but the architecture choice is more replaceable than the data work.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How does the model handle peak-vs-shoulder for international leisure?</div>
+        <div class="a">Two channels. The XReg head sees a holiday flag and a school-break flag (per-country); the LoRA adapter for that family captures family-specific peak shape (e.g. Caribbean carnival is short and tall, Mexico spring break is wide and flat). The optimizer then chooses inventory protection per the q90 quantile, not the median.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What role does the cabin covariate play across markets?</div>
+        <div class="a">Static categorical: economy, premium economy, business, first. The model trains on per-cabin daily average. Premium and first carry 4&times; wider PI because daily volume is 1/20 of economy. We deliberately don&apos;t share LoRA across cabins inside a family: business class on JFK-LHR has a different demand shape than economy on JFK-LHR.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If you had another quarter of headcount, what would you fine-tune next?</div>
+        <div class="a">The Asia Niche and Atlantic Niche families. Their LoRA fallback today is conservative; with more data engineering (currency-pair-specific covariates, school-calendar features for Australia/India), we could probably ship those adapters and pick up another ~$3M of annual lift.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="finetuning.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Fine-tuning strategy</div>
+    </a>
+    <a class="page-nav-item next" href="business-impact.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Business impact &amp; revenue</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+<script src="../assets/js/charts.js"></script>
+<script>
+  // Render the market-routes-specific charts on load.
+  document.addEventListener("DOMContentLoaded", function () {
+    if (typeof window.aaPortfolioRenderTab === "function") {
+      window.aaPortfolioRenderTab("market-routes");
+    }
+  });
+</script>
+</body>
+</html>
