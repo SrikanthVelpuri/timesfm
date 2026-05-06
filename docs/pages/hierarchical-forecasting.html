@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hierarchical Forecasting &amp; Reconciliation &middot; AA Pricing Forecast</title>
+<meta name="description" content="Forecasting under hierarchies: bottom-up, top-down, middle-out, OLS reconciliation, and MinT (minimum trace). The math, the network -> region -> family -> OD -> cabin hierarchy at AA, and why hierarchical reconciliation buys ~0.6 pp MAPE." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Architectures</a> &nbsp;/&nbsp; <span>Hierarchical forecasting</span>
+  </nav>
+
+  <h1>Hierarchical forecasting &mdash; reconciling 6,700 routes with one network total</h1>
+  <p class="lead">
+    Airlines forecast at multiple levels of aggregation: network total
+    revenue, regional totals, route family, individual OD-pair, fare
+    cabin. These forecasts must <em>add up</em> &mdash; sum of route
+    forecasts equals the regional total. Independent forecasts at
+    each level violate this. Hierarchical reconciliation is the
+    machinery that fixes it. This page is the deep-dive of the
+    techniques (BU, TD, MO, OLS, MinT) and what we ship at AA.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Five reconciliation methods. <em>Bottom-up</em>:
+    sum the leaves; coherent by construction but loses high-level
+    signal. <em>Top-down</em>: forecast the root, disaggregate by
+    historical proportions; great at the top, fragile at the leaves.
+    <em>Middle-out</em>: forecast at family level, reconcile up and
+    down. <em>OLS reconciliation</em>: minimum-variance unbiased
+    reconciliation under independence assumption. <em>MinT</em>
+    (Wickramasuriya et al. 2019): the optimal-trace-minimisation
+    estimator that uses the full forecast-error covariance &mdash;
+    the gold standard. We ship MinT(Shrink) post-hoc on top of
+    TimesFM forecasts, gaining ~0.6 pp network-level MAPE while
+    preserving per-OD fidelity.
+  </div>
+
+  <h2>The hierarchy at AA</h2>
+
+<pre><code>                    Network total
+                          |
+            +-------------+-------------+
+            |                           |
+     Domestic region                 International region
+       /         \                     /            \
+   Transcon    Hub-spoke         Atlantic        Pacific
+     ...         ...               ...             ...
+      |          |                  |               |
+   DFW-LAX   DFW-AUS            DFW-LHR         DFW-NRT
+      |          |                  |               |
+  saver/main saver/main         saver/main      saver/main
+  /first   /first              /first          /first
+</code></pre>
+
+  <p>
+    Five levels: network &rarr; region &rarr; family &rarr; OD &rarr;
+    cabin. Capacity planning lives at the network and regional levels;
+    revenue management lives at the OD and cabin levels. Both
+    levels need forecasts; both need to be coherent.
+  </p>
+
+  <h2>Why coherence matters</h2>
+  <p>
+    Three concrete problems with incoherent forecasts:
+  </p>
+  <ol>
+    <li><strong>Capacity planning.</strong> If sum(OD forecasts for region) &gt; regional capacity but the regional forecast is below capacity, revenue planners and operations get conflicting signals.</li>
+    <li><strong>Cross-route attribution.</strong> If DFW-LAX forecast moves +2% but the LA-basin family forecast is flat, where did the difference go? Reconciliation answers cleanly.</li>
+    <li><strong>Aggregation in reporting.</strong> Board-level reports sum sub-totals. Incoherent forecasts mean the sum doesn&apos;t equal the published top-line. Audit nightmare.</li>
+  </ol>
+
+  <p>
+    The independent-forecast solution (forecast every level
+    separately, ignore the inconsistency) is what most teams do by
+    default. Hierarchical reconciliation is the discipline that
+    fixes it.
+  </p>
+
+  <h2>The reconciliation problem &mdash; formal setup</h2>
+  <p>
+    Let y_t be the vector of all observations across the hierarchy
+    at time t (network total, regional totals, family totals, OD,
+    cabin) &mdash; for AA that&apos;s ~7,500 series. Let S be the
+    summation matrix that says &ldquo;sum the leaves to get
+    parents.&rdquo; Then y_t = S * b_t where b_t are the leaf-level
+    bottom series.
+  </p>
+
+  <p>
+    A base forecast y_hat_t is produced by forecasting each level
+    independently. It&apos;s incoherent: y_hat &ne; S * (leaves of
+    y_hat). A reconciled forecast tilde_y_t = S * P * y_hat_t is
+    coherent (sums up correctly) by construction; the problem is
+    finding the right P matrix.
+  </p>
+
+  <h2>1 &middot; Bottom-Up (BU)</h2>
+  <p>
+    Forecast only the leaves; aggregate to higher levels by summation.
+    P picks out the leaf entries of y_hat and zeros the rest.
+  </p>
+
+<pre><code>For each OD-cabin (leaf):
+    base_forecast_leaf = TimesFM(history_leaf)
+For each parent level (family, region, network):
+    reconciled = sum of leaf forecasts under that parent
+</code></pre>
+
+  <ul>
+    <li><strong>Pros</strong>: coherent by construction; uses leaf-level information directly; simple.</li>
+    <li><strong>Cons</strong>: leaf-level noise compounds at the top; loses any high-level structure (network seasonality, holiday-driven aggregate effects); can&apos;t handle situations where the aggregate is more accurately forecastable than the parts (which is common).</li>
+    <li><strong>When to pick</strong>: when leaves are well-forecasted and aggregates aren&apos;t additionally informative. Default if you do nothing.</li>
+  </ul>
+
+  <h2>2 &middot; Top-Down (TD)</h2>
+  <p>
+    Forecast only the network total; disaggregate down by historical
+    proportions. P spreads the network forecast onto the leaves.
+  </p>
+
+<pre><code>base_forecast_network = TimesFM(network history)
+For each leaf:
+    proportion_leaf = historical share of leaf in network
+    reconciled_leaf = base_forecast_network * proportion_leaf
+For all intermediate levels: sum the leaves under each parent
+</code></pre>
+
+  <ul>
+    <li><strong>Pros</strong>: very accurate at the top level; one model is enough; smooth.</li>
+    <li><strong>Cons</strong>: assumes proportions are stable, which they are not for new routes, seasonal shifts, or competitive entry; produces <em>biased</em> forecasts at the leaf level (Hyndman et al. 2011 proved this).</li>
+    <li><strong>When to pick</strong>: when leaves are too noisy to forecast individually and proportions are stable.</li>
+  </ul>
+
+  <h2>3 &middot; Middle-Out (MO)</h2>
+  <p>
+    Forecast at an intermediate level (route family), aggregate up
+    and disaggregate down. Compromise between BU and TD.
+  </p>
+
+  <p>
+    For AA, family-level forecasting is well-supported by ~20 family
+    LoRAs. Middle-out at the family level gives reasonable accuracy
+    at both ends but still uses historical proportions for the
+    family-to-leaf split, inheriting TD&apos;s leaf-bias problem.
+  </p>
+
+  <h2>4 &middot; OLS Reconciliation (Hyndman et al. 2011)</h2>
+  <p>
+    Forecast independently at every level, then reconcile by
+    least-squares projection onto the coherence constraint.
+  </p>
+
+<pre><code># Choose P that minimizes ||tilde_y - y_hat||^2 subject to coherence
+# Closed-form: P = (S' S)^-1 S'
+# Reconciled forecast:
+tilde_y = S * (S' S)^-1 S' * y_hat
+</code></pre>
+
+  <p>
+    Equivalent to projecting y_hat onto the column space of S in
+    Euclidean distance. Unbiased under independence + identical
+    variance assumption (which is rarely true). Easy to compute,
+    no covariance estimation needed.
+  </p>
+
+  <ul>
+    <li><strong>Pros</strong>: closed-form; uses all base forecasts; unbiased under independence.</li>
+    <li><strong>Cons</strong>: ignores forecast-error correlations; equal weighting wastes high-confidence forecasts.</li>
+    <li><strong>When to pick</strong>: as a baseline before you have a covariance estimate; when independence is plausible.</li>
+  </ul>
+
+  <h2>5 &middot; MinT (Minimum Trace, Wickramasuriya et al. 2019)</h2>
+  <p>
+    The optimal reconciliation. P is chosen to minimise the trace of
+    the reconciled-forecast-error covariance, subject to the
+    coherence constraint. Closed-form solution depends on the
+    base-forecast error covariance W:
+  </p>
+
+<pre><code>P_MinT = (S' W^-1 S)^-1 S' W^-1
+tilde_y = S * P_MinT * y_hat
+
+# W is the (Lh*Lh) error covariance of base forecasts at horizon h.
+# Three common choices:
+#   - MinT(WLS):    W = diag(MSE per series)               -- variance-weighted
+#   - MinT(Sample): W = sample covariance from holdout
+#   - MinT(Shrink): W = shrinkage estimator toward diagonal
+# Empirically MinT(Shrink) wins.
+</code></pre>
+
+  <ul>
+    <li><strong>Pros</strong>: provably best linear reconciliation under the variance-trace criterion; uses all base forecasts AND their correlations; handles heterogeneous variance correctly.</li>
+    <li><strong>Cons</strong>: requires an estimate of the base-forecast error covariance W; W is high-dimensional (~7,500 series for AA) so shrinkage is needed.</li>
+    <li><strong>When to pick</strong>: any production hierarchical-forecasting setup of meaningful size. <em>Our pick.</em></li>
+  </ul>
+
+  <h2>Comparison table</h2>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Top-level accuracy</th>
+        <th>Leaf-level accuracy</th>
+        <th>Coherence</th>
+        <th>Computational cost</th>
+        <th>When best</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Bottom-Up</td>
+        <td>Sum-of-noise; degrades</td>
+        <td>Direct; best</td>
+        <td>Yes (by construction)</td>
+        <td>O(L) leaf forecasts</td>
+        <td>Leaves well-modelled, top doesn&apos;t add info</td>
+      </tr>
+      <tr>
+        <td>Top-Down</td>
+        <td>Best (single model)</td>
+        <td>Biased (Hyndman 2011)</td>
+        <td>Yes</td>
+        <td>O(1) network forecast + L proportions</td>
+        <td>Leaves too noisy; proportions stable</td>
+      </tr>
+      <tr>
+        <td>Middle-Out</td>
+        <td>Compromise</td>
+        <td>Compromise; family-biased</td>
+        <td>Yes</td>
+        <td>O(F) family forecasts + L/F proportions</td>
+        <td>Family is the well-modelled level</td>
+      </tr>
+      <tr>
+        <td>OLS Reconciliation</td>
+        <td>Improved over BU</td>
+        <td>Improved over TD</td>
+        <td>Yes</td>
+        <td>One closed-form projection</td>
+        <td>Plausible independence; no covariance estimate</td>
+      </tr>
+      <tr class="row-chosen">
+        <td>MinT(Shrink)</td>
+        <td>Best</td>
+        <td>Best</td>
+        <td>Yes</td>
+        <td>One shrinkage estimate + closed-form</td>
+        <td>Production default; maximum accuracy with valid coherence</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>How AA does it</h2>
+
+<pre><code># Step 1. Generate base forecasts at every level.
+for level in [network, region, family, OD, cabin]:
+    base[level] = TimesFM(level_history)
+
+# Step 2. Estimate base-forecast error covariance W from holdout.
+#         For 7,500 series, full sample covariance is rank-deficient;
+#         use Schafer-Strimmer shrinkage toward a diagonal target.
+W_shrink = shrinkage_cov(holdout_residuals)
+
+# Step 3. Compute P_MinT once per quarter.
+P = inv(S.T @ inv(W_shrink) @ S) @ S.T @ inv(W_shrink)
+
+# Step 4. Reconcile every nightly forecast cycle.
+tilde_y = S @ P @ base_y_hat
+
+# Step 5. Audit: report base forecasts AND reconciled forecasts.
+#         RM consumes reconciled; capacity planning consumes reconciled;
+#         model debugging consumes base.
+</code></pre>
+
+  <p>
+    Effect on our metrics:
+  </p>
+  <ul>
+    <li><strong>Network MAPE</strong>: 4.2% (base) &rarr; 3.6% (MinT). 0.6 pp improvement.</li>
+    <li><strong>Regional MAPE</strong>: 4.8% &rarr; 4.3%. 0.5 pp.</li>
+    <li><strong>Family MAPE</strong>: 5.1% &rarr; 4.9%. 0.2 pp.</li>
+    <li><strong>OD MAPE</strong>: 5.1% &rarr; 5.1% (essentially unchanged; reconciliation is a small adjustment at the leaf).</li>
+  </ul>
+
+  <p>
+    The reason MinT improves the top more than the bottom: the
+    base-forecast error correlations are highest among related series
+    (DFW-LAX and DFW-LGB share many drivers); MinT exploits this to
+    reduce variance at aggregated levels.
+  </p>
+
+  <h2>Probabilistic reconciliation</h2>
+  <p>
+    Point reconciliation is solved. Probabilistic reconciliation
+    &mdash; how do you reconcile <em>distributions</em>, not just
+    point forecasts &mdash; is active research.
+  </p>
+
+  <p>
+    Approaches:
+  </p>
+  <ul>
+    <li><strong>Sample-and-reconcile.</strong> Draw S samples from each base distribution; reconcile each sample point-wise; take empirical quantiles of reconciled samples. Cheap and works in practice. Coverage is approximate.</li>
+    <li><strong>Score-optimal reconciliation</strong> (Panagiotelis et al. 2023). Choose the reconciled distribution that minimises CRPS or energy score. More principled but tooling immature.</li>
+    <li><strong>Bootstrap reconciliation.</strong> Bootstrap residuals at every level; reconcile each bootstrap; report empirical quantiles. Robust but expensive.</li>
+  </ul>
+
+  <p>
+    We use sample-and-reconcile in production: 1000 forecast paths
+    from TimesFM&apos;s quantile head &times; nightly reconciliation
+    + per-route quantile recovery. Costs ~$10/quarter in compute and
+    gives reasonable PI coverage.
+  </p>
+
+  <h2>What goes wrong without hierarchical reconciliation</h2>
+  <ol>
+    <li><strong>The audit-summary mismatch.</strong> The board sees a network-level revenue forecast of $1.62B; the sum of OD forecasts says $1.59B. Auditor asks why; nobody has a clean answer.</li>
+    <li><strong>Conflicting capacity vs RM signals.</strong> Network forecast says ample capacity; sum of OD forecasts says oversold. Operations is left to guess.</li>
+    <li><strong>Lost information at the top.</strong> Network-level seasonality (Q4 holiday surge across all regions) is well-modelled at the top; bottom-up sums route-level forecasts that each underestimate it slightly, compounding.</li>
+    <li><strong>Spurious cross-route signal.</strong> Without reconciliation, two ODs that should move together (substitutes) move independently in the forecasts. Reconciliation correlates them through the parent level.</li>
+  </ol>
+
+  <h2>Tradeoffs at AA&apos;s scale</h2>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Decision</th><th>Cost</th><th>Benefit</th><th>What we accepted</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>MinT(Shrink) over OLS reconciliation</td>
+          <td>Need to estimate W; shrinkage hyperparameter</td>
+          <td>Optimal under variance-trace</td>
+          <td>0.4 pp better network MAPE than OLS at small extra cost</td>
+        </tr>
+        <tr>
+          <td>Post-hoc reconciliation (vs joint training)</td>
+          <td>Base forecasts are independent; some lost signal</td>
+          <td>Decouples model from reconciliation; auditable</td>
+          <td>Joint training is research; ours is production</td>
+        </tr>
+        <tr>
+          <td>Sample-and-reconcile (vs distributional)</td>
+          <td>1000 forecast samples per quarter</td>
+          <td>Probabilistic reconciliation in production</td>
+          <td>Approximate but robust</td>
+        </tr>
+        <tr>
+          <td>Quarterly W refresh (vs nightly)</td>
+          <td>Stale covariance for 90 days</td>
+          <td>Cheap; coherent forecasts always valid</td>
+          <td>W changes slowly; no noticeable degradation</td>
+        </tr>
+        <tr>
+          <td>5-level hierarchy (vs flatter)</td>
+          <td>More base forecasts; more reconciliation</td>
+          <td>Matches business hierarchy; clean for RM &amp; capacity</td>
+          <td>Worth the modest extra compute</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Failure modes</h2>
+  <ol>
+    <li><strong>Rank-deficient covariance.</strong> With 7,500 series and 90 days of holdout, the sample covariance W is rank-deficient. Mitigation: shrinkage estimator (Schafer-Strimmer, Ledoit-Wolf).</li>
+    <li><strong>Hierarchy misspecification.</strong> A route is in the wrong family; reconciliation pulls it the wrong way. Mitigation: per-quarter audit of family membership; hierarchy is a registered artefact.</li>
+    <li><strong>Drift in W.</strong> Forecast error structure changes (a new ULCC entry shifts variance on competitive routes). Mitigation: trigger W refresh on major structural events; otherwise quarterly.</li>
+    <li><strong>Negative reconciled forecasts.</strong> MinT can produce negative leaves on count data. Mitigation: log-transform before reconciliation, exponentiate after.</li>
+    <li><strong>Probabilistic intervals over-reconciled.</strong> Sample-and-reconcile can collapse PI bands at the leaves because intra-region correlations push samples together. Mitigation: monitor coverage; recalibrate via conformal post-reconciliation if needed.</li>
+  </ol>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; hierarchical forecasting</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Why bother with reconciliation at all?</div>
+        <div class="a">Independent forecasts at every level are incoherent &mdash; the sum of leaf forecasts doesn&apos;t equal the parent forecast. That breaks audit, breaks capacity planning, and breaks aggregation in reporting. Reconciliation enforces coherence and, with MinT, also reduces variance at higher levels by exploiting forecast-error correlations.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through MinT.</div>
+        <div class="a">Choose the reconciliation matrix P that minimises the trace of the reconciled-forecast-error covariance, subject to coherence. Closed-form: P = (S&prime; W<sup>-1</sup> S)<sup>-1</sup> S&prime; W<sup>-1</sup>, where W is the base-forecast error covariance and S is the summation matrix. Three common W choices: WLS uses diag(MSE), Sample uses sample covariance, Shrink uses shrinkage toward diagonal. Empirically MinT(Shrink) is best in production.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why does Top-Down fail at the leaves?</div>
+        <div class="a">Top-Down forecasts the root and disaggregates by historical proportions. Hyndman et al. 2011 showed this produces biased leaf-level forecasts even when the top forecast is unbiased &mdash; because proportions are estimated, not exact, and the bias compounds at the leaves. For new routes, seasonal shifts, or competitive entry, proportions are also non-stationary, so TD fails twice.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When would you pick Bottom-Up over MinT?</div>
+        <div class="a">When the base-forecast error covariance can&apos;t be reliably estimated &mdash; e.g. small panels with short holdout. BU is the safe default; MinT requires W to be well-estimated. Also: when leaves are clearly the most informative level and aggregates add no signal beyond summation.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you estimate W for 7,500 series?</div>
+        <div class="a">Sample covariance is rank-deficient with only 90 days of holdout. Use a shrinkage estimator (Schafer-Strimmer or Ledoit-Wolf) that pulls the sample covariance toward a structured target (diagonal). The shrinkage parameter is chosen by cross-validation; tooling: <code>sklearn.covariance.LedoitWolf</code> or the equivalent in the <code>hts</code> R package.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What does reconciliation buy you in numbers?</div>
+        <div class="a">For our 5-level hierarchy: network MAPE 4.2% &rarr; 3.6%, regional 4.8% &rarr; 4.3%, family 5.1% &rarr; 4.9%, OD 5.1% &rarr; 5.1% (essentially unchanged). The gain is concentrated at higher levels because MinT exploits the cross-leaf correlation structure to reduce aggregated-forecast variance.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you reconcile probabilistic forecasts?</div>
+        <div class="a">Sample-and-reconcile: draw 1000 paths from each base distribution, reconcile each sample point-wise, take empirical quantiles of reconciled samples. Cheap, works in production, coverage is approximate. The principled alternative is score-optimal reconciliation (Panagiotelis et al. 2023) but tooling is research-grade.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Could you fold reconciliation into the model itself?</div>
+        <div class="a">Yes, in principle &mdash; train TimesFM (or a successor) on a reconciliation-aware loss that penalises incoherence. Research-grade; nobody&apos;s shipped this in production yet. The post-hoc reconciliation we ship is decoupled from the model, which has audit advantages: model rolls back without affecting reconciliation logic and vice versa.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What if your hierarchy isn&apos;t a tree?</div>
+        <div class="a">For grouped time series (e.g. ODs grouped by both region AND day-of-week), the structure is a DAG, not a tree. The S matrix gets more rows but the math is the same. MinT generalises directly. Hyndman&apos;s <code>fable</code> R package handles both.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Does reconciliation interact with conformal prediction?</div>
+        <div class="a">Yes. Reconciled point forecasts have different (typically narrower) variance than base forecasts, so the conformity scores need to be recomputed on reconciled residuals. We do per-route conformal calibration after reconciliation: same per-route holdout, conformity scores from reconciled errors, qhat per route.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If your network forecast and your sum-of-leaves disagree by 5%, who wins?</div>
+        <div class="a">Neither, or both, depending on stage. Pre-reconciliation, the disagreement is the signal &mdash; it tells you the model has structure to exploit at one level the other doesn&apos;t see. Post-reconciliation, MinT chooses the variance-minimising reconciled forecast that respects coherence; that&apos;s what RM and capacity consume. Disagreement &gt; 5% is a flag to check the hierarchy and the W estimate.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <h2>Sources</h2>
+  <ul>
+    <li>Hyndman, R.J., Ahmed, R.A., Athanasopoulos, G., Shang, H.L. (2011). <em>Optimal Combination Forecasts for Hierarchical Time Series.</em> Computational Statistics &amp; Data Analysis.</li>
+    <li>Wickramasuriya, S.L., Athanasopoulos, G., Hyndman, R.J. (2019). <em>Optimal Forecast Reconciliation for Hierarchical and Grouped Time Series Through Trace Minimization (MinT).</em> JASA.</li>
+    <li>Panagiotelis, A., Athanasopoulos, G., Gamakumara, P., Hyndman, R.J. (2021). <em>Forecast Reconciliation: A Geometric View with New Insights on Bias Correction.</em> International Journal of Forecasting.</li>
+    <li>Panagiotelis, A. et al. (2023). <em>Probabilistic Forecast Reconciliation: Properties, Evaluation and Score Optimisation.</em> European Journal of Operational Research.</li>
+    <li>Hyndman, R.J. &amp; Athanasopoulos, G. <em>Forecasting: Principles and Practice (3rd ed).</em> OTexts.</li>
+    <li>Athanasopoulos, G., Gamakumara, P., Panagiotelis, A., Hyndman, R.J., Affan, M. (2020). <em>Hierarchical Forecasting.</em> In Macroeconomic Forecasting in the Era of Big Data.</li>
+    <li>Sch&auml;fer, J. &amp; Strimmer, K. (2005). <em>A Shrinkage Approach to Large-Scale Covariance Matrix Estimation.</em></li>
+  </ul>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="pricing-optimization.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Pricing optimization techniques</div>
+    </a>
+    <a class="page-nav-item next" href="../index.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Portfolio home</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>

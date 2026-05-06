@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Causal Elasticity Deep-Dive &middot; AA Pricing Forecast</title>
+<meta name="description" content="Estimating fare elasticity from observational data: identification strategies (RCT, IV, DiD, RDD, FE), Double ML, DeepIV, causal forests, GPBoost, hierarchical Bayes, and why a forecast coefficient is not an elasticity." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Architectures</a> &nbsp;/&nbsp; <span>Causal elasticity deep-dive</span>
+  </nav>
+
+  <h1>Causal elasticity &mdash; how the optimizer&apos;s &ldquo;-1.21&rdquo; is actually estimated</h1>
+  <p class="lead">
+    The base-price optimizer needs an elasticity. The XReg head&apos;s
+    price coefficient is <em>not</em> one &mdash; it&apos;s a regression
+    fit on observational data under existing pricing policy, with all
+    the confounding that implies. This page is the deep-dive on what
+    a real elasticity estimator looks like: identification strategies
+    (RCT, IV, DiD, RDD), Double ML, DeepIV, causal forests, GPBoost,
+    hierarchical Bayes &mdash; with the math, the failure modes, and
+    the recipe we recommend the OR team run.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Predictive coefficients conflate
+    demand-driven price moves with policy responses. Real elasticity
+    needs identification: ideally a randomised price experiment
+    (RCT), failing that an instrumental variable (fuel-shock, FX
+    shock, calendar randomisation) or a quasi-experiment (DiD, RDD).
+    Once identified, ML estimators add value: Double ML
+    (Chernozhukov 2018) cleans confounding via Neyman-orthogonal
+    moments and cross-fitting; DeepIV uses neural nets on the
+    instrument-conditional expectation; causal forests (Wager &amp;
+    Athey) estimate per-OD heterogeneous elasticity; GPBoost and
+    hierarchical Bayes shrink low-volume routes toward family
+    means. Our recommended OR stack: fuel-shock IV + Double ML on
+    the panel + GPBoost for partial pooling. The XReg coefficient
+    in <code>metrics.json</code> is shorthand only.
+  </div>
+
+  <h2>Why a forecast coefficient isn&apos;t an elasticity</h2>
+
+  <h3>The selection problem</h3>
+  <p>
+    Suppose you regress log(demand) on log(price) using historical AA
+    booking data. You get a coefficient: -1.21. Done? No. Three reasons
+    that coefficient is biased:
+  </p>
+  <ul>
+    <li><strong>Reverse causation.</strong> When demand spikes, AA raises prices. The data shows high price + high demand, biasing the estimated elasticity <em>toward zero</em> (or even positive). This is the classic simultaneity bias in supply-demand estimation.</li>
+    <li><strong>Omitted variables.</strong> A holiday weekend has both higher prices (set by RM) and higher demand (driven by holiday). If the regression doesn&apos;t condition on holiday status, the elasticity picks up the holiday effect, not the price effect.</li>
+    <li><strong>Selection on the offered price.</strong> AA only logs bookings that <em>accepted</em> the offered price. Customers who refused are invisible. The estimator is conditional on acceptance, not unconditional demand.</li>
+  </ul>
+
+  <p>
+    Fixing this is what causal inference is about. Before any ML
+    machinery, the question is: what variation in price are we
+    using? An estimator is only as good as the variation it
+    exploits.
+  </p>
+
+  <h3>The identification toolbox</h3>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Strategy</th>
+        <th>What it requires</th>
+        <th>Strength</th>
+        <th>AA application</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="row-chosen">
+        <td>Randomised Controlled Trial (RCT)</td>
+        <td>Random price assignment</td>
+        <td>Gold standard; eliminates confounding by design</td>
+        <td>Calendar-randomised micro-experiments on low-volume routes</td>
+      </tr>
+      <tr>
+        <td>Instrumental Variables (IV)</td>
+        <td>Exogenous variable that moves price but not demand directly</td>
+        <td>Identifies LATE under exclusion restriction</td>
+        <td>Fuel-price shocks, FX shocks, regulatory holiday changes</td>
+      </tr>
+      <tr>
+        <td>Difference-in-Differences (DiD)</td>
+        <td>A &ldquo;control&rdquo; group unaffected by the price change + parallel-trends assumption</td>
+        <td>Removes time-invariant unobservables</td>
+        <td>Compare elasticity-affected route family vs unaffected family before/after a policy change</td>
+      </tr>
+      <tr>
+        <td>Regression Discontinuity (RDD)</td>
+        <td>A sharp policy threshold</td>
+        <td>Local randomisation near the cutoff</td>
+        <td>Fare-class boundaries (e.g. saver vs main cabin price thresholds)</td>
+      </tr>
+      <tr>
+        <td>Fixed Effects (FE)</td>
+        <td>Panel data with unit + time variation</td>
+        <td>Removes time-invariant route-specific confounders</td>
+        <td>Two-way fixed effects on (route, week) panel</td>
+      </tr>
+      <tr>
+        <td>Synthetic Controls</td>
+        <td>Pre-treatment outcomes for a treated unit + donor pool</td>
+        <td>Constructs counterfactual from weighted donors</td>
+        <td>Single-route policy interventions (e.g. new ULCC entry on one OD)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Each of these is a story about <em>where the price variation
+    came from</em>. Without one, no ML estimator can give you a
+    causal elasticity &mdash; only a debiased predictive
+    coefficient.
+  </p>
+
+  <h2>1 &middot; RCT &mdash; the gold standard</h2>
+  <p>
+    Randomly assign prices to bookings or to (route, day) cells. Estimate
+    elasticity by comparing demand at randomised price levels. Gold
+    standard because the price variation is by construction
+    independent of confounders.
+  </p>
+
+  <h3>The pragmatic version: calendar-randomised micro-experiments</h3>
+  <p>
+    Pure full-fare RCT is operationally hard at AA scale &mdash; you can&apos;t
+    randomly charge different customers different fares for the same
+    seat in the same fare class. The pragmatic compromise: randomise
+    at the (route, day) level for a small subset of low-stakes routes,
+    on a few days per quarter. Get a few hundred (price, demand)
+    points with random variation; estimate elasticity on those points
+    only.
+  </p>
+
+<pre><code>For each low-volume route in pilot set:
+    For each day in [calendar window]:
+        random_offset = uniform(-15%, +15%)
+        published_fare = base_fare * (1 + random_offset)
+        log all bookings with (route, day, fare, demand)
+
+After 6 months:
+    For each route family:
+        estimate elasticity from random-variation subset only
+        compute SE, propagate to optimizer
+</code></pre>
+
+  <p>
+    Cost: ~$200k per quarter in revenue (intentional sub-optimal
+    pricing on the experimental cells). Benefit: a clean elasticity
+    estimate that the optimizer can trust.
+  </p>
+
+  <h2>2 &middot; Instrumental Variables (IV)</h2>
+  <p>
+    Find a variable Z that affects price (P) but not demand (D)
+    directly &mdash; only through P. Standard 2SLS:
+  </p>
+
+<pre><code>Stage 1:  P ~ Z + X         # predict price from instrument + controls
+          P_hat = fitted values
+
+Stage 2:  D ~ P_hat + X     # demand on predicted price
+          coefficient on P_hat = elasticity (LATE)
+</code></pre>
+
+  <p>
+    The hard part is finding a credible Z. Three candidates for AA:
+  </p>
+  <ul>
+    <li><strong>Jet fuel price shocks.</strong> Affect AA&apos;s cost &rarr; affect price. Don&apos;t directly affect customer demand for AA tickets. Exclusion restriction is plausible if you control for macro indices.</li>
+    <li><strong>FX shocks (international routes).</strong> Move our marginal cost on dollar-priced tickets bought from foreign markets. Don&apos;t directly affect domestic demand.</li>
+    <li><strong>Regulatory holiday changes.</strong> A new holiday calendar in a destination country changes both supply and demand patterns.</li>
+  </ul>
+
+  <p>
+    Diagnostics every IV needs: <em>relevance</em> (first-stage F &gt; 10),
+    <em>exclusion</em> (no direct path Z &rarr; D), <em>monotonicity</em>
+    (Z always moves P in the same direction). Weak instruments
+    (F &lt; 10) produce spurious 2SLS estimates &mdash; better to
+    report &ldquo;underpowered&rdquo; than ship a biased number.
+  </p>
+
+  <h2>3 &middot; Double ML (Chernozhukov et al. 2018)</h2>
+  <p>
+    The framework that combines IV-style identification with
+    flexible ML on the nuisance functions. Two key ideas: <em>Neyman
+    orthogonality</em> (the moment condition is locally insensitive
+    to the nuisance estimates) and <em>cross-fitting</em> (use
+    independent folds for nuisance vs target estimation).
+  </p>
+
+  <h3>The orthogonal moment for elasticity</h3>
+
+<pre><code># Notation: D = demand, P = price, X = controls, Z = instrument
+
+# Step 1. Estimate the conditional means with any flexible ML model
+m_D(X) = E[D | X]    # demand model on controls only
+m_P(X) = E[P | X]    # price  model on controls only
+
+# Step 2. Form residuals
+D_res  = D - m_D_hat(X)
+P_res  = P - m_P_hat(X)
+
+# Step 3. Regress D_res on P_res (partialing out)
+elasticity = cov(D_res, P_res) / var(P_res)
+
+# Step 4. Cross-fit: use disjoint folds for ML fits and the OLS step
+</code></pre>
+
+  <p>
+    The Neyman-orthogonality property means: even if your ML
+    estimates of m_D and m_P have slow convergence rates (n^{-1/4}
+    instead of n^{-1/2}), the elasticity estimate still converges
+    at the standard root-n rate with valid confidence intervals.
+    That&apos;s the magic of orthogonalisation.
+  </p>
+
+  <p>
+    For us, &ldquo;any flexible ML model&rdquo; means: LightGBM on
+    rich feature sets (route, season, holiday, day-of-week,
+    competitor fare). For the IV variant, swap in the residual of
+    P from Z, X.
+  </p>
+
+  <h2>4 &middot; DeepIV (Hartford et al. 2017)</h2>
+  <p>
+    Double ML with neural networks on the conditional expectations.
+    Specifically, the second stage learns the structural function
+    h(p, x) = E[D | do(P=p), X=x] by training to minimise
+    E[(D - integral h(p, x) dF(p|z, x))<sup>2</sup>].
+  </p>
+
+<pre><code># Stage 1: learn F(P | Z, X) -- distribution of price given instrument
+        e.g., a mixture density network outputting (mu, sigma) of P given Z, X
+
+# Stage 2: learn h(p, x) -- structural demand function
+        loss for each (D_i, Z_i, X_i):
+            sample p ~ F(P | Z_i, X_i)
+            predict D_hat = h_theta(p, X_i)
+            backprop on (D_i - average D_hat)^2
+</code></pre>
+
+  <p>
+    Useful when the structural relationship is non-linear (demand
+    saturates at low prices, kink at fare-class boundaries) and
+    classical 2SLS is mis-specified. Production maturity:
+    high-research, low-deployment; tooling still in
+    research-grade libraries (econml).
+  </p>
+
+  <h2>5 &middot; Causal Forests (Wager &amp; Athey 2018)</h2>
+  <p>
+    Random forests trained to estimate <em>heterogeneous treatment
+    effects</em> via &ldquo;honest&rdquo; tree splitting (one
+    half-sample fits the splits, the other estimates the leaf
+    treatment effect). Output: per-observation conditional average
+    treatment effect (CATE), with valid asymptotic CIs.
+  </p>
+
+<pre><code>Treatment: D_high_price - D_low_price (per route, week)
+Causal forest:
+  build M trees with honest splitting
+  each leaf: estimate ATE from out-of-sample residuals
+At inference:
+  per-route CATE_hat(X), CI from forest variance
+</code></pre>
+
+  <p>
+    For elasticity heterogeneity (does DFW-LAX react differently to
+    price changes than DFW-AUS?), causal forests are the cleanest
+    tool. Combined with an instrument or randomisation, you get per-OD
+    elasticity estimates with finite-sample CIs.
+  </p>
+
+  <h2>6 &middot; GPBoost &mdash; LightGBM with random effects (Sigrist 2022)</h2>
+  <p>
+    For panels with low-volume routes, per-route OLS / LightGBM is
+    wildly noisy. Mixed-effects models shrink toward group means
+    (route family, region). GPBoost combines the flexibility of
+    gradient boosting with Gaussian-process random effects:
+  </p>
+
+<pre><code>D = f(X)        # boosted-tree fixed effect
+  + b_route(z) # Gaussian-process random effect, indexed by route
+  + epsilon
+</code></pre>
+
+  <p>
+    Empirically dominates plain LightGBM on grouped data; ships in
+    R and Python. Right tool when you have 6,700 routes, most with
+    &lt; 500 days history, and you want a sane per-route elasticity
+    without per-route OLS noise.
+  </p>
+
+  <h2>7 &middot; Hierarchical Bayes (Stan / PyMC / NumPyro)</h2>
+  <p>
+    Gold-standard partial pooling. Per-route elasticity is drawn
+    from a family-level prior; family-level priors drawn from a
+    network-level hyper-prior. Posterior over per-route elasticity
+    is naturally shrunk toward the family mean by an amount
+    determined by route-level variance.
+  </p>
+
+<pre><code>elasticity_global ~ Normal(0, 1)
+elasticity_family[k] ~ Normal(elasticity_global, sigma_family)
+elasticity_route[i,k] ~ Normal(elasticity_family[k], sigma_route)
+log_demand[i, t] ~ Normal(elasticity_route[i,k] * log_price[i, t]
+                          + alpha[i] + season[t], sigma_obs)
+</code></pre>
+
+  <p>
+    Best uncertainty story; expensive to fit at full network scale
+    (~days on a sample). Right tool when CI matters more than
+    speed (e.g., regulatory submissions).
+  </p>
+
+  <h2>The recommended OR stack at AA</h2>
+  <p>
+    None of these is a silver bullet alone; the production answer
+    is a layered stack:
+  </p>
+
+<pre><code>Layer 1: Identification.
+    -- Calendar-randomised RCT on a 50-route pilot set, 6 months.
+    -- Fuel-shock + FX-shock IV on the full panel for cross-validation.
+
+Layer 2: Estimation.
+    -- Double ML on the panel using LightGBM nuisance models.
+    -- Cross-fit across 5 folds; report SEs.
+
+Layer 3: Heterogeneity.
+    -- Causal forest on the (route, season) panel for per-OD elasticity.
+    -- Honest splitting; report 90% CI.
+
+Layer 4: Pooling.
+    -- GPBoost or hierarchical Bayes to shrink low-volume routes
+       toward family means.
+
+Layer 5: Audit + report.
+    -- One signed elasticity table per quarter to the optimizer.
+    -- Methods documented; identification strategy named explicitly.
+</code></pre>
+
+  <p>
+    The Operations Research team owns this stack. The portfolio
+    today supplies the forecast (L1 in the four-layer pricing stack
+    &mdash; see <a href="base-price-strategy.html">base-price-strategy.html</a>);
+    elasticity is L2, owned separately.
+  </p>
+
+  <h2>The XReg coefficient and what it actually is</h2>
+  <p>
+    The <code>elast</code> field in <code>metrics.json</code> for
+    each route is the XReg head&apos;s coefficient on log price &mdash;
+    a regression coefficient on observational data fit under existing
+    AA pricing policy. It is <em>not</em> a causal elasticity. It
+    conflates demand-driven price moves with policy responses.
+  </p>
+
+  <p>
+    Three uses where the XReg coefficient is fine, and one where it
+    isn&apos;t:
+  </p>
+  <ul>
+    <li><strong>Forecast feature</strong>. Improves point forecasts when price moves are mostly demand-driven. Fine.</li>
+    <li><strong>Sensitivity check</strong>. &ldquo;If price moves 5%, what does the forecast say?&rdquo; Fine as a what-if probe.</li>
+    <li><strong>Diagnostic for elasticity drift</strong>. If the XReg coef changes sharply quarter-over-quarter, something has shifted &mdash; could be data, could be policy, worth investigating. Fine.</li>
+    <li><strong>Direct input to base-price optimizer</strong>. <em>Not fine.</em> Optimizer needs causal elasticity. Use the OR team&apos;s separately-estimated number.</li>
+  </ul>
+
+  <h2>Tradeoffs at AA&apos;s scale</h2>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Decision</th><th>Cost</th><th>Benefit</th><th>What we accepted</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>RCT pilot on 50 low-volume routes</td>
+          <td>$200k/quarter sub-optimal pricing on experimental cells</td>
+          <td>Gold-standard elasticity at the family level</td>
+          <td>Constrained to low-stakes routes; no full-fare RCT possible</td>
+        </tr>
+        <tr>
+          <td>Fuel-shock IV on the panel</td>
+          <td>Power loss; weak-instrument risk if shock is small</td>
+          <td>Identification on full panel without revenue cost</td>
+          <td>Diagnostics: report first-stage F, exclude routes with F &lt; 10</td>
+        </tr>
+        <tr>
+          <td>Double ML over OLS-on-residuals</td>
+          <td>Cross-fitting + LightGBM nuisance models = compute</td>
+          <td>Robust to flexible-ML overfit; valid CIs</td>
+          <td>~3 hours panel fit on weekly schedule</td>
+        </tr>
+        <tr>
+          <td>Causal forest for heterogeneity</td>
+          <td>Honest splitting halves usable training data</td>
+          <td>Per-OD elasticity with valid CIs</td>
+          <td>OK for top-200 high-volume routes; pool the rest</td>
+        </tr>
+        <tr>
+          <td>GPBoost for partial pooling</td>
+          <td>Slower fit than plain LightGBM</td>
+          <td>Sane low-volume estimates via shrinkage</td>
+          <td>For 6,700 routes most with sparse history, the shrinkage is decisive</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Failure modes</h2>
+  <ol>
+    <li><strong>Selection on accepted offers.</strong> Bookings in the warehouse only reflect customers who said yes. Mitigation: include search-impression data when available; explicitly model selection.</li>
+    <li><strong>Endogenous instrument.</strong> If the &ldquo;fuel shock&rdquo; correlates with macro demand (recessions cause fuel drops <em>and</em> demand drops), exclusion fails. Mitigation: control for macro indicators directly.</li>
+    <li><strong>Cross-route substitution.</strong> Lowering DFW-LAX may cannibalise DFW-BUR. Estimating one elasticity at a time misses the cross-elasticity. Mitigation: estimate jointly with cross-elasticity terms; or partition into substitute clusters.</li>
+    <li><strong>Time-varying treatment effect.</strong> Elasticity in March is not the same as elasticity in December. Mitigation: estimate per-season; or add time interactions to the structural model.</li>
+    <li><strong>Feedback loops.</strong> If the optimizer uses the elasticity to set prices, future price variation reflects the model. Re-estimating on that future data contracts the elasticity toward zero. Mitigation: keep an exogenous source of variation alive (RCT cells; structural shocks); never re-estimate purely from deployed-policy data.</li>
+  </ol>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; causal elasticity</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Why isn&apos;t a forecast model&apos;s price coefficient an elasticity?</div>
+        <div class="a">Confounding. A forecast model is fit on observational data where price was set by current pricing policy &mdash; high prices coincide with high demand because RM raises prices when demand spikes. The coefficient picks up that simultaneity. Real elasticity needs identification: an instrument, randomisation, or quasi-experiment.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What identification strategy would you actually use at AA?</div>
+        <div class="a">Layered. (1) Calendar-randomised RCT on a 50-route pilot for the gold-standard at the family level. (2) Fuel-shock and FX-shock IV on the full panel as a cross-validation. (3) Quasi-experimental DiD when policy changes happen (new ULCC entry, fare-class restructuring). The combination is more robust than any one alone.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through Double ML for fare elasticity.</div>
+        <div class="a">Two ML models: predict demand from non-price controls, predict price from non-price controls. Cross-fit residuals. Regress demand-residual on price-residual; the slope is debiased elasticity. Robust to slow ML convergence rates because of Neyman orthogonality. Tooling: <code>doubleml</code> and <code>econml</code>.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When does Double ML need an IV add-on?</div>
+        <div class="a">When the residual price variation is still endogenous &mdash; i.e., the controls don&apos;t capture all the demand-driven price moves. In that case Double ML&apos;s &ldquo;partial out&rdquo; step gives a debiased predictive coefficient, not a causal one. Adding an instrument (Double ML IV) restores causality: regress price residual on instrument residual, then use that as the price proxy.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Causal forests vs hierarchical Bayes for per-route elasticity?</div>
+        <div class="a">Causal forests give per-route point estimates with valid asymptotic CIs and are easier to deploy. Hierarchical Bayes gives full posteriors and naturally shrinks via priors, at the cost of fitting time. For 6,700 routes, GPBoost is a good middle ground: tree-flexibility with random-effects shrinkage. Pick HB when you need posteriors for risk-weighted optimization.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the weakness of fixed-effects elasticity?</div>
+        <div class="a">Two-way fixed effects (route + week) sweeps out time-invariant route confounders and route-invariant time shocks. But it misses anything time-varying within a route &mdash; competitor entry, seasonal capacity changes, ULCC arrival. And in panels with little within-route price variation, the FE estimator is underpowered.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why is the fuel-shock instrument credible?</div>
+        <div class="a">Fuel-price shocks affect AA&apos;s marginal cost (relevance: yes, F-stat is strong on transcontinental). They don&apos;t affect customer demand for AA tickets directly &mdash; people don&apos;t fly more or less because jet fuel got cheaper, except indirectly through price (exclusion: plausible). The exclusion restriction can fail if recessions cause both fuel drops and demand drops; we control for macro indicators to be safe.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What goes wrong when you re-estimate elasticity from deployed-policy data?</div>
+        <div class="a">The optimizer picks prices to be near-optimal under the current elasticity estimate. Future bookings reflect that policy. Re-estimating on deployed-policy data shows narrow price variation &mdash; the elasticity contracts toward zero or whatever is consistent with the policy. Mitigation: maintain RCT cells with exogenous variation alive; or always anchor on a structural-shock instrument.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When would DeepIV be worth the engineering cost?</div>
+        <div class="a">When the structural relationship is highly non-linear (kinks at fare-class boundaries, demand saturation at low prices, threshold effects at competitor entry) and 2SLS is mis-specified. For most airline routes, log-linear elasticity holds well enough that Double ML wins on cost. DeepIV is a research bet, not a default.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you handle cross-route substitution in elasticity?</div>
+        <div class="a">Two approaches. (1) Joint estimation with cross-elasticity terms: regress D_i on log(P_i) and log(P_j) for substitute routes j. (2) Cluster substitutable routes (DFW-LAX, DFW-LGB, DFW-BUR are substitutes; DFW-LAX and DFW-MIA are not), estimate within-cluster joint elasticity matrices. Both require defining the substitute set; we use shopper-search co-occurrence to define clusters empirically.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If you had to pick one elasticity number per route family, what method?</div>
+        <div class="a">Double ML on the panel with fuel-shock IV, with GPBoost for partial pooling toward family means. Why: (a) DML handles flexible nuisance models, (b) IV gives identification, (c) GPBoost gives sane low-volume estimates. Cost: ~3 hours panel fit per quarter; one signed elasticity table to the optimizer.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <h2>Sources</h2>
+  <ul>
+    <li>Wright, P.G. (1928). <em>The Tariff on Animal and Vegetable Oils</em> (origin of IV).</li>
+    <li>Card, D. &amp; Krueger, A.B. (1994). <em>Minimum Wages and Employment</em> (canonical DiD).</li>
+    <li>Imbens, G. &amp; Lemieux, T. (2008). <em>Regression Discontinuity Designs: A Guide to Practice.</em> J. Econometrics.</li>
+    <li>Chernozhukov, V. et al. (2018). <em>Double/Debiased Machine Learning for Treatment and Structural Parameters.</em> Econometrics Journal.</li>
+    <li>Hartford, J., Lewis, G., Leyton-Brown, K., Taddy, M. (2017). <em>Deep IV: A Flexible Approach for Counterfactual Prediction.</em> ICML.</li>
+    <li>Wager, S. &amp; Athey, S. (2018). <em>Estimation and Inference of Heterogeneous Treatment Effects using Random Forests.</em> JASA.</li>
+    <li>Sigrist, F. (2022). <em>GPBoost: Combining Tree-Boosting with Gaussian Process and Mixed Effects Models.</em> Statistics and Computing.</li>
+    <li>Abadie, A., Diamond, A., Hainmueller, J. (2010). <em>Synthetic Control Methods for Comparative Case Studies.</em> JASA.</li>
+    <li>Stock, J.H. &amp; Yogo, M. (2005). <em>Testing for Weak Instruments in Linear IV Regression.</em></li>
+  </ul>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="probabilistic-heads.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Probabilistic output heads</div>
+    </a>
+    <a class="page-nav-item next" href="pricing-optimization.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Pricing optimization techniques</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>

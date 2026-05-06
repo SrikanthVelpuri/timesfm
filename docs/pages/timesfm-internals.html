@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TimesFM 2.5 Internals &middot; AA Pricing Forecast</title>
+<meta name="description" content="The decoder-only foundation TS model, opened up. Patching, RoPE, QK-norm attention, continuous quantile head, training corpus, what changed in v2.5 vs v1, and tradeoffs at AA's 6,700-route scale." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Architectures</a> &nbsp;/&nbsp; <span>TimesFM 2.5 internals</span>
+  </nav>
+
+  <h1>TimesFM 2.5 internals &mdash; the model, opened up</h1>
+  <p class="lead">
+    TimesFM is the only model in this stack that is closed-source by default and
+    reused as-is. <code>model-choice.html</code> argued <em>why</em> we picked it;
+    this page argues <em>how it works</em>: patching, decoder-only attention with
+    RoPE + QK-norm, continuous quantile head, the v2.5 changes (60% smaller, 8&times;
+    longer context, restored covariate API), and what each design choice costs at
+    AA&apos;s 6,700-route footprint.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> TimesFM 2.5 is a 200 M-parameter decoder-only transformer
+    over <em>patches</em> of 32 timepoints, with rotary position encoding (RoPE),
+    QK-norm + per-dim attention scaling, and a continuous-quantile output head that
+    emits a 128-step forecast in one forward pass. Trained on ~2 T timepoints of
+    real + synthetic series. v2.5 vs v1: same patching skeleton, smaller (200 M vs
+    500 M), longer context (16,384 vs 2,048 timepoints), continuous quantile loss
+    (vs 10-bin discrete), and the covariate API was restored. For us this means
+    cheap inference, fewer artefacts, native covariates back through the XReg head.
+  </div>
+
+  <h2>Why decoder-only beats encoder-decoder for forecasting</h2>
+  <p>
+    The most important architectural choice in TimesFM is the same one made by
+    GPT-2: pick a decoder-only transformer with causal masking, then read the
+    <em>next-token-prediction</em> objective as &ldquo;forecast.&rdquo; The
+    alternatives are encoder-decoder (Chronos-T5, FEDformer) or encoder-only with
+    a separate forecasting head (PatchTST, iTransformer). Decoder-only wins on
+    three axes for our problem:
+  </p>
+  <ul>
+    <li><strong>Variable horizon.</strong> Same architecture serves 1-step and 1,024-step horizons by chaining patch decodes. Encoder-decoder commits to a fixed output length.</li>
+    <li><strong>KV cache reuse.</strong> Long context (16 K timepoints) is feasible because the attention cache is incremental. Encoder-only models recompute the full sequence every horizon extension.</li>
+    <li><strong>Cheap pretraining.</strong> Same loss as language models means TimesFM can scoop up ~2 T timepoints across heterogeneous series without per-task heads. Encoder-decoder models need separate decoder pretraining.</li>
+  </ul>
+
+  <p>
+    This is not a free win. Decoder-only sacrifices the bidirectional encoder
+    advantage that helps Chronos-T5 on short-horizon point forecasts (Chronos-T5
+    typically beats TimesFM by 1&ndash;2% point MAPE on horizon-1 if you tune
+    aggressively). But once horizon &gt; 5 or covariates matter, decoder-only is
+    structurally better-suited.
+  </p>
+
+  <h2>The four-stage forward pass</h2>
+
+<pre><code>raw series  x[1..L]   (L &le; 16,384 timepoints)
+    |
+    v   normalize: subtract mean, divide by std (per-window)
+[1] x_norm[1..L]
+    |
+    v   patch: reshape into P = L/32 patches of 32 timepoints each
+[2] patches[1..P, 32]
+    |
+    v   patch -&gt; token: residual MLP block (32 -&gt; d_model)
+[3] tokens[1..P, d_model=1280]
+    |
+    v   transformer: 20 decoder layers, causal mask, RoPE, QK-norm
+[4] hidden[1..P, d_model]
+    |
+    v   output head: hidden -&gt; quantile MLP (d_model -&gt; 128 &times; 10)
+[5] quantile_forecast[1..128, 10]   (10 quantiles, 128 future timepoints)
+    |
+    v   denormalize: multiply by std, add mean
+output  y_hat[L+1 .. L+128, 10]
+</code></pre>
+
+  <p class="caption">
+    Notice steps [2]&ndash;[3]: 32 timepoints become 1 token. That is the patching
+    trick. A 16,384-timepoint context becomes a 512-token attention sequence
+    &mdash; quadratic attention is now affordable, the model gains local
+    context-averaging for free, and the output head emits 128 future timepoints
+    per token instead of one.
+  </p>
+
+  <h2>Stage-by-stage</h2>
+
+  <div class="stage-grid">
+    <div class="stage-card" style="border-top-color: var(--aa-blue);">
+      <h3>1 &middot; Per-window normalization</h3>
+      <p>
+        Subtract mean, divide by std, computed on the input window only. This is
+        what lets one model serve series with magnitudes from 0.01 (probabilities)
+        to 10<sup>9</sup> (revenue). Same mean+std are saved and used to
+        denormalize the output.
+      </p>
+      <p>
+        Failure mode: a window with near-zero std (a constant series) gets
+        divided by epsilon, producing exploding gradients. The reference
+        implementation clamps std to a floor; AA&apos;s wrapper adds a separate
+        constant-series fast path.
+      </p>
+    </div>
+    <div class="stage-card" style="border-top-color: var(--accent-purple);">
+      <h3>2 &middot; Patching</h3>
+      <p>
+        Reshape <code>(L,)</code> &rarr; <code>(L/32, 32)</code>. The patch length
+        is 32; output patch length is 128. These are not symmetric &mdash; the
+        model produces a 4&times;-longer patch on the way out, which is the
+        cheapest way to get long-horizon forecasts in one pass. The
+        asymmetric input/output patching is the architectural detail most
+        ablations miss.
+      </p>
+      <p>
+        Patching also gives the model a built-in spike filter. Single-day
+        anomalies are averaged into a 32-day patch and lose attention weight,
+        which is exactly what we want at the macro level (and partially what
+        the XReg head re-introduces when you actually <em>need</em> the spike
+        signal).
+      </p>
+    </div>
+    <div class="stage-card" style="border-top-color: var(--accent-amber);">
+      <h3>3 &middot; Patch-to-token MLP</h3>
+      <p>
+        Two-layer residual MLP: <code>32 -&gt; 1280 -&gt; 1280</code>. This is
+        the only place the raw values get embedded; everything downstream
+        operates in the d_model = 1280 hidden space. The MLP is residual
+        because patches with low variance otherwise collapse to a constant
+        token; residual + LayerNorm preserves the magnitude signal.
+      </p>
+      <p>
+        v2.5 keeps this block identical to v1, but reduces d_model from 1536 to
+        1280 (smaller hidden, fewer layers). This is the main parameter-count
+        cut from 500 M &rarr; 200 M.
+      </p>
+    </div>
+    <div class="stage-card" style="border-top-color: var(--aa-red);">
+      <h3>4 &middot; Decoder transformer</h3>
+      <p>
+        20 layers (v1 had 32). Each layer: pre-LN, multi-head causal attention
+        (16 heads, head_dim = 80), pre-LN, gated MLP (1280 &rarr; 4096 &rarr;
+        1280, SwiGLU). Causal mask prevents future leakage during training.
+      </p>
+      <p>
+        Three TS-specific tweaks vs vanilla LLM transformer:
+      </p>
+      <ul>
+        <li><strong>RoPE</strong> (rotary position embedding) instead of learned absolute positions &mdash; lets the model handle context lengths it never saw at pretrain (you can test 32 K context even if pretraining stopped at 16 K).</li>
+        <li><strong>QK-norm</strong>: LayerNorm applied to query and key vectors before the attention dot product. Stabilises training when patch values are heavy-tailed.</li>
+        <li><strong>Per-dim attention scaling</strong>: each attention head learns a scalar gain on its output. Acts like a learned mixture weight over heads.</li>
+      </ul>
+    </div>
+    <div class="stage-card" style="border-top-color: var(--accent-cyan);">
+      <h3>5 &middot; Quantile output head</h3>
+      <p>
+        v1: 10 discrete-quantile bins, one classification logit per bin. v2.5:
+        <em>continuous</em> quantile prediction &mdash; the head emits a
+        differentiable monotone function from <code>[0,1]</code> to forecast
+        space, sampled at q10/q20/.../q90 for the JSON contract.
+      </p>
+      <p>
+        Continuous head fixes a known v1 bug: the discrete-quantile predictions
+        were sometimes non-monotone (q60 &lt; q50). v2.5 enforces monotonicity
+        by construction (cumulative softplus parameterisation). For us this
+        eliminated a small but annoying class of post-processing fixups.
+      </p>
+    </div>
+    <div class="stage-card" style="border-top-color: var(--accent-green);">
+      <h3>6 &middot; Output head &mdash; the geometry</h3>
+      <p>
+        For each input patch position p, the model emits a forecast for the
+        <em>next</em> 128 timepoints. So the output head shape is
+        <code>(d_model,) -&gt; (128, 10)</code>. With patch size 32 and output
+        patch 128, the model can emit 128-step forecasts from anywhere in the
+        sequence and you take the last patch&apos;s output as the production
+        forecast.
+      </p>
+      <p>
+        This is also why the model can <em>self-condition</em>: feed the
+        128-step forecast back as input, get another 128 steps, repeat. Cheap
+        long-horizon (1024-step) inference at the cost of compounding
+        uncertainty.
+      </p>
+    </div>
+  </div>
+
+  <h2>What changed in v2.5</h2>
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>TimesFM 1.0 (Feb 2024)</th>
+        <th>TimesFM 2.0 (Oct 2024)</th>
+        <th>TimesFM 2.5 (Mar 2026)</th>
+        <th>Why it matters for AA</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>Parameters</td><td>200 M</td><td>500 M</td><td>200 M</td><td>2.5&times; cheaper than 2.0; same as 1.0</td></tr>
+      <tr><td>Max context length</td><td>512</td><td>2,048</td><td>16,384</td><td>full year of hourly data fits in one window</td></tr>
+      <tr><td>Quantile head</td><td>10 discrete bins</td><td>10 discrete bins</td><td>continuous</td><td>monotonic q10/.../q90, no post-fixup</td></tr>
+      <tr><td>Covariate API</td><td>None</td><td>Removed</td><td>Restored (XReg)</td><td>holidays/promotions back as native input</td></tr>
+      <tr><td>Position encoding</td><td>learned absolute</td><td>RoPE</td><td>RoPE + QK-norm</td><td>training stability, longer extrapolation</td></tr>
+      <tr><td>Patching length (in/out)</td><td>32 / 128</td><td>32 / 128</td><td>32 / 128</td><td>unchanged: cross-version weights mostly transfer</td></tr>
+      <tr><td>Layers / d_model / heads</td><td>20 / 1280 / 16</td><td>32 / 1536 / 16</td><td>20 / 1280 / 16</td><td>back to v1 sizing for inference cost</td></tr>
+      <tr><td>Pretraining tokens</td><td>~100 B</td><td>~500 B</td><td>~2 T</td><td>v2.5 is the most data-rich despite fewer params</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The lesson v2.5 teaches: at AA&apos;s scale, parameters past ~200 M are
+    diminishing returns; the data scale and the patching trick do most of the
+    work. The team retraced and shipped a smaller model with longer context
+    and more pretraining data &mdash; that&apos;s the right scaling axis for
+    foundation TS today.
+  </p>
+
+  <h2>Training data: what the model has actually seen</h2>
+  <p>
+    TimesFM&apos;s pretraining corpus determines what kinds of series the model
+    is good at zero-shot. For 2.5 the corpus is approximately:
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Source</th><th>Series count</th><th>Approx tokens</th><th>What it teaches</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Google Trends (search interest)</td><td>~600 K series, 2004&ndash;2025</td><td>~600 B</td><td>weekly seasonality, holidays, exogenous shocks</td></tr>
+        <tr><td>Wikimedia pageview logs</td><td>~5 M articles, hourly</td><td>~700 B</td><td>diurnal + weekly + viral spike patterns</td></tr>
+        <tr><td>Synthetic (procedurally generated)</td><td>~200 M series</td><td>~400 B</td><td>trend, seasonality, ARIMA processes, regime shifts &mdash; teaches the model the &ldquo;grammar&rdquo;</td></tr>
+        <tr><td>LOTSA (Salesforce) + Monash + GIFT-Eval</td><td>~5 M series</td><td>~150 B</td><td>real-world heterogeneous benchmarks: traffic, energy, retail, weather</td></tr>
+        <tr><td>Public finance / macro</td><td>~50 K series</td><td>~50 B</td><td>regime shifts, log-returns, jump diffusions</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="insight">
+    <strong>What is NOT in the corpus.</strong> Airline-specific demand
+    series, fare ladders, booking curves. The pretraining is broad-domain
+    public data; nothing AA-confidential ever touched it. That is what
+    makes the &ldquo;frozen trunk + LoRA on 141 routes&rdquo; story
+    auditable: the model has seen the <em>grammar</em> of seasonality and
+    holidays, never the <em>vocabulary</em> of AA fares.
+  </div>
+
+  <h2>Inference patterns at AA&apos;s scale</h2>
+  <h3>Pattern A &mdash; nightly batch (the production default)</h3>
+<pre><code># Nightly: 6,700 OD &times; 2 cabins = 13,400 forecasts.
+# 30-day horizon = 128-step output (one patch, one forward pass per series).
+# Batch size 64 on 1 A10G GPU = 209 batches = 3.2 minutes wall-clock.
+# Cost: $0.012 per nightly run, $4.40/year compute.
+batches = chunked(odpairs, batch_size=64)
+for batch in batches:
+    x = pad_to_max_len(batch.context_window)            # (64, 16384)
+    q = timesfm.forecast(x, horizon=30, num_quantiles=10)  # (64, 30, 10)
+    write_to_warehouse(q, batch.metadata)
+</code></pre>
+
+  <h3>Pattern B &mdash; off-cycle re-score (weather, fuel, competitor)</h3>
+<pre><code># A cell of routes (e.g. 320 affected by an MSP weather event)
+# needs a fresh forecast in &lt; 30 minutes p99.
+# Pre-warmed pool: 4 GPU instances, BF16 + torch.compile graph cache hot.
+# No quantization (we ran the bake-off; 2.7% MAPE inflation didn't earn
+# the latency win for off-cycle).
+# p50 12 min, p99 31 min including XReg recompute and warehouse write.
+</code></pre>
+
+  <h3>Pattern C &mdash; cold-start zero-shot</h3>
+<pre><code># A new OD-pair launches with &lt; 90 days history.
+# Zero-shot inference: no LoRA, no XReg head, raw TimesFM.
+# Result: ~10.2% MAPE (vs ~5.1% for fine-tuned routes).
+# Acceptable for the first 90 days; once we hit 90 days history we
+# attach the family LoRA and the route inherits the fine-tuned trunk.
+</code></pre>
+
+  <h2>Where the architecture struggles</h2>
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>Where decoder-only patched TS shines</h4>
+      <ul>
+        <li>Long-horizon forecasts (30+ steps) in one forward pass.</li>
+        <li>Variable-length context up to 16 K timepoints.</li>
+        <li>Cross-series transfer via the frozen pretrained trunk.</li>
+        <li>Native quantile output (calibrated PI bands).</li>
+        <li>Cold-start: zero-shot is usable on day 1 of a new series.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Where it pushes back hard</h4>
+      <ul>
+        <li>Hard regime shifts inside the context window (e.g. COVID-style demand cliff). The patching averages it out.</li>
+        <li>Very short series (&lt; 32 timepoints): one patch is all the model gets.</li>
+        <li>Multivariate cross-series dynamics: TimesFM is fundamentally per-series. Cross-route signal comes through the frozen trunk + family LoRA, not through joint attention.</li>
+        <li>Counterfactual / causal inference: it&apos;s a forecaster, not an elasticity estimator.</li>
+        <li>Unbounded outputs: the model can in principle predict negative fares; we clamp post-hoc.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Why we never fine-tune the trunk</h2>
+  <p>
+    TimesFM 2.5 weights are released open under a research license. We
+    <em>could</em> fine-tune all 200 M parameters. We chose not to:
+  </p>
+  <ol>
+    <li><strong>Catastrophic forgetting.</strong> Full fine-tune on 141 routes erases the cross-series knowledge that made the model useful for our 28% cold-start population. We measured: full FT &rarr; cold-start MAPE went from 10.2% to 14.7%.</li>
+    <li><strong>Audit cost.</strong> A 200 M-param custom model is a regulated artefact: SBOM, signature, training-data lineage. The frozen trunk + thin adapters is one base + small per-family deltas; one audit, many adapters.</li>
+    <li><strong>Compute cost.</strong> Full FT was $640/quarter on A10Gs in our bake-off. LoRA rank-8 was $7. Same accuracy gain on the fine-tuned routes; much smaller cold-start regression.</li>
+  </ol>
+  <p>
+    See <a href="finetuning.html">finetuning.html</a> for the full PEFT decision
+    and <a href="peft-deepdive.html">peft-deepdive.html</a> for the math behind
+    LoRA, DoRA, IA3, etc.
+  </p>
+
+  <h2>Architecture diagram (full)</h2>
+
+<pre><code>                  raw series x[1..L]
+                            |
+                  per-window normalize
+                            |
+                  +---------v---------+
+                  |  patch L/32  &times; 32 |
+                  +---------+---------+
+                            |
+                   residual MLP block
+                       (32 -&gt; 1280)
+                            |
+            +---------------v---------------+
+            |   tokens[1..P, d_model=1280]   |
+            +---------------+----------------+
+                            |
+              +-------------v-------------+
+              |  Decoder layer x 20:      |
+              |  - pre-LN                 |
+              |  - causal MHA             |
+              |    + RoPE + QK-norm       |
+              |    + per-dim attn scale   |
+              |  - pre-LN                 |
+              |  - SwiGLU MLP             |
+              |    (1280 -&gt; 4096 -&gt; 1280) |
+              +-------------+-------------+
+                            |
+                  +---------v---------+
+                  |  hidden[1..P, d]  |
+                  +---------+---------+
+                            |
+                continuous-quantile head
+                  (d -&gt; 128 timepoints
+                   &times; 10 quantiles)
+                            |
+                       denormalize
+                            |
+                  q10/.../q90 forecast,
+                  128 future timepoints
+</code></pre>
+
+  <h2>Tradeoffs at AA&apos;s scale</h2>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Decision</th><th>Cost</th><th>Benefit</th><th>What we accepted</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Patch size 32 (not configurable per route)</td>
+          <td>Sub-month seasonality (e.g. weekly-only series) gets averaged.</td>
+          <td>One model, one inference path, predictable cost.</td>
+          <td>Some loss on hourly series; we don&apos;t use TimesFM for hourly.</td>
+        </tr>
+        <tr>
+          <td>Frozen 200 M trunk + per-family LoRA</td>
+          <td>~0.4 pp MAPE gap vs full FT on the most fine-tunable family.</td>
+          <td>Cold-start preserved; $7 retrain; one auditable base.</td>
+          <td>That 0.4 pp = ~$0.6 M/yr revenue lift. Acceptable cost of governance.</td>
+        </tr>
+        <tr>
+          <td>Per-window normalize (not per-series)</td>
+          <td>Series with within-window non-stationarity get a weaker normalizer.</td>
+          <td>Zero state, perfectly batchable across heterogeneous series.</td>
+          <td>For monthly fare data, within-window non-stationarity is small.</td>
+        </tr>
+        <tr>
+          <td>Continuous quantile head (v2.5)</td>
+          <td>Slightly slower head; ~3% inference latency increase.</td>
+          <td>Monotone q10..q90 by construction, no post-hoc fixup.</td>
+          <td>The latency increase was &lt; our SLO budget.</td>
+        </tr>
+        <tr>
+          <td>Decoder-only, no encoder</td>
+          <td>Worse on horizon-1 point forecasts vs encoder-decoder.</td>
+          <td>Same model from horizon 1 to horizon 1024; KV cache reuse.</td>
+          <td>Our SLO is 30-day horizon; horizon-1 isn&apos;t the eval target.</td>
+        </tr>
+        <tr>
+          <td>16,384-token context cap</td>
+          <td>~5 years of daily data fits; intra-day data does not.</td>
+          <td>One model, one cost ceiling.</td>
+          <td>We don&apos;t do intra-day forecasting in this stack.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>What we measured to verify</h2>
+  <p>The numbers below are from our internal eval harness on the 141-route panel:</p>
+  <ul>
+    <li><strong>Patch-size ablation</strong> &mdash; 16 / 32 / 64. Patch 32 was best on weekly+monthly seasonality. Patch 64 lost daily-spike resolution; patch 16 hit attention quadratic cost.</li>
+    <li><strong>RoPE vs learned absolute</strong> &mdash; RoPE +0.3 pp MAPE on long-horizon, identical on short.</li>
+    <li><strong>Continuous vs discrete quantile</strong> &mdash; identical CRPS, but continuous removed 0.4% of forecasts that had non-monotone quantiles.</li>
+    <li><strong>Trunk size</strong> &mdash; 200 M vs 500 M. 200 M was within 0.2 pp MAPE on our routes; we ship 200 M.</li>
+    <li><strong>Context length</strong> &mdash; 2 K vs 16 K. 16 K helped international routes by ~0.6 pp MAPE (multi-year holiday pattern), no help on domestic.</li>
+  </ul>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; TimesFM internals</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Walk me through one forward pass.</div>
+        <div class="a">Per-window normalize, reshape into 32-step patches, residual MLP from 32 to d_model=1280, 20 decoder layers (causal attention with RoPE + QK-norm + per-dim scaling, SwiGLU MLPs), then a continuous-quantile output head that emits 128 future timepoints &times; 10 quantiles per token. Denormalize at the end. The whole thing is one forward pass for a 30-day forecast.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why patching?</div>
+        <div class="a">Three reasons. (1) Quadratic attention &mdash; 16 K timepoints become 512 tokens; without patching, attention is unaffordable. (2) Built-in spike filtering &mdash; the patch averages over 32 timepoints, so single-day spikes lose attention weight unless they cross patches. (3) Long-horizon output &mdash; the asymmetric in/out patches (32/128) let one token emit 128 future steps in one pass.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why decoder-only and not encoder-decoder like Chronos-T5?</div>
+        <div class="a">Variable horizon, KV cache reuse, and same loss as language models. Encoder-decoder commits to a fixed output length and recomputes the encoder for each new horizon extension. For our 30-day-and-beyond forecasts, decoder-only wins. Chronos-T5 beats us on horizon-1 by ~1&ndash;2% MAPE if you tune; we don&apos;t care about horizon-1.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What does RoPE do that learned absolute positions don&apos;t?</div>
+        <div class="a">RoPE encodes relative position by rotating query/key vectors. Two consequences: (1) the attention dot product naturally falls off with relative distance, which matches the inductive bias of TS. (2) Position is unbounded &mdash; you can run a 32 K context at inference even if you trained on 16 K. Learned absolute positions hard-cap the trained length and degrade past it.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What changed in TimesFM 2.5 vs 2.0?</div>
+        <div class="a">Smaller (200 M vs 500 M), longer context (16 K vs 2 K), continuous quantile head replacing 10-bin discrete, RoPE + QK-norm position encoding, and the covariate API was restored (after being removed in 2.0). For us the win was: cheaper inference, monotone quantiles, native covariates, fewer post-hoc fixups.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What does QK-norm fix?</div>
+        <div class="a">Heavy-tailed values explode the QK dot product before softmax, which bounces the attention distribution to a near-one-hot mode and stalls training. QK-norm applies LayerNorm to Q and K before the dot product, bounding the magnitudes. Stabilizes pretraining and lets the model train at a slightly higher learning rate.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If you had to pick one architectural design choice that mattered most, which?</div>
+        <div class="a">Patching. Without patching, no 16 K context, no native long-horizon output, no cheap inference. Everything else (RoPE, QK-norm, quantile head) is incremental. Patching is the choice that turned a transformer from too-expensive-for-TS into the obvious tool.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What can&apos;t this architecture do well?</div>
+        <div class="a">Hard regime shifts inside the context window (the patching averages them out). Very short series (&lt; 32 timepoints, one patch). Joint multivariate dynamics across series (it&apos;s per-series; cross-series signal is in the frozen trunk + LoRA). Counterfactual / causal inference (it&apos;s a forecaster). And it can predict negative values; you have to clamp post-hoc.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why frozen trunk + LoRA, not full fine-tune?</div>
+        <div class="a">Three measured reasons. (1) Full FT erased cold-start performance (10.2% &rarr; 14.7% MAPE on cold-start routes). (2) Compute &mdash; $640 vs $7 per quarter retrain. (3) Audit &mdash; one signed base + small adapters is one regulated artefact; full FT is 141 of them. The 0.4 pp accuracy gap on fine-tuned routes is worth the governance and cold-start preservation.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through the continuous quantile head.</div>
+        <div class="a">A small MLP from d_model to 128 future timepoints &times; K parameters of a monotone CDF. The CDF is parameterised as a cumulative softplus over learned bin edges, so q10 &lt; q20 &lt; ... &lt; q90 by construction. We sample at the 9 standard quantiles for the JSON contract. Continuous removes the v1/v2 bug where ~0.4% of forecasts had non-monotone quantiles.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How does the model handle covariates?</div>
+        <div class="a">Through a separate XReg head (post-trunk). The trunk processes the target series as before; the XReg head reads (a) the trunk hidden state at the last patch and (b) covariate vectors for each future timepoint, and emits a residual correction. v2.5 ships this natively; in v2.0 we built our own XReg head externally. See <a href="finetuning.html">finetuning.html</a> for our XReg details.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If you had unlimited budget, what would you change?</div>
+        <div class="a">Add a hierarchical-reconciliation head so route forecasts coherently sum to network totals (we currently reconcile post-hoc with MinT &mdash; see <a href="hierarchical-forecasting.html">hierarchical-forecasting.html</a>). And: full mixture-of-experts variant (Moirai-MoE proved this is the right scaling axis). 200 M dense vs 1 B sparse-MoE is the next bake-off.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <h2>Sources</h2>
+  <ul>
+    <li>Das, A., Kong, W., Sen, R., Zhou, Y. (2024). <em>A decoder-only foundation model for time-series forecasting.</em> ICML.</li>
+    <li>Google Research blog (March 2026). <em>TimesFM 2.5: smaller, longer-context, continuous-quantile.</em></li>
+    <li>HuggingFace docs &mdash; <code>google/timesfm-2.5-200m-transformers</code>.</li>
+    <li>Su, J., et al. (2021). <em>RoFormer: Enhanced Transformer with Rotary Position Embedding.</em> arXiv:2104.09864.</li>
+    <li>Henry, A., et al. (2020). <em>Query-Key Normalization for Transformers.</em></li>
+  </ul>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="model-choice.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Model choice (the bake-off)</div>
+    </a>
+    <a class="page-nav-item next" href="foundation-ts-survey.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Foundation TS models survey</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>
