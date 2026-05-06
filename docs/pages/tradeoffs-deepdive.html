@@ -41,7 +41,7 @@
   </p>
 
   <div class="tldr">
-    <strong>TL;DR.</strong> 18 cross-cutting decisions, each with a chosen path, the
+    <strong>TL;DR.</strong> 21 cross-cutting decisions, each with a chosen path, the
     runner-up that almost won, and a one-paragraph rationale. The pattern: prefer cheaper,
     more reversible decisions; pay for accuracy only when revenue attribution justifies it;
     keep the operational surface small.
@@ -206,9 +206,45 @@
     &ldquo;what model is in prod&rdquo; that audit can query.
   </p>
 
+  <h2>19. Forecast layer ownership vs full pricing-stack ownership</h2>
+  <p><strong>Chose:</strong> own the forecast layer (L1) only; explicitly do NOT own elasticity (L2), base-price (L3), or the dynamic bot (L4).<br><strong>Runner-up:</strong> vertically integrate the whole stack inside Applied Science.</p>
+  <p>
+    Three reasons we chose the narrower scope. (1) Antitrust separation &mdash; forecast is a
+    statement of fact about demand; pricing is a policy decision. Mixing them in one
+    codebase makes legal review harder. (2) Team-skill match &mdash; we have time-series
+    expertise; OR has econometrics expertise; Pricing Strategy has policy expertise.
+    (3) Faster ship &mdash; one layer takes 16 weeks; four layers would take 18 months.
+    See <a href="base-price-strategy.html">base-price-strategy.html</a> for the full
+    layer split.
+  </p>
+
+  <h2>20. XReg coefficient labelled &ldquo;elasticity&rdquo; vs honest naming</h2>
+  <p><strong>Chose:</strong> keep the metric name <code>elast</code> in <code>metrics.json</code> but document explicitly that it is a <em>predictive</em> coefficient, not a causal elasticity.<br><strong>Runner-up:</strong> rename to <code>xreg_price_coef</code> across the codebase.</p>
+  <p>
+    The XReg head&apos;s price coefficient is fit on observational data under the
+    existing pricing policy &mdash; it conflates demand-driven price moves with policy
+    responses. Calling it &ldquo;elasticity&rdquo; is shorthand the optimizer team uses; we
+    keep it for tooling compatibility but added a clarification in <code>metrics.json</code>
+    and a full discussion in <a href="alt-models-bakeoff.html#layer-2">alt-models-bakeoff.html#layer-2</a>.
+    The base-price optimizer should consume a separately-estimated causal elasticity
+    (Double ML / DeepIV / hierarchical Bayes), not the XReg coefficient.
+  </p>
+
+  <h2>21. Single forecast model vs four-model stack</h2>
+  <p><strong>Chose:</strong> foundation model (TimesFM) for forecast layer; defer elasticity / base-price / competitor reaction to other model classes owned by other teams.<br><strong>Rejected:</strong> one big RL policy that spans all four layers.</p>
+  <p>
+    Four reasons. (1) Auditability &mdash; legal and revenue management need to explain
+    strategic prices, not show an RL policy and shrug. (2) Antitrust &mdash; layer-specific
+    reviews are easier than one giant policy. (3) Training-data sparsity at the
+    strategic horizon &mdash; bandits learn fast on per-request, slow on weekly anchor
+    decisions. (4) Bot exploration cost &mdash; bandits explore into bad prices; OK at the
+    per-request layer, not OK at the strategic anchor. Each layer&apos;s right tool is in
+    <a href="alt-models-bakeoff.html">alt-models-bakeoff.html</a>.
+  </p>
+
   <h2>The decision framework I used</h2>
   <p>
-    Every one of these 18 decisions ran through the same three questions. They&apos;re worth
+    Every one of these 21 decisions ran through the same three questions. They&apos;re worth
     writing down because they&apos;re portable to any ML project:
   </p>
   <ol>

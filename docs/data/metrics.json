@@ -52,6 +52,7 @@
     "cabin_simulation": 4
   },
   "_routes_comment": "128 OD-pairs across 20 route families. Each row: origin-destination, family, region (D=domestic, I=international), zero-shot MAPE, XReg-head MAPE, LoRA MAPE, q80 PI coverage post-LoRA, daily fare median (USD), annual revenue baseline (USD M), incremental annual revenue lift (USD M), elasticity coefficient. Numbers illustrative.",
+  "_xreg_coef_clarification": "The 'elast' field on each route is the XReg head's price coefficient (regression on observational data under existing AA pricing policy). It is a PREDICTIVE coefficient, NOT a causal elasticity - it conflates demand-driven price moves with policy responses. The base-price optimizer should consume a separately-estimated causal elasticity from the OR team's panel-data model (LightGBM+RE / hierarchical Bayes / Double ML / DeepIV). See pages/alt-models-bakeoff.html for the model bake-off.",
   "routes": [
     {"od":"DFW-LAX","family":"Transcon Hub","region":"D","mape_zs":10.6,"mape_head":5.7,"mape_lora":4.2,"cov":80.1,"fare":312,"rev_base_m":182,"rev_lift_m":1.92,"elast":0.92},
     {"od":"DFW-JFK","family":"Transcon Hub","region":"D","mape_zs":10.4,"mape_head":5.6,"mape_lora":4.1,"cov":80.4,"fare":348,"rev_base_m":167,"rev_lift_m":1.81,"elast":0.88},
@@ -282,5 +283,44 @@
     "domestic": { "mape_drop_pct": 57.1, "rmse_drop_pct": 38.5, "pinball_q90_drop_pct": 31.2, "crps_drop_pct": 33.6, "ece_drop_pct": 42.0 },
     "international_short": { "mape_drop_pct": 58.6, "rmse_drop_pct": 41.0, "pinball_q90_drop_pct": 33.5, "crps_drop_pct": 35.4, "ece_drop_pct": 39.8 },
     "international_long": { "mape_drop_pct": 59.1, "rmse_drop_pct": 35.8, "pinball_q90_drop_pct": 27.4, "crps_drop_pct": 29.1, "ece_drop_pct": 36.2 }
-  }
+  },
+  "stack_layers": [
+    {
+      "layer": 1,
+      "name": "Forecast",
+      "model": "TimesFM 2.5 + XReg head + per-family LoRA",
+      "model_options": ["TimesFM 2.5", "Chronos-Bolt", "TFT (mature panels only)", "TiDE", "Moirai-MoE"],
+      "output": "q10/q50/q90 daily fare, 30-day horizon, per OD-pair, per cabin",
+      "owner": "Applied Science",
+      "cadence": "nightly + on-demand",
+      "page": "pages/model-choice.html"
+    },
+    {
+      "layer": 2,
+      "name": "Elasticity",
+      "model_options": ["LightGBM+RE (GPBoost)", "Hierarchical Bayes (Stan/PyMC)", "Double ML", "DeepIV", "Causal Forests", "MERF"],
+      "output": "dE[demand]/dPrice + cross-elasticities, per (route family, cabin, days-to-departure, segment)",
+      "owner": "Operations Research",
+      "cadence": "weekly",
+      "page": "pages/alt-models-bakeoff.html#layer-2"
+    },
+    {
+      "layer": 3,
+      "name": "Base-price optimizer",
+      "model_options": ["MIP with elasticity-grid linearization", "Bayesian optimization", "Simulation-based grid search"],
+      "output": "anchor_fare, fare_ladder[], floor, ceiling, per (OD, cabin, season)",
+      "owner": "Pricing Strategy",
+      "cadence": "weekly to monthly",
+      "page": "pages/alt-models-bakeoff.html#layer-3"
+    },
+    {
+      "layer": 4,
+      "name": "Dynamic-pricing bot",
+      "model_options": ["Contextual bandits (Thompson sampling)", "Rules engine", "Lightweight elasticity-step lookup"],
+      "output": "per-request fare = base * f(load, days-to-departure, competitor, channel)",
+      "owner": "Pricing Tech",
+      "cadence": "per-request, milliseconds",
+      "page": "pages/base-price-strategy.html"
+    }
+  ]
 }
