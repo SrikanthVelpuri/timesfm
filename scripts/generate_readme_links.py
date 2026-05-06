@@ -6,9 +6,14 @@ For each HTML page in docs/pages/, extracts the <title> tag (with
 content. Groups pages by category and replaces the block between
 the AA-PORTFOLIO-PAGES markers in README.md.
 
+Links are emitted as absolute GitHub Pages URLs so they're clickable from
+the README on github.com. The base URL can be overridden via the
+PORTFOLIO_BASE_URL env var (e.g. for a different fork or a custom domain).
+
 Usage:
     python3 scripts/generate_readme_links.py            # rewrite README in place
     python3 scripts/generate_readme_links.py --check    # exit non-zero if stale
+    PORTFOLIO_BASE_URL=https://example.com/ python3 scripts/generate_readme_links.py
 
 CI: .github/workflows/sync-readme-pages.yml runs this on push to master
 and auto-commits the result.
@@ -16,6 +21,7 @@ and auto-commits the result.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -23,6 +29,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PAGES_DIR = ROOT / "docs" / "pages"
 README = ROOT / "README.md"
+
+# Default base URL of the deployed GitHub Pages site. Override with
+# PORTFOLIO_BASE_URL=... at script invocation time.
+DEFAULT_BASE_URL = "https://srikanthvelpuri.github.io/timesfm/"
 
 MARK_START = "<!-- AA-PORTFOLIO-PAGES:START -->"
 MARK_END = "<!-- AA-PORTFOLIO-PAGES:END -->"
@@ -148,7 +158,11 @@ def collect_pages() -> dict[str, tuple[str, str]]:
     return pages
 
 
-def render_section(pages: dict[str, tuple[str, str]]) -> str:
+def page_url(base_url: str, fname: str) -> str:
+    return f"{base_url.rstrip('/')}/pages/{fname}.html"
+
+
+def render_section(pages: dict[str, tuple[str, str]], base_url: str) -> str:
     lines: list[str] = []
     lines.append("")
     lines.append(
@@ -159,8 +173,8 @@ def render_section(pages: dict[str, tuple[str, str]]) -> str:
     )
     lines.append("")
     lines.append(
-        f"**Entry point:** [`docs/index.html`](docs/index.html) — "
-        f"{len(pages)} pages."
+        f"**Entry point:** [{base_url}]({base_url}) — {len(pages)} pages "
+        f"deployed on GitHub Pages."
     )
     lines.append("")
     seen: set[str] = set()
@@ -172,7 +186,7 @@ def render_section(pages: dict[str, tuple[str, str]]) -> str:
         lines.append("")
         for fname, (title, desc) in cat_pages:
             seen.add(fname)
-            link = f"docs/pages/{fname}.html"
+            link = page_url(base_url, fname)
             if desc:
                 lines.append(f"- **[{title}]({link})** — {desc}")
             else:
@@ -184,7 +198,7 @@ def render_section(pages: dict[str, tuple[str, str]]) -> str:
         lines.append("")
         for fname in other:
             title, desc = pages[fname]
-            link = f"docs/pages/{fname}.html"
+            link = page_url(base_url, fname)
             if desc:
                 lines.append(f"- **[{title}]({link})** — {desc}")
             else:
@@ -225,12 +239,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Exit non-zero if README would change; do not write.",
     )
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get("PORTFOLIO_BASE_URL", DEFAULT_BASE_URL),
+        help=(
+            "Base URL of the deployed GitHub Pages site "
+            f"(default: env PORTFOLIO_BASE_URL or {DEFAULT_BASE_URL})."
+        ),
+    )
     args = parser.parse_args(argv)
     pages = collect_pages()
     if not pages:
         print("ERROR: no pages found in docs/pages/.", file=sys.stderr)
         return 2
-    section = render_section(pages)
+    section = render_section(pages, args.base_url)
     return update_readme(section, check=args.check)
 
 
