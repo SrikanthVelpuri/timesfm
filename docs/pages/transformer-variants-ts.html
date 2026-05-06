@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Transformer Variants for TS &middot; AA Pricing Forecast</title>
+<meta name="description" content="Architecture deep-dive of transformer variants for time-series forecasting: Vanilla Transformer, Informer (ProbSparse), Autoformer (decomposition + autocorrelation), FEDformer (Fourier), PatchTST (patching + channel-independence), Crossformer (two-stage), iTransformer (variate-token), with tradeoffs at scale." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Architectures</a> &nbsp;/&nbsp; <span>Transformer variants for TS</span>
+  </nav>
+
+  <h1>Transformer variants for TS &mdash; what each variant solves</h1>
+  <p class="lead">
+    Before foundation models, the field spent four years inventing
+    transformer variants specialised for time series. The variants are
+    still useful: they are the right pick when you have one panel,
+    abundant history, and you want a small model fit per dataset.
+    This page is the architectural deep-dive of the seven variants you
+    will actually be asked about: Vanilla Transformer, Informer,
+    Autoformer, FEDformer, PatchTST, Crossformer, iTransformer.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Three structural problems that vanilla
+    transformers had on TS: (1) quadratic attention, (2) no signal
+    decomposition, (3) per-timestep token wastes capacity on noisy
+    multivariate channels. Each variant fixes one or more.
+    <em>Informer</em> tackles attention complexity (ProbSparse).
+    <em>Autoformer</em> tackles decomposition (trend / seasonal +
+    autocorrelation attention). <em>FEDformer</em> moves attention into
+    the frequency domain. <em>PatchTST</em> tokenises by patches and
+    forecasts each variate independently. <em>Crossformer</em> attends
+    twice: cross-time then cross-variate. <em>iTransformer</em> inverts
+    the token axis &mdash; each variate is a token. For our 100+
+    cold-start panel, foundation models still win; for 1&ndash;10
+    well-known panels with deep history, PatchTST or iTransformer wins.
+  </div>
+
+  <h2>The three structural problems vanilla transformers had on TS</h2>
+  <ol>
+    <li><strong>O(L<sup>2</sup>) attention.</strong> Long-context TS (3+ years of daily data is L = 1095) blows past quadratic attention.</li>
+    <li><strong>No native decomposition.</strong> TS naturally decomposes into trend + seasonal + residual; vanilla attention has no inductive bias for this.</li>
+    <li><strong>One-token-per-timestep is wasteful.</strong> A token represents one timestep across all channels; capacity goes to noise more than signal, and channel correlations get baked into a single embedding.</li>
+  </ol>
+
+  <h2>1 &middot; Vanilla Transformer (the baseline)</h2>
+  <p>
+    Self-attention over per-timestep tokens. Add learned absolute or
+    sinusoidal positional encoding. Output is decoded autoregressively
+    or with a parallel decoder. Almost nobody uses this on TS in 2026,
+    because every variant below beats it on cost and accuracy for
+    real benchmarks &mdash; but it&apos;s the reference architecture
+    against which the variants are measured.
+  </p>
+
+<pre><code>x[1..L]      raw multivariate series (L timesteps, D channels)
+   |
+   v   per-timestep linear embed
+tokens[1..L, d_model]    (one token per timestep)
+   |
+   v   transformer encoder x N (full L*L attention)
+hidden[1..L, d_model]
+   |
+   v   linear head
+y_hat[L+1..L+H, D]
+</code></pre>
+  <ul>
+    <li><strong>Strengths</strong>: simple, well-understood, transfers from NLP literature.</li>
+    <li><strong>Weaknesses</strong>: O(L<sup>2</sup>) attention; noise saturates per-timestep tokens; no decomposition.</li>
+    <li><strong>When to pick</strong>: never, in 2026, for production TS. Useful as a research baseline.</li>
+  </ul>
+
+  <h2>2 &middot; Informer (Zhou et al. 2021)</h2>
+  <p>
+    The first transformer variant that actually shipped on long-horizon TS
+    benchmarks. Introduced <em>ProbSparse self-attention</em>: instead of
+    computing all L<sup>2</sup> attention scores, sample a small subset of
+    queries based on their KL-divergence-from-uniform &mdash; queries that
+    are &ldquo;less informative&rdquo; (closer to uniform) get dropped from
+    the attention computation. Net cost is O(L log L).
+  </p>
+  <p>
+    Also introduced <em>generative-style decoder</em>: instead of
+    autoregressive decoding, give the decoder a placeholder zero-padded
+    target and let it produce the whole horizon in one pass.
+  </p>
+
+<pre><code>Encoder: stack of (ProbSparse-attention + distilling conv layer) blocks.
+         Distilling conv halves the sequence length each layer.
+Decoder: one masked ProbSparse attention + cross-attention.
+         Output the full horizon in one shot.
+Complexity: O(L log L) attention.
+</code></pre>
+  <ul>
+    <li><strong>Strengths</strong>: sub-quadratic attention; one-shot decoder is fast.</li>
+    <li><strong>Weaknesses</strong>: KL-based query sampling is a heuristic; loses signal on uniformly important contexts; later papers (PatchTST) showed simpler patching beats ProbSparse.</li>
+    <li><strong>When to pick</strong>: extremely long horizons (H &gt; 720), one panel, low compute budget. Largely superseded.</li>
+  </ul>
+
+  <h2>3 &middot; Autoformer (Wu et al. 2021)</h2>
+  <p>
+    Two architectural ideas. First, <em>series decomposition</em> as an
+    inductive bias: a moving-average filter splits each input into trend
+    + seasonal components <em>inside</em> the encoder/decoder stack at
+    every layer. The model learns each component separately and recombines
+    at the end.
+  </p>
+  <p>
+    Second, <em>autocorrelation attention</em> replaces dot-product
+    attention. Compute the autocorrelation function of the series in the
+    frequency domain (FFT), find the top-k lags by autocorrelation,
+    and aggregate via these lags. Captures period-level dependencies
+    directly.
+  </p>
+
+<pre><code>For each layer:
+  trend_t, seasonal_t = decompose(input)         # moving-average split
+  trend_t  -&gt; passthrough trend stack
+  seasonal_t -&gt; auto-correlation-attention block
+output: trend + seasonal recombined.
+Auto-correlation attention:
+  R = FFT-based autocorrelation of Q and K
+  pick top-k lags
+  aggregate values by rolling them by those lags and weighting by R
+Complexity: O(L log L)
+</code></pre>
+  <ul>
+    <li><strong>Strengths</strong>: decomposition as inductive bias is a real win on strongly seasonal series; autocorrelation captures period-aware structure.</li>
+    <li><strong>Weaknesses</strong>: top-k autocorrelation is a heuristic; loses to PatchTST on benchmarks where seasonality is irregular.</li>
+    <li><strong>When to pick</strong>: textbook seasonal series (utility load, retail, weather) with clean periodicity.</li>
+  </ul>
+
+  <h2>4 &middot; FEDformer (Zhou et al. 2022)</h2>
+  <p>
+    Push attention further into the frequency domain. <em>Frequency-Enhanced
+    Decomposition</em>: each token sequence is mapped via FFT, attention is
+    applied in frequency space on a small subset of frequencies (low or
+    randomly sampled), then mapped back. The intuition: most TS signals are
+    sparse in the frequency domain &mdash; a few dominant frequencies carry
+    most of the predictable energy.
+  </p>
+
+<pre><code>For each layer:
+  trend_t, seasonal_t = decompose(input)
+  seasonal_t -&gt; FFT
+  attention applied on a random or low-frequency subset
+  inverse FFT
+  recombine with trend
+Complexity: O(L) when frequency subset is fixed-size.
+</code></pre>
+  <ul>
+    <li><strong>Strengths</strong>: O(L) attention on the frequency subset; clean for periodic-dominated signals.</li>
+    <li><strong>Weaknesses</strong>: random-frequency-subset attention is a strong prior &mdash; if your signal has a non-stationary spectrum (regime shift, holiday-driven mixing), you lose; later variants (PatchTST) match or beat it without the FFT machinery.</li>
+    <li><strong>When to pick</strong>: explicit frequency-domain knowledge (seasonal load, audio, vibration). Niche for airline pricing.</li>
+  </ul>
+
+  <h2>5 &middot; PatchTST (Nie et al. 2023)</h2>
+  <p>
+    Did two surprisingly effective things and beat all the previous
+    fancy variants. First, <em>patch tokens</em>: group every 16 timepoints
+    into a token. Sequence length L = 720 becomes ~45 tokens; quadratic
+    attention is now affordable. (TimesFM reused this trick.) Second,
+    <em>channel independence</em>: forecast each variate using the same
+    transformer weights but on its own forward pass. The model never sees
+    other variates&apos; values.
+  </p>
+
+<pre><code>Per channel, independently:
+  x_c[1..L] -&gt; patches of length 16 -&gt; embed -&gt; transformer -&gt; head -&gt; y_c[L+1..L+H]
+All channels share the same transformer weights.
+Complexity: O((L/16)^2) attention per channel.
+</code></pre>
+  <ul>
+    <li><strong>Strengths</strong>: empirically beats Autoformer / FEDformer on standard TS benchmarks; channel independence is more robust under spurious correlation; trivial to fine-tune.</li>
+    <li><strong>Weaknesses</strong>: doesn&apos;t exploit cross-channel signal at all; if your variates are densely correlated (energy + temperature) you leave information on the table.</li>
+    <li><strong>When to pick</strong>: ETS-like univariate or weakly-coupled multivariate; one panel, deep history. <em>Also: it&apos;s the baseline TimesFM, Chronos-Bolt, and Moirai-MoE all beat or match.</em></li>
+  </ul>
+
+  <h2>6 &middot; Crossformer (Zhang &amp; Yan 2023)</h2>
+  <p>
+    The opposite philosophy from PatchTST: explicitly model both
+    cross-time and cross-variate dependencies. Two attention stages:
+    cross-time attention within each variate (like PatchTST), then
+    cross-variate attention across variates at each time-patch position.
+    A learned router module decides how much of each.
+  </p>
+
+<pre><code>Per layer:
+  Stage 1 (cross-time):    attention over patches within each variate
+  Stage 2 (cross-variate): attention over variates within each patch position
+Complexity: O((L/p)^2 + D^2) per layer for L sequence, D variates.
+</code></pre>
+  <ul>
+    <li><strong>Strengths</strong>: captures dense cross-variate signal that PatchTST loses; competitive when correlations are real.</li>
+    <li><strong>Weaknesses</strong>: more parameters; D<sup>2</sup> cross-variate attention scales poorly with channel count; in low-data regimes the cross-variate attention overfits.</li>
+    <li><strong>When to pick</strong>: dense multivariate (energy + weather + occupancy), &lt; 50 channels, deep history.</li>
+  </ul>
+
+  <h2>7 &middot; iTransformer (Liu et al. 2024)</h2>
+  <p>
+    Inverts the token axis. Where every previous variant had one
+    token-per-timestep (or per-patch), iTransformer has one token-per-variate.
+    Each variate&apos;s entire history becomes a single embedded vector;
+    attention is applied across variates. Feed-forward network operates
+    per-variate-token to learn variate-specific non-linearities.
+  </p>
+
+<pre><code>For one forward pass:
+  x[1..L, 1..D] (L timesteps, D variates)
+  -&gt; embed each variate as a token: tokens[1..D, d_model]
+  -&gt; transformer attends over the D variate tokens
+  -&gt; per-variate FFN
+  -&gt; per-variate forecast head
+Complexity: O(D^2) attention; L is hidden inside the embedding step.
+</code></pre>
+  <ul>
+    <li><strong>Strengths</strong>: empirically the best transformer on multivariate benchmarks (ICLR 2024 Spotlight). Lookback length L is decoupled from attention cost; longer lookbacks &ldquo;just work.&rdquo;</li>
+    <li><strong>Weaknesses</strong>: scales as O(D<sup>2</sup>); hits a wall around D = 100 variates; per-variate forecast head means cold-start variates are unlearnable.</li>
+    <li><strong>When to pick</strong>: small-D multivariate (D &le; 50), deep lookback (L = years), one panel. <em>Strong for an energy/weather/finance shop with 5&ndash;50 variates.</em></li>
+  </ul>
+
+  <h2>Architecture comparison matrix</h2>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Attention complexity</th>
+        <th>Token unit</th>
+        <th>Decomposition</th>
+        <th>Channel handling</th>
+        <th>Deal-breaker</th>
+        <th>When it wins</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Vanilla Transformer</td>
+        <td>O(L<sup>2</sup>)</td>
+        <td>Per-timestep</td>
+        <td>None</td>
+        <td>Joint embed</td>
+        <td>Cost on long L</td>
+        <td>Never (in 2026)</td>
+      </tr>
+      <tr>
+        <td>Informer (2021)</td>
+        <td>O(L log L)</td>
+        <td>Per-timestep</td>
+        <td>None</td>
+        <td>Joint embed</td>
+        <td>ProbSparse heuristic</td>
+        <td>Very long horizon, one panel</td>
+      </tr>
+      <tr>
+        <td>Autoformer (2021)</td>
+        <td>O(L log L)</td>
+        <td>Per-timestep</td>
+        <td>Trend + seasonal at every layer</td>
+        <td>Joint embed</td>
+        <td>Top-k lag heuristic</td>
+        <td>Strongly seasonal series</td>
+      </tr>
+      <tr>
+        <td>FEDformer (2022)</td>
+        <td>O(L)</td>
+        <td>Per-timestep</td>
+        <td>FFT-domain</td>
+        <td>Joint embed</td>
+        <td>Random-frequency prior</td>
+        <td>Frequency-dominated signals</td>
+      </tr>
+      <tr class="row-chosen">
+        <td>PatchTST (2023)</td>
+        <td>O((L/p)<sup>2</sup>) per channel</td>
+        <td>Per-patch</td>
+        <td>None</td>
+        <td>Channel-independent</td>
+        <td>Loses cross-channel signal</td>
+        <td>Univariate or weakly-coupled, deep history</td>
+      </tr>
+      <tr>
+        <td>Crossformer (2023)</td>
+        <td>O((L/p)<sup>2</sup> + D<sup>2</sup>)</td>
+        <td>Per-patch + per-variate</td>
+        <td>None</td>
+        <td>Cross-variate explicit</td>
+        <td>D<sup>2</sup> scaling on many channels</td>
+        <td>Dense multivariate, &lt; 50 channels</td>
+      </tr>
+      <tr>
+        <td>iTransformer (2024)</td>
+        <td>O(D<sup>2</sup>)</td>
+        <td>Per-variate</td>
+        <td>None</td>
+        <td>Variate-as-token</td>
+        <td>Cold-start variates unlearnable</td>
+        <td>Small-D multivariate, long lookback</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>How they evolved &mdash; the four-year arc</h2>
+<pre><code>2017  Vanilla Transformer. Quadratic attention is a problem.
+                |
+                v
+2021  Informer.  Sub-quadratic via ProbSparse.    [solves cost]
+                |
+                v
+2021  Autoformer. Decomposition + autocorrelation. [solves inductive bias]
+                |
+                v
+2022  FEDformer. Frequency-domain attention.       [pushes inductive bias further]
+                |
+                v
+2023  PatchTST.  Just patch and channel-independent. Beats all the fancy variants.
+                |                                  [reframes the problem]
+                v
+2023  Crossformer. Two-stage attention. Multivariate cross-channel matters.
+                |
+                v
+2024  iTransformer. Variate-as-token. Decouple lookback from attention.
+
+Meanwhile, in parallel:
+2024  TimesFM, Chronos, Moirai &mdash; foundation TS. Make pretraining the fix,
+       not architecture.
+</code></pre>
+
+  <p>
+    The arc: every architectural variant solved one problem; foundation
+    models solved the meta-problem (cross-domain transfer) by scaling
+    pretraining. The variants are still the right answer when you
+    can&apos;t pretrain, when you have one panel with deep history,
+    or when audit requires a fully owned model.
+  </p>
+
+  <h2>Tradeoffs at AA&apos;s scale</h2>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Decision</th><th>Cost</th><th>Benefit</th><th>What we accepted</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Foundation TS (TimesFM) over PatchTST</td>
+          <td>Frozen 200 M trunk; opaque pretraining corpus</td>
+          <td>Cold-start works on day 1; cross-route transfer is free</td>
+          <td>Audit overhead: SBOM + signed model card</td>
+        </tr>
+        <tr>
+          <td>Channel-independent (TimesFM, PatchTST style)</td>
+          <td>Lose dense cross-route signal</td>
+          <td>One model, one inference path; robust under spurious correlation</td>
+          <td>Cross-route signal is recovered through the family LoRA, not joint attention</td>
+        </tr>
+        <tr>
+          <td>Patching (vs per-timestep tokens)</td>
+          <td>Sub-patch resolution lost (single-day spikes averaged)</td>
+          <td>O((L/p)<sup>2</sup>) attention; long context affordable</td>
+          <td>The XReg head separately ingests dynamic covariates that need spike-level resolution</td>
+        </tr>
+        <tr>
+          <td>Decoder-only (TimesFM) over encoder-only (iTransformer)</td>
+          <td>Slightly worse on horizon-1 point forecasts</td>
+          <td>Variable horizon; KV cache; same architecture from 1 to 1024 steps</td>
+          <td>SLA is 30-day; horizon-1 isn&apos;t the eval target</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>If we couldn&apos;t use a foundation model, what would we use?</h2>
+  <ol>
+    <li><strong>Domestic mature panel</strong> (~80 routes, 5+ years history): <strong>PatchTST</strong> per family. ~5.6% MAPE on the mature subset, ~0.5 pp worse than TimesFM but $0 in pretraining cost.</li>
+    <li><strong>International dense-multivariate</strong> (route + competitor + currency + weather): <strong>iTransformer</strong>. Lookback can be 5+ years without attention cost.</li>
+    <li><strong>Cold-start subset</strong> (28% of routes, &lt; 90 days): <strong>nothing transformer-based works.</strong> Fall back to Prophet or a per-family hierarchical Bayes.</li>
+    <li><strong>Strongly seasonal demand</strong> (e.g. holiday-driven leisure routes): <strong>Autoformer</strong>. Decomposition inductive bias helps when seasonality is the dominant signal.</li>
+  </ol>
+
+  <p>
+    This is the alternative-architecture playbook the team would run if AA
+    decided to fully own the model. Cost: ~6 months of engineering, $400k
+    in compute, and we&apos;d still lose on cold-start. We chose to use a
+    foundation model for the same reasons most teams do.
+  </p>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; transformer variants</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Why did PatchTST beat Autoformer and FEDformer?</div>
+        <div class="a">Two reasons. (1) Patching turned out to be a better attention reduction than ProbSparse / autocorrelation / FFT &mdash; it&apos;s simpler, makes the attention budget predictable, and lets the model learn its own decomposition rather than imposing one. (2) Channel-independence was robust under spurious correlation, which the joint-channel embeddings of earlier variants suffered from.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If patching is the win, why is iTransformer better than PatchTST on multivariate benchmarks?</div>
+        <div class="a">Because patching forces a tradeoff between lookback length and attention cost. iTransformer breaks that tradeoff: lookback length is hidden inside the per-variate embedding, attention is purely across variates. So with D = 20 variates and L = 5 years of daily data, attention cost is O(20<sup>2</sup>) regardless of L. That&apos;s a real advantage for finance / energy / weather panels with deep history.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When is iTransformer wrong?</div>
+        <div class="a">When D is large (D &gt; 100) the D<sup>2</sup> attention falls apart. When variates are weakly coupled, the cross-variate attention overfits to noise. And when you have cold-start variates, the per-variate forecast head is unlearnable &mdash; iTransformer needs every variate to have history.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through Autoformer&apos;s autocorrelation attention.</div>
+        <div class="a">Compute the autocorrelation of Q and K via FFT &mdash; this is fast (O(L log L)). Pick the top-k lags by autocorrelation strength; these are the &ldquo;periods&rdquo; the model attends to. Aggregate values by rolling them by those lags, weighted by autocorrelation. The intuition: classical TS uses ACF to find seasonality; Autoformer makes that the attention pattern. Powerful when seasonality is clean; less so when it&apos;s irregular.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why doesn&apos;t FEDformer crush every benchmark, given how parameter-efficient it is?</div>
+        <div class="a">Two reasons. (1) The random-frequency-subset attention is a strong prior; when the signal has a non-stationary spectrum (regime shift, holiday mixing), you systematically lose. (2) On benchmarks dominated by trend or sudden events rather than periodic structure, FFT attention has nothing to attend to. PatchTST&apos;s &ldquo;learn your own patterns from patches&rdquo; turned out to be more robust.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How does Informer&apos;s ProbSparse attention compare to standard sparse attention?</div>
+        <div class="a">Standard sparse attention drops fixed slots (Reformer LSH, Longformer windowed). ProbSparse drops queries based on KL-divergence-from-uniform &mdash; queries that are spread evenly across keys (close to uniform attention) get dropped, on the theory that they&apos;re uninformative. It&apos;s a heuristic; later work showed it&apos;s no better than uniform sparse attention plus more layers.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why isn&apos;t Crossformer the obvious answer for AA pricing if we have route + competitor + fuel + holiday channels?</div>
+        <div class="a">Three reasons. (1) Many of those channels are static (fuel hedge price, holiday flag) &mdash; they don&apos;t need cross-time attention. (2) The AA-confidential cross-route signal is captured by the LoRA family adapter, not by joint attention. (3) Cross-variate D<sup>2</sup> attention in Crossformer overfits when channel correlations are noisy or non-stationary, which our competitor-fare signal is.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If you had to ship without foundation models, which variant would you pick?</div>
+        <div class="a">PatchTST per route family. ~5.6% MAPE on our mature subset (vs 5.1% for TimesFM), &lt; $1k/route family pretraining, channel-independence is robust, the eval harness is straightforward. The 0.5 pp gap is acceptable; the 28% cold-start population is the unsolvable problem &mdash; for that we&apos;d fall back to Prophet or a hierarchical Bayes.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why did the field go from variant-explosion to foundation models?</div>
+        <div class="a">Each variant added an inductive bias to fix one problem. Foundation models removed the need for inductive bias by scaling pretraining: with 2 T tokens of diverse TS, the model learned its own decomposition, autocorrelation, and frequency structure. The variants are still useful when you can&apos;t pretrain (private data, audit, edge), but for cross-domain transfer, pretraining beat architectural cleverness.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What would you build if you had to do TS on a new domain tomorrow?</div>
+        <div class="a">Step 1: try TimesFM zero-shot. Cheap baseline. Step 2: if cold-start is &gt; 20% of the panel, stay with TimesFM + LoRA family adapters. Step 3: if you have one fixed panel with 5+ years of history and no cold-start, switch to PatchTST per panel &mdash; cheaper, owned-model audit story, &lt; 1 pp accuracy gap. Step 4: if that panel is small-D multivariate (D &le; 50) with dense correlations, switch to iTransformer instead. The decision tree is pretty stable.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <h2>Sources</h2>
+  <ul>
+    <li>Zhou, H. et al. (2021). <em>Informer: Beyond Efficient Transformer for Long Sequence Time-Series Forecasting.</em> AAAI.</li>
+    <li>Wu, H. et al. (2021). <em>Autoformer: Decomposition Transformers with Auto-Correlation for Long-Term Series Forecasting.</em> NeurIPS.</li>
+    <li>Zhou, T. et al. (2022). <em>FEDformer: Frequency Enhanced Decomposed Transformer for Long-term Series Forecasting.</em> ICML.</li>
+    <li>Nie, Y., Nguyen, N.H., Sinthong, P., Kalagnanam, J. (2023). <em>A Time Series is Worth 64 Words: Long-term Forecasting with Transformers (PatchTST).</em> ICLR.</li>
+    <li>Zhang, Y., Yan, J. (2023). <em>Crossformer: Transformer Utilizing Cross-Dimension Dependency for Multivariate Time Series Forecasting.</em> ICLR.</li>
+    <li>Liu, Y. et al. (2024). <em>iTransformer: Inverted Transformers Are Effective for Time Series Forecasting.</em> ICLR Spotlight.</li>
+  </ul>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="foundation-ts-survey.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Foundation TS models survey</div>
+    </a>
+    <a class="page-nav-item next" href="peft-deepdive.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">PEFT methods deep-dive</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>
