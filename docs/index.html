@@ -130,7 +130,7 @@
 
   <h2 id="decisions">Deep-dive pages &mdash; design decisions</h2>
   <p>
-    Nine interview-prep pages on the major design decisions behind the project. Each
+    Eleven interview-prep pages on the major design decisions behind the project. Each
     page has a TL;DR, a decision matrix, code samples where relevant, trade-offs, and
     an interview Q&amp;A section.
   </p>
@@ -139,6 +139,16 @@
       <span class="tag" style="background: rgba(245,158,11,0.18); color: #b45309;">Suitability</span>
       <h3 style="color: #b45309;">When to use TimesFM &mdash; batch vs real-time, temporal vs cross-sectional</h3>
       <p>Suitability checklist, pipeline patterns, and three concrete use cases: setting pricing 14 days ahead, detecting demand shifts in real time and re-optimizing, predicting competitor pricing movements (with antitrust separation).</p>
+    </a>
+    <a class="page-index-card decision" href="pages/base-price-strategy.html" style="border-left-color: #6b21a8;">
+      <span class="tag" style="background: rgba(168,85,247,0.18); color: #6b21a8;">Strategy</span>
+      <h3 style="color: #6b21a8;">Base price as a strategic layer &mdash; where TimesFM stops and the bot begins</h3>
+      <p>The four-layer pricing stack: forecast (TimesFM) &rarr; elasticity (GBM/Bayes) &rarr; base price (MIP/Bayesian opt) &rarr; dynamic bot (bandits). Why base price matters more, not less, when bots run the dynamic loop. JSON contracts between layers, antitrust separation, partial-pooling decisions per layer.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/alt-models-bakeoff.html" style="border-left-color: var(--accent-cyan);">
+      <span class="tag" style="background: rgba(14,116,144,0.18); color: var(--accent-cyan);">Alt models</span>
+      <h3 style="color: var(--accent-cyan);">Alt-models bake-off &mdash; elasticity, base-price, competitor reaction</h3>
+      <p>Honest model comparison for the layers TimesFM does NOT solve: TFT/TiDE/Chronos-Bolt as forecast alternatives; LightGBM+RE / hierarchical Bayes / Double ML / DeepIV / GPBoost for elasticity; Bayesian opt / contextual bandits for base-price; multi-agent / inverse optimization for competitor. With citations.</p>
     </a>
     <a class="page-index-card decision" href="pages/market-routes.html" style="border-left-color: var(--accent-green);">
       <span class="tag" style="background: rgba(34,197,94,0.15); color: #15803d;">Markets</span>

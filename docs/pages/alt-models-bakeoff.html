@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Alt-Models Bake-Off &middot; AA Pricing Forecast</title>
+<meta name="description" content="Honest model bake-off for the layers TimesFM does NOT solve: TFT/TiDE/Chronos-Bolt/N-HiTS/DeepAR for forecasting; LightGBM+RE / hierarchical Bayes / Double ML / DeepIV / GPBoost for elasticity; Bayesian opt / contextual bandits for base-price; multi-agent / inverse optimization for competitor reaction." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Alt-models bake-off</span>
+  </nav>
+
+  <h1>Alt-models bake-off &mdash; the layers around TimesFM</h1>
+  <p class="lead">
+    TimesFM is the right tool for the forecast layer. It is the wrong tool for elasticity
+    estimation, base-price optimization, and competitor reaction. This page is the honest
+    model bake-off for those three adjacent problems, plus a sanity check on whether a
+    different foundation model (TFT, TiDE, Chronos-Bolt, N-HiTS, DeepAR, PatchTST,
+    Moirai-MoE) would have beaten TimesFM at our footprint.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Forecasting layer: TimesFM still wins at 6,700 routes with 28%
+    cold-start; TFT/TiDE win at 100 mature routes. Elasticity layer: LightGBM with random
+    effects (GPBoost) is the workhorse; Double ML / DeepIV when you need causal
+    identification. Base-price layer: MIP + offline Bayesian-opt is the safe pick;
+    contextual bandits belong on the per-request bot, not on the strategic anchor.
+    Competitor layer: covariate approach is mis-specified; Stackelberg / inverse
+    optimization on the top-20 competitive ODs is the next research bet.
+  </div>
+
+  <h2 id="layer-1">Layer 1 &mdash; Forecasting alternatives if TimesFM hadn&apos;t existed</h2>
+  <div class="insight">
+    <strong>Why this table exists.</strong> TimesFM is still our pick. We include this
+    table because (a) interviewers always ask it, and (b) for a smaller footprint
+    (100 mature routes, no cold-start) the trade-off shifts. See <a href="model-choice.html">model-choice.html</a>
+    for the original 9-way bake-off; this is the deeper cut focused on the panel-of-100+
+    setting and citations.
+  </div>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Params</th>
+        <th>Native covariates</th>
+        <th>Calibrated quantiles</th>
+        <th>Cross-series transfer</th>
+        <th>Cold-start</th>
+        <th>Verdict for our footprint</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="row-chosen">
+        <td>TimesFM 2.5</td>
+        <td>200 M (frozen)</td>
+        <td>Via XReg head</td>
+        <td>10-quantile continuous head</td>
+        <td>Native (foundation)</td>
+        <td>Yes (zero-shot)</td>
+        <td>Chosen &mdash; 5.1% network MAPE, $7/quarter</td>
+      </tr>
+      <tr>
+        <td>Chronos-Bolt-Base</td>
+        <td>200 M (frozen)</td>
+        <td>Limited</td>
+        <td>Sample-based</td>
+        <td>Native</td>
+        <td>Yes</td>
+        <td>Runner-up &mdash; 5.9% MAPE, 12% slower</td>
+      </tr>
+      <tr>
+        <td>Temporal Fusion Transformer (Lim et al. 2021)</td>
+        <td>~5 M (per panel)</td>
+        <td>Best-in-class (variable selection)</td>
+        <td>Quantile loss native</td>
+        <td>Per-panel training</td>
+        <td>No</td>
+        <td>Wins at 100 mature routes; loses on cold-start</td>
+      </tr>
+      <tr>
+        <td>TiDE (Das et al. 2023)</td>
+        <td>~3 M</td>
+        <td>Yes</td>
+        <td>Quantile head optional</td>
+        <td>Per-panel training</td>
+        <td>No</td>
+        <td>Faster than TFT on long horizons; same cold-start gap</td>
+      </tr>
+      <tr>
+        <td>N-HiTS (Challu et al. 2023)</td>
+        <td>~2 M</td>
+        <td>Limited</td>
+        <td>Conformal post-hoc</td>
+        <td>Per-panel</td>
+        <td>No</td>
+        <td>Strong on long horizons; thin covariate API</td>
+      </tr>
+      <tr>
+        <td>DeepAR (Salinas et al. 2020)</td>
+        <td>~1 M</td>
+        <td>Yes</td>
+        <td>Sample-based</td>
+        <td>Cross-series via global model</td>
+        <td>Partial</td>
+        <td>Older but still solid; quantile calibration weaker</td>
+      </tr>
+      <tr>
+        <td>PatchTST (Nie et al. 2023)</td>
+        <td>~3 M</td>
+        <td>Limited</td>
+        <td>Conformal post-hoc</td>
+        <td>Per-panel</td>
+        <td>No</td>
+        <td>Strong univariate; weak with covariates</td>
+      </tr>
+      <tr>
+        <td>Moirai-MoE (Salesforce 2024)</td>
+        <td>~300 M (frozen)</td>
+        <td>Mixture-of-experts</td>
+        <td>Native</td>
+        <td>Native</td>
+        <td>Yes</td>
+        <td>Newer foundation TS; re-evaluate quarterly</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    For the 100-route panel specifically, TFT and TiDE are the closest competitors
+    if you don&apos;t have the foundation-model option. TFT learns interpretable variable
+    selection per series &mdash; valuable when a regulator wants to know which covariate
+    drove a forecast. TiDE is a pure encoder MLP that&apos;s faster than TFT on long
+    horizons. Both require per-panel training, so both lose decisively on cold-start
+    (28% of our 6,700 routes have &lt; 90 days of clean history). Cite: Lim et al.,
+    <em>International Journal of Forecasting</em>, 2021 for TFT; Das et al., arXiv
+    2304.08424 for TiDE.
+  </p>
+
+  <div class="callout">
+    If the problem were <em>just</em> 100 mature routes with 3+ years of clean history
+    and no cold-start, TFT or TiDE+covariates would be in serious contention. With
+    6,700 routes and 28% cold-start, TimesFM still wins.
+  </div>
+
+  <h2 id="layer-2">Layer 2 &mdash; Elasticity estimation (NOT a forecasting problem)</h2>
+  <p>
+    Elasticity is a <em>causal</em> parameter &mdash; the partial derivative of demand
+    with respect to price, holding everything else fixed. Forecasting models recover
+    <em>predictive</em> coefficients confounded with policy. This is a different problem
+    and needs a different toolbox.
+  </p>
+
+  <div class="insight">
+    <strong>Honesty edit.</strong> The XReg head&apos;s price coefficient is <em>not</em> a
+    causal elasticity. It is a regression coefficient on observational data fit under
+    the existing AA pricing policy &mdash; it picks up demand-driven price moves <em>and</em>
+    policy responses, conflated. We label it <code>elast</code> in <code>metrics.json</code>
+    for shorthand, but the base-price optimizer should consume a separately-estimated
+    causal elasticity (Double ML / DeepIV / hierarchical Bayes with an instrument). The
+    OR team owns this layer.
+  </div>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Non-linear price response</th>
+        <th>Confounding control</th>
+        <th>Partial pooling</th>
+        <th>Uncertainty</th>
+        <th>Cost @ 6,700 routes</th>
+        <th>Verdict</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="row-chosen">
+        <td>LightGBM / CatBoost + random effects (GPBoost, Sigrist 2022)</td>
+        <td>Native</td>
+        <td>Partial (covariate adjust)</td>
+        <td>Yes</td>
+        <td>Bootstrap / mixed-effects SE</td>
+        <td>Hours of CPU</td>
+        <td>Workhorse for predictive elasticity</td>
+      </tr>
+      <tr>
+        <td>Mixed-effects with route random slopes (lme4-style)</td>
+        <td>Linear-in-log only</td>
+        <td>Partial</td>
+        <td>Yes</td>
+        <td>Frequentist SE native</td>
+        <td>Minutes</td>
+        <td>Transparent, underfits non-linearity</td>
+      </tr>
+      <tr>
+        <td>Hierarchical Bayesian (Stan / PyMC / NumPyro)</td>
+        <td>If priors permit</td>
+        <td>Partial (DAG-aware)</td>
+        <td>Yes (gold standard)</td>
+        <td>Posterior-native</td>
+        <td>Days at full network</td>
+        <td>Best uncertainty story; expensive</td>
+      </tr>
+      <tr>
+        <td>Double ML (Chernozhukov et al. 2018)</td>
+        <td>Native (any ML on nuisance)</td>
+        <td>Yes (orthogonalisation)</td>
+        <td>Via clustering</td>
+        <td>Asymptotic SE</td>
+        <td>Hours</td>
+        <td>Right tool when price is endogenous</td>
+      </tr>
+      <tr>
+        <td>DeepIV (Hartford et al. 2017)</td>
+        <td>Native (deep nets)</td>
+        <td>Yes (instrument-based)</td>
+        <td>No (without extension)</td>
+        <td>Bootstrap</td>
+        <td>Hours of GPU</td>
+        <td>Needs credible instrument (fuel shock, FX shock)</td>
+      </tr>
+      <tr>
+        <td>Causal forests (Wager &amp; Athey 2018)</td>
+        <td>Native</td>
+        <td>Yes (under unconfoundedness)</td>
+        <td>Per-leaf shrinkage</td>
+        <td>Honest CIs</td>
+        <td>Hours</td>
+        <td>Best for per-OD heterogeneous elasticity</td>
+      </tr>
+      <tr>
+        <td>MERF (Hajjem et al. 2014)</td>
+        <td>Native</td>
+        <td>Partial</td>
+        <td>Yes</td>
+        <td>Bootstrap</td>
+        <td>Hours</td>
+        <td>Older than GPBoost; less actively maintained</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The honest stack: <strong>LightGBM + categorical features</strong> as the workhorse
+    for price-response prediction; <strong>GPBoost or hierarchical Bayes</strong> when
+    partial pooling matters (low-volume routes); <strong>Double ML or DeepIV</strong>
+    when you need <em>causal</em> elasticity for the optimizer. Most teams pick LightGBM
+    and call it &ldquo;elasticity&rdquo;; it isn&apos;t, unless you control for confounding.
+    Be honest about which model is doing what.
+  </p>
+
+  <h2 id="layer-3">Layer 3 &mdash; Base-price optimization</h2>
+  <p>
+    Once you have a forecast distribution and an elasticity, the optimizer chooses a base
+    price that maximises expected revenue subject to constraints (floor, ceiling, ladder
+    smoothness, fare-class minima, brand-positioning rules).
+  </p>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Handles constraints</th>
+        <th>Exploration cost</th>
+        <th>Auditability</th>
+        <th>Sample efficiency</th>
+        <th>Requires simulator</th>
+        <th>Verdict</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="row-chosen">
+        <td>MIP with elasticity-grid linearisation</td>
+        <td>Yes (native)</td>
+        <td>Zero (offline)</td>
+        <td>High</td>
+        <td>N/A (deterministic)</td>
+        <td>No</td>
+        <td>Status quo + safe pick for AA compliance</td>
+      </tr>
+      <tr>
+        <td>Bayesian optimization (Frazier 2018)</td>
+        <td>Via constraint penalty</td>
+        <td>Low</td>
+        <td>High</td>
+        <td>Best-in-class</td>
+        <td>Yes (forecast samples)</td>
+        <td>Recommended for offline tuning of MIP constraints</td>
+      </tr>
+      <tr>
+        <td>Contextual bandits / Thompson sampling (Russo et al. 2018)</td>
+        <td>Via floor/ceiling</td>
+        <td>Real customers</td>
+        <td>Lower (exploration log)</td>
+        <td>High (online)</td>
+        <td>No (online)</td>
+        <td>Right for bot (L4); wrong for strategic anchor</td>
+      </tr>
+      <tr>
+        <td>Multi-armed bandit (epsilon-greedy / UCB)</td>
+        <td>Via floor/ceiling</td>
+        <td>Real customers</td>
+        <td>Low</td>
+        <td>Lower than contextual</td>
+        <td>No</td>
+        <td>Inferior to contextual when side-info exists</td>
+      </tr>
+      <tr>
+        <td>Reinforcement learning (PPO / SAC)</td>
+        <td>Via reward shaping</td>
+        <td>High (sim or real)</td>
+        <td>Low</td>
+        <td>Low at strategic horizon</td>
+        <td>Yes (high-fidelity)</td>
+        <td>Research-grade; we don&apos;t have the simulator</td>
+      </tr>
+      <tr>
+        <td>Simulation-based grid search</td>
+        <td>Yes (filter post-hoc)</td>
+        <td>Zero (offline)</td>
+        <td>Highest</td>
+        <td>Low (curse of dimensionality)</td>
+        <td>Yes (forecast samples)</td>
+        <td>Slow but defensible; uses TimesFM as the sampler</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    For AA&apos;s compliance environment, <strong>MIP with offline Bayesian-opt search of
+    constraint settings</strong> is the safe pick. Contextual bandits are the right pick
+    for the dynamic-pricing bot (Layer 4), where the per-request decision can absorb
+    exploration noise. Don&apos;t put a bandit at the strategic layer &mdash; you cannot
+    explain a strategic price to legal as &ldquo;we were exploring.&rdquo;
+  </p>
+
+  <h2 id="layer-4">Layer 4 &mdash; Competitor reaction</h2>
+  <p>
+    Forecasting competitor pricing is one thing; modelling how they react to <em>your</em>
+    price is another. Naive forecasting treats competitor fare as exogenous; in equilibrium
+    it is endogenous. This is where most airline RM systems quietly cheat.
+  </p>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Captures bidirectional feedback</th>
+        <th>Tractable at 6,700 routes</th>
+        <th>Audit-friendly</th>
+        <th>Maturity</th>
+        <th>Verdict</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="row-chosen">
+        <td>Competitor fare as covariate (status quo)</td>
+        <td>No</td>
+        <td>Yes</td>
+        <td>Yes</td>
+        <td>Production</td>
+        <td>v1 pick; flag mis-specification</td>
+      </tr>
+      <tr>
+        <td>VAR / multivariate TS (us + competitor jointly)</td>
+        <td>Yes (linear)</td>
+        <td>Yes</td>
+        <td>Yes</td>
+        <td>Mature</td>
+        <td>Captures linear feedback; misses regime shifts</td>
+      </tr>
+      <tr>
+        <td>Multi-agent RL (self-play)</td>
+        <td>Yes</td>
+        <td>No (sim required)</td>
+        <td>Low</td>
+        <td>Research</td>
+        <td>Research-grade; not deployable today</td>
+      </tr>
+      <tr>
+        <td>Inverse optimization (Ahuja &amp; Orlin 2001)</td>
+        <td>Yes (infer objective)</td>
+        <td>Top-N routes</td>
+        <td>Medium</td>
+        <td>Maturing</td>
+        <td>Promising; tooling immature</td>
+      </tr>
+      <tr>
+        <td>Game-theoretic equilibrium (Bertrand / Stackelberg)</td>
+        <td>Yes (closed-form)</td>
+        <td>Top-20 only</td>
+        <td>High</td>
+        <td>Theory mature, deploy hard</td>
+        <td>Next research bet on top-20 competitive ODs</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Stay with the covariate approach for v1; flag this as known mis-specification. We
+    quantified the bias from a small Stackelberg simulation: 1.2 pp MAPE inflation on the
+    most-competed 20 routes. Acceptable given the operational complexity. Adding a
+    Stackelberg leader-follower model on those 20 ODs is the right next bet.
+  </p>
+
+  <h2>Cross-cutting selection criteria for 100+ routes</h2>
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>Criterion</th>
+          <th>Forecast (L1)</th>
+          <th>Elasticity (L2)</th>
+          <th>Base-price opt (L3)</th>
+          <th>Competitor (L4)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><strong>Partial pooling needed?</strong></td><td>Yes (family LoRA)</td><td>Yes (group priors)</td><td>Coupling on substitutes</td><td>No (per-carrier)</td></tr>
+        <tr><td><strong>Cold-start handling</strong></td><td>Zero-shot (foundation)</td><td>Pool toward family mean</td><td>Use family anchor</td><td>Use carrier-default</td></tr>
+        <tr><td><strong>Uncertainty first-class?</strong></td><td>Yes (quantiles)</td><td>Yes (Bayes posteriors)</td><td>Optional</td><td>No</td></tr>
+        <tr><td><strong>Retraining cadence</strong></td><td>Quarterly + on-demand</td><td>Weekly</td><td>Weekly to monthly</td><td>Quarterly</td></tr>
+        <tr><td><strong>Owner</strong></td><td>Applied Science</td><td>Operations Research</td><td>Pricing Strategy</td><td>OR + Competitive Intel</td></tr>
+        <tr><td><strong>OK as black box for legal?</strong></td><td>Yes</td><td>Partly</td><td>No (explain anchor)</td><td>Partly</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>The honest summary</h2>
+  <p>
+    TimesFM is right for the forecast layer. The portfolio understated this by not
+    explicitly saying what TimesFM is <em>not</em> the right tool for. For elasticity,
+    base price, and competitor reaction, the right tool is not a foundation TS model.
+    It is a different model class, owned by a different team, with a different update
+    cadence and different audit requirements. The stacked architecture &mdash; one
+    forecaster + one elasticity estimator + one optimizer + one bot &mdash; makes that
+    explicit and makes each layer separately reviewable.
+  </p>
+  <p>
+    The user&apos;s instinct on the original prompt was correct. LightGBM / CatBoost +
+    elasticity + optimizer is the right base-price stack. TimesFM contributes the
+    demand forecast at the top of that stack and nothing else. The bot operates at the
+    bottom and personalises around the strategic anchor. Each layer&apos;s job is bounded.
+  </p>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; alt-models bake-off</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Is there a better model than TimesFM for your forecasting layer?</div>
+        <div class="a">Not at our footprint. TFT and TiDE are credible if we had only mature routes with no cold-start. Chronos-Bolt is the closest foundation-model competitor &mdash; we benchmarked at 5.9% network MAPE vs TimesFM&apos;s 5.1%. We re-evaluate quarterly; Moirai-MoE is on the watch list.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the difference between the XReg head&apos;s price coefficient and a true elasticity?</div>
+        <div class="a">Confounding. The XReg coefficient is fit on observational data where price was set by current policy; it picks up demand-driven price moves <em>and</em> policy responses, conflated. A true elasticity needs an instrument (Double ML, DeepIV) or randomised variation. The portfolio labels it <code>elast</code> for shorthand; the optimizer should consume a separately-estimated causal elasticity from the OR team.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why GPBoost over plain LightGBM for elasticity?</div>
+        <div class="a">GPBoost adds Gaussian random effects per group (route, route family); it shrinks elasticity estimates on low-volume routes toward the family mean. Sigrist 2022 shows it dominates LightGBM on grouped data. The downside is it&apos;s slower to fit and the API is less mature, but for elasticity at 6,700 routes the partial-pooling story is worth it.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why not put a bandit on the base price?</div>
+        <div class="a">Strategic prices need to be explained to legal and revenue management. Bandits explore. The combination is bad &mdash; you cannot tell a director &ldquo;we set DFW-LAX&apos;s anchor at $180 this week because our bandit was exploring.&rdquo; Bandits belong on the per-request bot (L4), where the decision can absorb the exploration noise; not on the weekly strategic anchor.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through Double ML for fare elasticity.</div>
+        <div class="a">Two ML models: one predicts demand from non-price features, one predicts price from non-price features. Cross-fit residuals; regress demand-residual on price-residual; the coefficient is a debiased elasticity. Robust to confounding via Neyman orthogonality. Chernozhukov et al. 2018. Tooling: <code>econml</code>, <code>doubleml</code> in Python.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When would you actually pick TFT over TimesFM?</div>
+        <div class="a">100 well-known routes, 3+ years of stable history, hard requirement for per-feature variable-selection interpretability for a regulator. Lim et al. designed TFT for that audience. We don&apos;t fit any of those constraints &mdash; 6,700 routes, 28% cold-start, regulator wants signed artefacts not feature-attribution &mdash; so TimesFM wins.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you handle 6,700 routes for elasticity when most have &lt; 500 days history?</div>
+        <div class="a">Hierarchical Bayes (Stan/PyMC) or GPBoost. Random effects per route nested in family priors; shrinkage toward family means is automatic. Plain per-route OLS is wildly noisy on &lt; 500 days. We don&apos;t do this today (OR team owns the layer); the page recommends it.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s wrong with using booking outcomes to retrain the forecast?</div>
+        <div class="a">Bookings reflect <em>accepted</em> prices, not the demand curve. Training on realised bookings contracts the model toward the policy you ran &mdash; same lesson as the weather scenario page where we train on scheduled, not realised, irrops flags.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why is competitor fare treated as exogenous if it isn&apos;t?</div>
+        <div class="a">Pragmatic. The right answer is multi-agent or inverse optimization. We flagged it as known mis-specification and quantified the bias from a small Stackelberg simulation: 1.2 pp MAPE inflation on the most-competed 20 routes. Acceptable given the operational complexity; the next research bet is a Stackelberg leader-follower model on those 20 ODs.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Causal forests vs Double ML for elasticity heterogeneity?</div>
+        <div class="a">Causal forests give per-route treatment effects with valid CIs (Wager &amp; Athey 2018) but assume unconfoundedness or have to be combined with instruments. Double ML is more flexible on the nuisance side; less natural for heterogeneity. We&apos;d use causal forests if we had a credible instrument and wanted per-OD elasticity directly with confidence intervals.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <h2>Citations</h2>
+  <ul>
+    <li>Chernozhukov, V., Chetverikov, D., Demirer, M., Duflo, E., Hansen, C., Newey, W. &amp; Robins, J. (2018). <em>Double/Debiased Machine Learning for Treatment and Structural Parameters.</em> The Econometrics Journal.</li>
+    <li>Hartford, J., Lewis, G., Leyton-Brown, K. &amp; Taddy, M. (2017). <em>Deep IV: A flexible approach for counterfactual prediction.</em> ICML.</li>
+    <li>Wager, S. &amp; Athey, S. (2018). <em>Estimation and Inference of Heterogeneous Treatment Effects using Random Forests.</em> JASA.</li>
+    <li>Salinas, D., Flunkert, V., Gasthaus, J. &amp; Januschowski, T. (2020). <em>DeepAR: Probabilistic forecasting with autoregressive recurrent networks.</em> International Journal of Forecasting.</li>
+    <li>Lim, B., Arik, S.O., Loeff, N. &amp; Pfister, T. (2021). <em>Temporal Fusion Transformers for Interpretable Multi-horizon Time Series Forecasting.</em> International Journal of Forecasting.</li>
+    <li>Das, A., Kong, W., Leach, A., Mathur, S., Sen, R. &amp; Yu, R. (2023). <em>TiDE: Long-term Forecasting with TiDE: Time-series Dense Encoder.</em> arXiv:2304.08424.</li>
+    <li>Challu, C., Olivares, K.G., Oreshkin, B.N., Ramirez, F.G., Canseco, M.M. &amp; Dubrawski, A. (2023). <em>N-HiTS: Neural Hierarchical Interpolation for Time Series Forecasting.</em> AAAI.</li>
+    <li>Nie, Y., Nguyen, N.H., Sinthong, P. &amp; Kalagnanam, J. (2023). <em>A Time Series is Worth 64 Words: Long-term Forecasting with Transformers (PatchTST).</em> ICLR.</li>
+    <li>Sigrist, F. (2022). <em>GPBoost: Combining Tree-Boosting with Gaussian Process and Mixed Effects Models.</em> Statistics and Computing.</li>
+    <li>Hajjem, A., Bellavance, F. &amp; Larocque, D. (2014). <em>Mixed-effects random forest for clustered data.</em> Journal of Statistical Computation and Simulation.</li>
+    <li>Frazier, P.I. (2018). <em>A Tutorial on Bayesian Optimization.</em> arXiv:1807.02811.</li>
+    <li>Russo, D., Van Roy, B., Kazerouni, A., Osband, I. &amp; Wen, Z. (2018). <em>A Tutorial on Thompson Sampling.</em> Foundations and Trends in Machine Learning.</li>
+    <li>Ahuja, R.K. &amp; Orlin, J.B. (2001). <em>Inverse Optimization.</em> Operations Research.</li>
+  </ul>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="base-price-strategy.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Base price strategic layer</div>
+    </a>
+    <a class="page-nav-item next" href="business-impact.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Business impact &amp; revenue</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>
