@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>When to Use TimesFM &middot; AA Pricing Forecast</title>
+<meta name="description" content="When TimesFM is the right tool: batch vs real-time, cross-sectional vs temporal data. Plus three concrete use cases: setting pricing 14 days ahead, detecting demand shifts in real time, and predicting competitor pricing movements." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>When to use TimesFM</span>
+  </nav>
+
+  <h1>When to use TimesFM &mdash; suitability &amp; concrete use cases</h1>
+  <p class="lead">
+    A foundation model is a tool, not a default. This page is an honest catalogue of where
+    TimesFM is the right pick (and where it is not), how it fits batch vs real-time
+    pipelines, what it expects from your data shape, and three concrete revenue-management
+    use cases &mdash; setting pricing 14 days ahead, detecting demand shifts in real time, and
+    predicting competitor pricing movements.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> TimesFM is the right tool when your data is <em>temporal</em>
+    (sequences with a meaningful time axis), your inference cadence is <em>batch or low-rate
+    on-demand</em> (not high-QPS real-time), and you want <em>calibrated probabilistic
+    forecasts</em> over multi-step horizons. It is the wrong tool for cross-sectional
+    classification, sub-second latency budgets, and one-shot regression on tabular data.
+  </div>
+
+  <h2>Suitability checklist</h2>
+  <p>Before adopting TimesFM, run through these questions. If the answer to any of the
+  first three is &ldquo;no,&rdquo; pick a different tool.</p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Question</th><th>Right answer for TimesFM</th><th>If wrong, use instead</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Is your data temporal?</strong></td>
+          <td>Yes &mdash; rows index by time, observations form a sequence.</td>
+          <td>Cross-sectional &rarr; XGBoost / LightGBM / FT-Transformer.</td>
+        </tr>
+        <tr>
+          <td><strong>Do you need a forecast horizon &gt; 1 step?</strong></td>
+          <td>Yes &mdash; multi-step decisions (pricing, inventory, capacity).</td>
+          <td>Single-step regression &rarr; classical ML on lagged features.</td>
+        </tr>
+        <tr>
+          <td><strong>Do you need probabilistic / quantile output?</strong></td>
+          <td>Yes &mdash; downstream optimizer wants q10/q50/q90 or full distribution.</td>
+          <td>Just a point forecast &rarr; ARIMA / Prophet / a small MLP.</td>
+        </tr>
+        <tr>
+          <td><strong>Is per-prediction latency in the 1&ndash;100 ms range?</strong></td>
+          <td>Batch (nightly) or low-rate on-demand (a few QPS) is the sweet spot.</td>
+          <td>Sub-millisecond &rarr; cache forecasts, not the model.</td>
+        </tr>
+        <tr>
+          <td><strong>Do you have many related series?</strong></td>
+          <td>Yes &mdash; cross-series transfer is where foundation models win.</td>
+          <td>One isolated series &rarr; classical state-space model.</td>
+        </tr>
+        <tr>
+          <td><strong>Do you have exogenous covariates?</strong></td>
+          <td>Yes, and you can split them into static / dynamic-numerical / dynamic-categorical.</td>
+          <td>None at all &rarr; vanilla TimesFM zero-shot is fine; no XReg head needed.</td>
+        </tr>
+        <tr>
+          <td><strong>Are cold-start / new-entity rates high?</strong></td>
+          <td>Yes &mdash; foundation-model zero-shot pays for itself.</td>
+          <td>Stable population, plenty of history per series &rarr; per-series classical works.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Batch vs real-time &mdash; where TimesFM fits</h2>
+  <p>
+    TimesFM is a <strong>200M-parameter transformer</strong>. Even at 6 ms per OD-pair on
+    A10G, you cannot serve it in front of a million-QPS booking front-end. The right
+    pattern is <strong>forecast-and-cache</strong>: regenerate forecasts on a cadence that
+    matches your decision cadence, write to a fast read store, serve queries from cache.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>Pipeline shape</th>
+          <th>Cadence</th>
+          <th>How TimesFM fits</th>
+          <th>Read-side latency</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Nightly batch</strong> (our default)</td>
+          <td>Once per day, 02:00 CST</td>
+          <td>Score 6,700 OD-pairs &times; 30-day horizon = 41 s on a single A10G.</td>
+          <td>&lt;5 ms cache lookup from Cosmos DB.</td>
+        </tr>
+        <tr>
+          <td><strong>Off-cycle re-score</strong></td>
+          <td>On macro shock (fuel, currency, competitor)</td>
+          <td>Spin a spot VM, score affected OD-pair subset, write back. p50 14 min.</td>
+          <td>Same cache lookup &mdash; reads see fresh values once write completes.</td>
+        </tr>
+        <tr>
+          <td><strong>Low-rate on-demand</strong> (RM analyst tool)</td>
+          <td>~10&ndash;100 QPS</td>
+          <td>AKS pod with model loaded; batch=8 micro-batching; ~30 ms p99.</td>
+          <td>Direct from model.</td>
+        </tr>
+        <tr>
+          <td><strong>True real-time</strong> (booking front-end)</td>
+          <td>10K&ndash;100K QPS</td>
+          <td><strong>Don&apos;t.</strong> Serve from cache; regenerate cache on background cadence.</td>
+          <td>&lt;1 ms cache.</td>
+        </tr>
+        <tr>
+          <td><strong>Streaming / event-driven</strong></td>
+          <td>Per-event</td>
+          <td>Use a streaming aggregator to roll into windows, then nightly TimesFM. Event-driven is not the same as real-time inference.</td>
+          <td>Cache-served.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="insight">
+    <strong>Pattern.</strong> A foundation model is a slow truth source. Cache its output
+    aggressively and trigger regeneration on (a) a fixed cadence, (b) a covariate-based
+    rule (e.g. fuel &Delta; &gt; 2%), or (c) a coverage-drift rule. Reading from the cache is
+    independent of model latency.
+  </div>
+
+  <h2>Cross-sectional vs temporal data</h2>
+  <p>
+    The single biggest mismatch I see in interviews: people reach for TimesFM on
+    cross-sectional data because &ldquo;foundation model.&rdquo; The architecture has strong
+    inductive biases for sequences; if you don&apos;t have a meaningful time axis, those
+    biases work against you.
+  </p>
+
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>Temporal data &mdash; TimesFM&apos;s home turf</h4>
+      <ul>
+        <li>Daily fares per OD-pair indexed by date.</li>
+        <li>Hourly load on a power grid.</li>
+        <li>Weekly demand for SKU per warehouse.</li>
+        <li>Sensor readings indexed by timestamp.</li>
+        <li>Clinical vitals over a hospital stay.</li>
+        <li>Streaming metrics from a service mesh.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Cross-sectional data &mdash; pick another tool</h4>
+      <ul>
+        <li>One row per customer with attributes (lifetime value, churn risk).</li>
+        <li>One row per product with features (price, category, brand).</li>
+        <li>One row per loan application (default risk).</li>
+        <li>One image per row (CV problem).</li>
+        <li>One transaction per row (fraud snapshot).</li>
+        <li>One survey response per row (sentiment).</li>
+      </ul>
+    </div>
+  </div>
+
+  <p>
+    A useful test: shuffle your rows. If the answer is unaffected, your data is
+    cross-sectional &mdash; use a tabular model. If shuffling destroys the signal, your data
+    is temporal &mdash; TimesFM may help.
+  </p>
+
+  <h2>Mixed shapes &mdash; panel data with covariates</h2>
+  <p>
+    AA pricing is a <strong>panel</strong>: many series (OD-pairs) each indexed by time,
+    each carrying static attributes (route type, equipment) and dynamic covariates (fuel,
+    holiday, competitor fare). TimesFM handles this natively through:
+  </p>
+
+  <ul>
+    <li><strong>Cross-series transfer</strong> via the frozen foundation trunk &mdash; one model serves all 6,700 OD-pairs.</li>
+    <li><strong>Static covariates</strong> via the XReg head&apos;s embedding lookup (cabin, equipment).</li>
+    <li><strong>Dynamic numerical</strong> via the XReg head&apos;s regression input (fuel, currency, competitor fare).</li>
+    <li><strong>Dynamic categorical</strong> via one-hot in the XReg head (holiday flag, day-of-week).</li>
+    <li><strong>Family-specific patterns</strong> via per-family LoRA adapters.</li>
+  </ul>
+
+  <h2>When NOT to use TimesFM &mdash; failure modes I&apos;ve hit</h2>
+  <ol>
+    <li><strong>Sub-millisecond latency budgets.</strong> Booking front-ends, ad auctions, fraud-on-the-wire. Cache the forecast; don&apos;t serve the model.</li>
+    <li><strong>One series with 50 points.</strong> Foundation-model priors don&apos;t override a tiny dataset; classical state-space is more honest.</li>
+    <li><strong>Heavy-tailed point processes.</strong> Disease outbreaks, viral content, click cascades &mdash; these are non-stationary and the trunk wasn&apos;t pretrained on them.</li>
+    <li><strong>Strict interpretability.</strong> Regulator wants &ldquo;why this fare?&rdquo; with feature-attribution. SHAP-on-the-XReg-head works; SHAP-on-the-trunk does not.</li>
+    <li><strong>Tabular regression.</strong> A foundation model is the wrong inductive bias. Use XGBoost.</li>
+    <li><strong>Forecast horizons longer than your retraining cadence.</strong> If you forecast 90 days but only retrain every 90 days, you&apos;re always stale at the back end of the horizon.</li>
+  </ol>
+
+  <!-- ============================================================== -->
+  <h2 id="usecase-14day">Use case 1 &mdash; setting pricing 14 days ahead</h2>
+  <p>
+    Most AA bookings consolidate in the 14&ndash;3-day-out window. A robust 14-day-ahead fare
+    forecast lets the bid-price optimizer set fence values one full purchase cycle in
+    advance. Here is how the model fits this use case end-to-end.
+  </p>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="kpi-value">14 days</div><div class="kpi-label">Forecast lead time<br>per OD-pair</div></div>
+    <div class="kpi"><div class="kpi-value">90 days</div><div class="kpi-label">Context window<br>(input history)</div></div>
+    <div class="kpi"><div class="kpi-value">30 days</div><div class="kpi-label">Full horizon<br>(14 + buffer)</div></div>
+    <div class="kpi"><div class="kpi-value">q10/q50/q90</div><div class="kpi-label">Quantile output<br>per day</div></div>
+    <div class="kpi"><div class="kpi-value">02:00 CST</div><div class="kpi-label">Nightly fence<br>publication time</div></div>
+    <div class="kpi"><div class="kpi-value">~$0.011</div><div class="kpi-label">Compute cost<br>per cycle</div></div>
+  </div>
+
+  <h3>The pipeline</h3>
+  <ol>
+    <li><strong>02:00 CST.</strong> Spot VM spins; the previous day&apos;s fares + covariates are pulled from Azure Synapse.</li>
+    <li><strong>02:00:36.</strong> TimesFM trunk + XReg head + 17 LoRA adapters loaded into pinned memory.</li>
+    <li><strong>02:00:48.</strong> <code>torch.compile</code> warm-up on a sample batch.</li>
+    <li><strong>02:01:29.</strong> 6,700 OD-pairs scored over a 30-day horizon. Each forecast carries 10 quantiles per day.</li>
+    <li><strong>02:01:37.</strong> Forecasts written to Cosmos DB, indexed by OD-pair + departure date.</li>
+    <li><strong>02:01:39.</strong> Bid-price optimizer (separate team, C++) reads forecasts; computes fence values for the 14-day-out window; publishes to the booking system before 03:00 CST.</li>
+  </ol>
+
+  <h3>Why TimesFM specifically for 14-day ahead</h3>
+  <ul>
+    <li><strong>Multi-step quantile output is native.</strong> Pinball-trained continuous-quantile head produces calibrated q10/q50/q90 over the full horizon. Classical models would need a separate quantile regression per day.</li>
+    <li><strong>Covariates pre-publish at 14 days.</strong> Holidays, school breaks, scheduled load factor are all knowable 14 days ahead. The XReg head consumes them as future-known features.</li>
+    <li><strong>Cross-route information.</strong> A fuel spike yesterday affects every OD-pair&apos;s 14-day forecast simultaneously through the shared XReg head &mdash; no per-route refitting.</li>
+    <li><strong>Calibrated tails.</strong> The bid-price optimizer reads q90 for upside protection. Foundation-model quantile calibration on long tails (premium cabins) outperforms per-route regression by 30%+ on ECE.</li>
+  </ul>
+
+  <h3>Trade-offs at this lead time</h3>
+  <p>
+    14-day forecasts are stale by day 14 because new bookings change the realised demand
+    curve. We mitigate by (a) re-forecasting nightly so day-14 today becomes day-13
+    tomorrow with fresher context, and (b) firing off-cycle re-score when covariates move.
+    The optimizer still works on stale forecasts because it has its own demand curve as a
+    second-order correction.
+  </p>
+
+  <h3>Numbers</h3>
+  <ul>
+    <li>Day-14 MAPE: <strong>5.1%</strong> network, 4.2% domestic, 6.1% intl-long.</li>
+    <li>q90 PI coverage at day 14: <strong>79.3%</strong>, inside [78, 82] target band.</li>
+    <li>Revenue lift attributable to 14-day-ahead horizon: ~<strong>$22M</strong> of the $48M annual lift.</li>
+  </ul>
+
+  <!-- ============================================================== -->
+  <h2 id="usecase-demand">Use case 2 &mdash; detect demand shifts in real time and re-optimize</h2>
+  <p>
+    Demand shifts mid-day on a holiday weekend, or on a competitor schedule change, or on
+    weather news. The nightly forecast is no longer right by lunchtime. The pattern: fast
+    detection in streaming, then off-cycle re-forecast with TimesFM, then optimizer
+    re-runs on fresh inputs.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>Layer</th>
+          <th>Latency</th>
+          <th>What it does</th>
+          <th>Tooling</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>1. Streaming detection</strong></td>
+          <td>seconds</td>
+          <td>Watch booking velocity, search-to-book ratio, basket-abandonment rate per OD-pair. Fire signal if z-score &gt; 2.5 for 15 min.</td>
+          <td>Azure Event Hubs + Stream Analytics; CUSUM &amp; PSI on rolling windows.</td>
+        </tr>
+        <tr>
+          <td><strong>2. Trigger gate</strong></td>
+          <td>seconds</td>
+          <td>De-duplicate signals, throttle. Promote to off-cycle re-score if shift sustained or affects &gt; 50 OD-pairs.</td>
+          <td>Logic App + idempotency key in Cosmos DB.</td>
+        </tr>
+        <tr>
+          <td><strong>3. Covariate update</strong></td>
+          <td>1&ndash;3 min</td>
+          <td>Refresh load-factor lag, competitor fare scrape, weather feed. Stamp with publication time.</td>
+          <td>Azure Data Factory micro-pipeline.</td>
+        </tr>
+        <tr>
+          <td><strong>4. TimesFM re-forecast</strong></td>
+          <td>5&ndash;15 min</td>
+          <td>Spot VM scores affected OD-pair subset (typically 50&ndash;500) with fresh covariates. Only impacted families touched.</td>
+          <td>Azure ML batch endpoint; A10G spot.</td>
+        </tr>
+        <tr>
+          <td><strong>5. Optimizer re-run</strong></td>
+          <td>2&ndash;5 min</td>
+          <td>Bid-price C++ recomputes fences with new q10/q50/q90.</td>
+          <td>RM team&apos;s service.</td>
+        </tr>
+        <tr>
+          <td><strong>6. Fence publication</strong></td>
+          <td>30 s</td>
+          <td>Push to booking front-end. Invalidate cached fares.</td>
+          <td>RM publish API.</td>
+        </tr>
+        <tr>
+          <td><strong>End-to-end</strong></td>
+          <td><strong>p50 14 min &middot; p99 31 min</strong></td>
+          <td>From signal to fresh fence on the booking page.</td>
+          <td>&nbsp;</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="insight">
+    <strong>Why TimesFM works here even though it&apos;s &ldquo;slow&rdquo;.</strong> The detector
+    is real-time; the model is not. Detection runs in a streaming layer that doesn&apos;t
+    use TimesFM at all. TimesFM is invoked only after the gate fires, on a small
+    subset of routes, where its 5&ndash;15-minute compute cost is dwarfed by its calibrated
+    multi-step quantile output. We use the right tool at each layer.
+  </div>
+
+  <h3>What TimesFM contributes that streaming alone cannot</h3>
+  <ul>
+    <li><strong>Multi-step horizon.</strong> Streaming z-scores tell you &ldquo;something is off now.&rdquo; TimesFM tells you &ldquo;the next 30 days will look like this distribution.&rdquo; The optimizer needs the latter.</li>
+    <li><strong>Calibrated quantiles.</strong> A streaming detector cannot give you q90; it gives you a binary alert. The optimizer needs the spread.</li>
+    <li><strong>Covariate conditioning.</strong> The XReg head re-conditions on fresh covariates. The detector fires; covariates update; TimesFM re-forecasts; new q10/q50/q90 reflect the new state of the world.</li>
+    <li><strong>Cross-OD-pair propagation.</strong> A demand shift on DFW-LAX implies movement on ORD-LAX, JFK-LAX, AUS-LAX through shared route-family elasticity. TimesFM&apos;s shared head propagates automatically.</li>
+  </ul>
+
+  <h3>Trigger thresholds in production</h3>
+  <table class="timeline-table">
+    <thead><tr><th>Signal</th><th>Threshold</th><th>Trigger frequency / yr</th></tr></thead>
+    <tbody>
+      <tr><td>Booking velocity z-score</td><td>&gt; 2.5 for 15 min on &gt; 50 OD-pairs</td><td>~600</td></tr>
+      <tr><td>Competitor fare delta</td><td>&gt; 8% on any fare class</td><td>~7,300</td></tr>
+      <tr><td>Fuel index</td><td>&gt; 2% intraday</td><td>~10</td></tr>
+      <tr><td>Weather disruption flag</td><td>FAA ground-stop or NWS major-storm</td><td>~600</td></tr>
+      <tr><td>Currency (USD/local) for affected route family</td><td>&gt; 2% intraday</td><td>~120</td></tr>
+    </tbody>
+  </table>
+  <p class="caption">Most triggers don&apos;t escalate to a network-wide re-score; they hit a small subset of routes. Per-trigger compute cost is typically &lt;$0.01.</p>
+
+  <!-- ============================================================== -->
+  <h2 id="usecase-competitor">Use case 3 &mdash; predicting competitor pricing movements</h2>
+  <p>
+    Competitor pricing is partially observable: we see published fares on OTAs; we don&apos;t
+    see their internal optimizer state. The strategy: forecast <em>competitor fare</em>
+    as a separate target series alongside our own, then condition our own forecast on the
+    predicted competitor fare. This is shadow-modeling: we never use it for a price-match
+    policy directly (antitrust separation), but we do use it to anticipate the move.
+  </p>
+
+  <h3>Two parallel TimesFM heads</h3>
+  <div class="stage-grid">
+    <div class="stage-card">
+      <h3>Head A &mdash; AA fare forecast</h3>
+      <ul>
+        <li>Target: AA daily average fare per OD-pair.</li>
+        <li>Covariates include: <em>predicted</em> competitor fare from Head B as a future-known input.</li>
+        <li>Quarterly retrain.</li>
+        <li>Used for AA bid-price optimizer.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Head B &mdash; competitor fare forecast</h3>
+      <ul>
+        <li>Target: published competitor fare per OD-pair (Delta, United, Spirit, JetBlue, Frontier).</li>
+        <li>Covariates: same fuel/holiday/seasonality + their schedule changes from public sources.</li>
+        <li>Per-carrier LoRA on top of shared XReg head.</li>
+        <li>Used as input to Head A.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Why this works</h3>
+  <ul>
+    <li><strong>Cross-carrier transfer.</strong> A foundation model trained globally on 100B time-series points already knows how price series behave; we only fine-tune the residual. Per-carrier LoRA captures &ldquo;Spirit moves on Tuesdays,&rdquo; &ldquo;Delta protects upgrade inventory on Fridays.&rdquo;</li>
+    <li><strong>Public-data only.</strong> We forecast competitors using their <em>published</em> fares from OTAs &mdash; legal and standard. We don&apos;t scrape their internal data; we don&apos;t coordinate; we don&apos;t share predictions with the policy team in a way that would suggest collusion.</li>
+    <li><strong>Two-step forecasting.</strong> Head B&apos;s output (with its own quantiles) feeds Head A as a covariate. Head A learns &ldquo;when Head B predicts Delta down $20, AA fare median drops $11 (0.55 cross-elasticity).&rdquo;</li>
+    <li><strong>Calibration matters.</strong> Head B is wrong sometimes. Its q10/q90 spread tells Head A how confident to be. The optimizer ultimately reads Head A only.</li>
+  </ul>
+
+  <h3>Numbers</h3>
+  <ul>
+    <li>Head B MAPE on competitor fares: <strong>6.4%</strong> network (slightly worse than AA fares because we have less data per carrier).</li>
+    <li>Head A&apos;s MAPE improvement <em>from including Head B as covariate</em>: <strong>0.4 pp</strong>, mostly on price-elastic leisure markets.</li>
+    <li>Median competitor-match speed: <strong>14 minutes</strong> from the OTA publishing the new competitor fare to fresh AA fence (uses Head B&apos;s nowcast then triggers an off-cycle re-score of Head A).</li>
+    <li>Annual revenue lift attributable specifically to competitor anticipation: ~<strong>$8M</strong> of the $48M total.</li>
+  </ul>
+
+  <h3>Antitrust separation</h3>
+  <div class="dead-end-list">
+    <li><strong>Forecast is not policy.</strong> Head B predicts what Delta will price; it does not tell anyone what AA <em>should</em> price. The bid-price optimizer (separate team) decides.</li>
+    <li><strong>Public data only.</strong> No private feeds, no agreements, no shared optimizer state with any other carrier.</li>
+    <li><strong>Audit trail.</strong> Every Head B forecast is logged with the input data hash; legal can reproduce any prediction.</li>
+    <li><strong>No coordination signal.</strong> The model never receives anything that resembles &ldquo;what we&apos;re about to do.&rdquo; It only sees historical published fares.</li>
+  </div>
+
+  <h2>Decision tree &mdash; do I reach for TimesFM?</h2>
+  <ol>
+    <li><strong>Is the problem temporal?</strong> If no &rarr; tabular ML.</li>
+    <li><strong>Multi-step horizon needed?</strong> If no &rarr; per-step regression.</li>
+    <li><strong>Probabilistic output needed?</strong> If no &rarr; classical point forecast (ARIMA, Prophet).</li>
+    <li><strong>Many related series?</strong> If no &rarr; per-series state-space.</li>
+    <li><strong>Latency budget &ge; 5 ms per series?</strong> If no &rarr; cache; revisit pipeline shape.</li>
+    <li><strong>Need calibrated quantiles?</strong> If yes &rarr; <strong>TimesFM with pinball-trained continuous quantile head is the answer.</strong></li>
+    <li><strong>Need fast detection of <em>now</em>?</strong> Pair TimesFM with a streaming detector. Don&apos;t use TimesFM for the detection step.</li>
+    <li><strong>Need to anticipate competitor / external actor?</strong> Two parallel heads (one per actor) with LoRA per actor and cross-feeding. Antitrust review mandatory.</li>
+  </ol>
+
+  <div class="callout">
+    The mistake to avoid: using a foundation model just because it&rsquo;s available. The
+    right pattern is &ldquo;cheap classical baseline first, foundation model when the gap
+    pays for the operational cost.&rdquo; On this project the gap was 5+ pp of MAPE and $48M
+    of annual lift &mdash; defensible. On a tabular problem the gap is usually negative.
+  </div>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; suitability &amp; use cases</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">When would you reject TimesFM for a forecasting problem?</div>
+        <div class="a">Three cases. (1) Sub-millisecond latency budget &mdash; cache instead. (2) One series with &lt;200 points &mdash; foundation-model priors don&apos;t override a tiny dataset. (3) Heavy-tailed point processes (outbreaks, viral) where the trunk wasn&apos;t pretrained on similar regimes.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why not just use TimesFM in real time on the booking front-end?</div>
+        <div class="a">Architectural mismatch. A 200M-param transformer at 6 ms/series &times; 100K QPS = 600 GPU-hours/sec. The right pattern is forecast-and-cache: TimesFM regenerates forecasts on cadence, the booking front-end reads a 1 ms cache.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you tell if your data is temporal vs cross-sectional?</div>
+        <div class="a">Shuffle test. If shuffling the rows leaves the answer unchanged, the data is cross-sectional &rarr; tabular ML. If shuffling destroys signal, it&apos;s temporal &rarr; TimesFM is a candidate.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Can TimesFM handle panel data (many series)?</div>
+        <div class="a">Yes &mdash; that&apos;s exactly where foundation models win. Cross-series transfer through the frozen trunk; per-family LoRA adapters for idiosyncrasies; one trunk serves all 6,700 AA OD-pairs.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why 14 days and not 7 or 30?</div>
+        <div class="a">Match the decision cadence. Most AA bookings consolidate in the 14&ndash;3-day-out window; the bid-price optimizer needs 14-day-ahead fence values. We forecast 30 days but the 14&ndash;day point is the most-used slice.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you detect demand shifts in real time without using TimesFM?</div>
+        <div class="a">Streaming layer: Azure Event Hubs + Stream Analytics computing rolling z-scores and CUSUM on booking velocity, search-to-book ratio, basket-abandonment. TimesFM is invoked only after the streaming gate fires.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the latency from a demand shift to a fresh fare?</div>
+        <div class="a">p50 14 minutes, p99 31 minutes. Streaming detection (seconds), trigger gate (seconds), covariate update (1&ndash;3 min), TimesFM re-forecast (5&ndash;15 min), optimizer re-run (2&ndash;5 min), publish (30 s).</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Is forecasting competitor prices legal?</div>
+        <div class="a">Yes if done on public data and never used to coordinate. We forecast Delta/United/Spirit fares from OTA-published prices. The forecast feeds our internal optimizer; it never goes back out. Legal review confirmed and we have an audit trail.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How does Head B (competitor) feed Head A (AA)?</div>
+        <div class="a">Head B&apos;s q50 prediction for the competitor fare, plus Head B&apos;s q90 spread (a confidence proxy), is consumed by Head A&apos;s XReg head as a future-known dynamic numerical covariate. Head A learns the AA cross-elasticity coefficient with respect to the predicted competitor fare.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What if Head B is wrong?</div>
+        <div class="a">Head B&apos;s spread (q90 - q10) tells Head A how confident to be. If Head B is wide (low confidence), Head A&apos;s effective elasticity coefficient shrinks toward zero. We lose the Head-B-derived signal for those OD-pairs but no harm to Head A&apos;s calibration.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Is TimesFM the only foundation model that fits this use case?</div>
+        <div class="a">No. Chronos, Lag-Llama, and TimeGPT all fit the same pattern. TimesFM won our bake-off by 0.8 pp MAPE and a better continuous quantile head. The pattern (forecast-and-cache, panel data, calibrated quantiles, batch + on-demand) is what matters; the specific foundation model is more replaceable.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What if your covariates aren&apos;t known 14 days ahead?</div>
+        <div class="a">You either (a) forecast the covariates separately, accepting the compounding error, or (b) drop them from the XReg head and accept lower accuracy. We have most covariates known 14 days ahead (holidays, scheduled load factor, fuel hedge price). For competitor fare we use Head B&apos;s forecast as the proxy.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Could you replace TimesFM with a simple per-route ARIMAX?</div>
+        <div class="a">Per-route ARIMAX is the baseline we beat by 5+ pp of MAPE. It&apos;s adequate when you have only a handful of stable, high-volume series and no cold-start. For a 6,700-series panel with heterogeneous shapes and 10 new routes per year, foundation-model trunk + LoRA wins decisively.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the smallest-data scenario where TimesFM still helps?</div>
+        <div class="a">Zero-shot on a brand-new OD-pair: ~10&ndash;15% MAPE on day 1 with no training, vs ARIMAX&apos;s &ldquo;needs 6 months of data&rdquo;. The trunk&apos;s pretrained priors carry the cold-start. Once you have ~3 months of data, fine-tuning starts to matter.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="market-routes.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Market routes fine-tuning</div>
+    </a>
+    <a class="page-nav-item next" href="business-impact.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Business impact &amp; revenue</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>
