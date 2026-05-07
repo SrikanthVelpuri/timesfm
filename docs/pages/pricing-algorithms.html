@@ -1,0 +1,1720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pricing Algorithms Deep-Dive &middot; AA Pricing Forecast</title>
+<meta name="description" content="Base price vs dynamic pricing: every algorithm in the stack. LightGBM demand, hierarchical-Bayes elasticity, MNL choice, EMSRb, bid-price, Thompson-sampling bandits, DQN/PPO/TRPO RL, and large-scale alternatives for 100+ domestic and international routes." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Pricing algorithms deep-dive</span>
+  </nav>
+
+  <h1>Pricing algorithms &mdash; base price, dynamic price, and everything in between</h1>
+  <p class="lead">
+    A full inventory of the pricing stack: which algorithm sits in which layer, why
+    it&rsquo;s there, what it replaces, and what changes when you scale from a single
+    flagship route to 100+ domestic and international OD-pairs with different cabins,
+    fare families, and demand regimes. The TimesFM forecast on the rest of this site is
+    one component; this page covers the whole platform.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> A working airline pricing platform has two distinct layers.
+    The <em>base-price layer</em> sets the strategic anchor per route, cabin, and fare
+    family on a weekly/monthly cadence using demand forecasts, elasticity models, and a
+    revenue optimizer. The <em>dynamic-pricing layer</em> adjusts around the anchor on a
+    minute-to-day cadence using bandits, RL bots, or bid-price heuristics responding to
+    booking pace, inventory, competitor moves, and days-to-departure. The bots optimize
+    execution; the base price defines the strategic boundaries (floor, ceiling, fare
+    ladder, brand positioning) inside which they operate. Both layers are required.
+  </div>
+
+  <h2>Math primer &mdash; the 12 formulas you need</h2>
+  <p>
+    Every algorithm in this page can be reduced to one of these expressions. Print this
+    block; it travels with you across every layer.
+  </p>
+<pre><code># Demand and revenue
+q(p)                     # quantity demanded at price p
+R(p) = p &middot; q(p)          # revenue
+&pi;(p) = (p &minus; c) &middot; q(p)    # profit; c is marginal cost
+
+# Elasticity
+&epsilon; = (&part;q/&part;p) &middot; (p/q)    # price elasticity of demand (negative for normal goods)
+log(q) = &alpha; + &epsilon;&middot;log(p) + X&beta;  # log-log regression: &epsilon; is the slope directly
+
+# Optimal price
+dR/dp = 0  &rArr;  q + p&middot;(&part;q/&part;p) = 0
+p*    = c &middot; &epsilon; / (1 + &epsilon;)        # constant-elasticity markup formula
+                                  # ex: &epsilon; = &minus;1.31, c = $80  &rArr;  p* &approx; $338
+
+# Inventory control (classical RM)
+EMSRb<sub>i</sub>: protect <em>y<sub>i</sub></em> seats from class i&minus;1 if expected revenue at class i &ge; threshold
+&pi;<sub>l</sub>     # bid price on leg l = marginal value of one more seat
+sell iff F &gt; &Sigma; &pi;<sub>l</sub> over legs in itinerary
+
+# Bandits and RL
+TS:    Beta(&alpha;+wins, &beta;+losses) per arm; sample, pull argmax, update
+PPO:   L<sup>CLIP</sup> = E[ min(r&middot;A, clip(r, 1&plusmn;&epsilon;)&middot;A) ], r = &pi;<sub>&theta;</sub>/&pi;<sub>old</sub>
+TRPO:  max E[A&middot;&pi;<sub>&theta;</sub>/&pi;<sub>old</sub>] s.t. KL(&pi;<sub>old</sub>&Vert;&pi;<sub>&theta;</sub>) &le; &delta;
+
+# Risk-aware optimization
+CVaR<sub>&alpha;</sub>(R(p)) = E[ R(p) | R(p) &le; VaR<sub>&alpha;</sub>(R(p)) ]   # conditional value at risk
+robust:    max<sub>p</sub> min<sub>&theta; &isin; U</sub> R(p, &theta;)              # worst-case demand parameters
+</code></pre>
+  <p class="caption">
+    Every later section refers back to one of these. The two most useful in interviews are
+    the constant-elasticity markup formula and the EMSRb / bid-price duality.
+  </p>
+
+  <h2>Why two layers, not one</h2>
+  <p>
+    A single end-to-end RL agent that prices everything from $0 every minute is the
+    common interview-mistake answer. It fails three real-world tests:
+  </p>
+  <ol>
+    <li><strong>Strategy is slow; execution is fast.</strong> The right base fare for DFW&ndash;LAX next quarter depends on schedule, competitor entry, fleet mix, and brand positioning &mdash; decisions humans make and audit. The right fare 17 minutes before push-back depends on remaining seats and competitor moves &mdash; decisions a bot makes.</li>
+    <li><strong>Audit and governance.</strong> A bot that can move price from $0 to $11,000 with no anchor will get the carrier sued (price discrimination, predatory-pricing complaints) or fined (bait-and-switch). A documented base-price layer with human approval gives legal a defensible position.</li>
+    <li><strong>Reward sparsity.</strong> A pure-RL agent on raw bookings sees one signal per booking. A base-price layer collapses millions of bookings into the elasticity coefficient the bot needs &mdash; the bot then learns price <em>increments</em>, not absolute price, and converges 100&times; faster.</li>
+  </ol>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Concern</th><th>Base-price layer</th><th>Dynamic-pricing layer</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Purpose</td><td>Set the strategic anchor: floor, ceiling, fare ladder.</td><td>Adjust around the anchor based on live signals.</td></tr>
+        <tr><td>Cadence</td><td>Weekly / monthly / seasonal.</td><td>Minutes &mdash; days.</td></tr>
+        <tr><td>Owner</td><td>Pricing &amp; Revenue Strategy team (humans approve).</td><td>Pricing engine / RL bot (autonomous within rails).</td></tr>
+        <tr><td>Inputs</td><td>Route demand, costs, competitor structure, seasonality, brand strategy.</td><td>Booking pace, remaining inventory, days-to-departure, intraday competitor fares.</td></tr>
+        <tr><td>Risk if wrong</td><td>Long-term mispositioning (years of margin loss).</td><td>Short-term revenue miss (one departure).</td></tr>
+        <tr><td>Typical model</td><td>Demand forecast + elasticity + optimizer.</td><td>Bandit / RL / bid-price control.</td></tr>
+        <tr><td>Output</td><td>Anchor fare per (route, cabin, fare family).</td><td>Bookable fare in the booking system right now.</td></tr>
+        <tr><td>Re-train</td><td>Quarterly to seasonal.</td><td>Continuous online learning.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>End-to-end architecture &mdash; five layers</h2>
+  <p>
+    The full platform stacks five layers. Each layer&rsquo;s output is the next layer&rsquo;s
+    input. TimesFM (covered on the rest of this site) lives in <em>Layer 2</em>.
+  </p>
+
+  <div class="pipeline">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><h3>Base Pricing Layer</h3><p>Sets route &times; cabin &times; fare-family anchor price. Weekly/monthly cadence. Output: <code>base_fare</code> per (OD, cabin, fare).</p></div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><h3>Forecasting Layer</h3><p>Predicts demand, booking curve, elasticity, seasonality. <strong>TimesFM lives here.</strong> Output: q10/q50/q90 daily fare per OD over a 30-day horizon.</p></div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><h3>Optimization Layer</h3><p>Picks the best base price under capacity and revenue constraints (LP / DP / EMSRb / network bid price). Output: fence values + recommended fare-class availability.</p></div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><h3>Dynamic Pricing Layer</h3><p>Adjusts price within rails based on live demand, inventory, competitor fares, days-to-departure. Bandit / RL / heuristic. Output: bookable fare right now.</p></div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><h3>Governance Layer</h3><p>Human approval, business rules, antitrust separation, audit logs, kill switches, monitoring. Output: signed-off, auditable price decisions.</p></div></div>
+  </div>
+
+  <div class="insight">
+    <strong>Reading this on an interview:</strong> the question "what model do you use for
+    pricing?" is a category error. There is no single model. There are five layers and a
+    family of algorithms in each layer. Pick the layer the interviewer is asking about,
+    then explain the trade-offs <em>inside</em> that layer.
+  </div>
+
+  <!-- ============================================================== -->
+  <h2 id="base-price">Layer 1 &mdash; base-price algorithms</h2>
+  <p>
+    The base-price layer is a chain of three sub-models: demand forecast &rarr; elasticity
+    estimate &rarr; revenue optimizer. Each can be swapped independently.
+  </p>
+
+  <h3>1.1 Demand forecasting at the base-price level</h3>
+  <p>
+    The base-price demand model predicts <em>quantity demanded at a given price level</em>
+    one quarter to one year ahead, per route, cabin, and fare family. It is much coarser
+    than TimesFM&rsquo;s nightly fare forecast: aggregated to weekly buckets, using <em>future
+    knowable</em> covariates only (schedule, fuel hedge, holidays, capacity).
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Model</th><th>When it&rsquo;s the right pick</th><th>Strengths</th><th>Weaknesses</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>LightGBM / CatBoost</strong> on tabular weekly panel</td>
+          <td>The default. 100+ routes, mixed-type covariates, fast iteration.</td>
+          <td>Handles categorical natively (CatBoost), trains in minutes, SHAP explainability for the strategy team.</td>
+          <td>No native uncertainty; can&rsquo;t share signal across routes the way a foundation model can.</td>
+        </tr>
+        <tr>
+          <td><strong>Quantile gradient boosting</strong></td>
+          <td>You need q10/q90 bands for the optimizer.</td>
+          <td>Drop-in for LightGBM with <code>objective=quantile</code>. Calibrated tails after isotonic correction.</td>
+          <td>Train one model per quantile; q-crossing is not auto-prevented.</td>
+        </tr>
+        <tr>
+          <td><strong>Hierarchical Bayesian</strong> (PyMC / NumPyro)</td>
+          <td>You want pooled estimates across routes and proper uncertainty.</td>
+          <td>Partial pooling: thin routes borrow strength from thick ones. Posterior intervals integrate cleanly with the optimizer.</td>
+          <td>Slow to fit on 100+ routes &times; 5 fare families; needs a senior Bayesian engineer.</td>
+        </tr>
+        <tr>
+          <td><strong>DeepAR / TFT (Temporal Fusion Transformer)</strong></td>
+          <td>Lots of related series, rich dynamic covariates, room for a deep model.</td>
+          <td>Cross-series transfer; quantile output natively; covariate attention.</td>
+          <td>Heavier than LightGBM for similar accuracy on weekly aggregates; harder to debug.</td>
+        </tr>
+        <tr>
+          <td><strong>TimesFM (foundation model)</strong></td>
+          <td>You can amortize the operational cost across the dynamic-pricing layer too.</td>
+          <td>Same base used twice: weekly aggregate for base price + daily for dynamic. Cold-start on new routes.</td>
+          <td>Overkill if base price is the only consumer. Quantile head needs calibration check at weekly aggregation.</td>
+        </tr>
+        <tr>
+          <td><strong>Per-route ARIMAX</strong></td>
+          <td>One flagship route with 5+ years of clean data.</td>
+          <td>Transparent, regulator-friendly, no compute infrastructure needed.</td>
+          <td>Doesn&rsquo;t scale: 100 routes = 100 models to monitor. No cross-route transfer for thin or cold-start routes.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>1.1b More demand-forecast options worth knowing</h3>
+  <p>
+    The table above is the short list. The full menu has another half-dozen approaches
+    that show up in interviews and that you should be able to defend rejecting if you
+    didn&rsquo;t pick them.
+  </p>
+
+  <div class="stage-grid">
+    <div class="stage-card">
+      <h3>N-BEATS / N-HiTS</h3>
+      <ul>
+        <li>Pure deep-MLP with interpretable trend / seasonality / generic basis blocks.</li>
+        <li>Strong on univariate; multi-horizon native.</li>
+        <li>N-HiTS adds hierarchical interpolation &mdash; better long-horizon at lower compute.</li>
+        <li>Useful when you want a deep baseline to measure TimesFM uplift against.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Chronos / Moirai / Lag-Llama</h3>
+      <ul>
+        <li>Alternative foundation models. Chronos (Amazon) tokenizes values; Moirai (Salesforce) handles any covariate; Lag-Llama is decoder-only with explicit lag features.</li>
+        <li>Run a bake-off &mdash; on AA panel TimesFM won by 0.8 pp MAPE but 6 months later that may flip.</li>
+        <li>Same forecast-and-cache pattern; vendor-replaceable.</li>
+        <li>Architecture choice should not be load-bearing on a single vendor.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Bayesian Structural Time Series (BSTS) / Prophet</h3>
+      <ul>
+        <li>Trend + seasonality + holiday + regressors as additive components.</li>
+        <li>Excellent for stakeholder-explainable decompositions.</li>
+        <li>Fits in seconds per route; plays well with hierarchical Bayes.</li>
+        <li>Ceiling on accuracy for cross-route panels &mdash; no transfer.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Gaussian Processes (GP)</h3>
+      <ul>
+        <li>Smooth functional priors with closed-form uncertainty.</li>
+        <li>Best for low-data routes (cold-start, charters); kernel encodes seasonality.</li>
+        <li>Cubic in series length &rarr; sparse GPs / inducing points for scale.</li>
+        <li>Pair with a foundation-model trunk: GP on the residual.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Neural ODEs / SDEs</h3>
+      <ul>
+        <li>Model the booking curve as a continuous-time dynamical system.</li>
+        <li>Captures intra-day and irregular-time-step dynamics naturally.</li>
+        <li>Compute-heavy; mostly research-stage in revenue management.</li>
+        <li>Useful for irrops modeling where bookings arrive in bursts.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Survival models &mdash; time-to-purchase</h3>
+      <ul>
+        <li>Cox proportional hazards / DeepHit / DeepSurv on time-to-book.</li>
+        <li>Direct hazard rate &rarr; days-to-departure pricing curve.</li>
+        <li>Pairs with discounting policy: when does pace become unsalvageable?</li>
+        <li>Strong fit for fence-rule design in the dynamic layer.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>iTransformer / TFT / Crossformer</h3>
+      <ul>
+        <li>Attention-based panel models; iTransformer treats series as tokens.</li>
+        <li>TFT&rsquo;s variable-selection network gives feature importances per horizon.</li>
+        <li>Heavier than LightGBM, lighter than a foundation model.</li>
+        <li>Good middle ground when you don&rsquo;t want a foundation model dependency.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>State-space / Kalman filters</h3>
+      <ul>
+        <li>Online updates as new bookings arrive; cheap.</li>
+        <li>Useful as a fast residual layer on top of a slow forecaster.</li>
+        <li>Particle filters when the model is non-linear / non-Gaussian.</li>
+        <li>Underrated; perfect for streaming demand-shift detection.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>LSTM / GRU baselines</h3>
+      <ul>
+        <li>10 years old; still appropriate as a deep baseline if you don&rsquo;t want transformers.</li>
+        <li>Beats ARIMAX with covariates; loses to TFT/foundation models.</li>
+        <li>Easy to deploy on commodity GPUs.</li>
+        <li>Defensible answer if interviewer asks "why not LSTMs?" &mdash; ship time, not capability.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>1.2 Price-elasticity estimation</h3>
+  <p>
+    Elasticity is the question the optimizer cannot answer without help: <em>if I move the
+    base price by 5%, how much demand do I lose?</em> It is the gradient that the revenue
+    optimizer differentiates against. The right method depends on data shape and how much
+    interpretability the strategy team wants.
+  </p>
+
+  <div class="stage-grid">
+    <div class="stage-card">
+      <h3>Log-log regression</h3>
+      <ul>
+        <li><code>log(qty) = &alpha; + &epsilon;&middot;log(price) + X&beta;</code></li>
+        <li>The <code>&epsilon;</code> coefficient is the elasticity directly.</li>
+        <li>Fast to fit; transparent for legal review.</li>
+        <li>Confounded if price and demand co-move (endogeneity); needs IV or DiD on observational data.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Hierarchical Bayesian elasticity</h3>
+      <ul>
+        <li>One <code>&epsilon;</code> per (route, cabin, fare-family), partially pooled.</li>
+        <li>Thin routes borrow from the family hyper-parameter.</li>
+        <li>Posterior CI &rarr; risk-aware optimizer.</li>
+        <li>Scales fine with stochastic VI to ~1,000 routes; fits in ~30 min on CPU for 100.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Multinomial Logit (MNL) choice model</h3>
+      <ul>
+        <li>The standard in revenue management: customer chooses among AA, Delta, United, no-buy.</li>
+        <li>Captures cross-elasticity vs competitors directly.</li>
+        <li>Mixed-logit / latent-class extends to leisure-vs-business segments.</li>
+        <li>Needs choice-set data (search logs); strict assumptions (IIA) unless you go nested.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Deep choice models</h3>
+      <ul>
+        <li>Replace MNL utility function with a neural net; estimate elasticity from gradient.</li>
+        <li>Captures non-linear price response (kinks at $99, $199 thresholds).</li>
+        <li>Needs millions of search-impressions to be defensible.</li>
+        <li>SHAP-on-the-utility-net gives directional explainability, not point causality.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Causal / experimental elasticity</h3>
+      <ul>
+        <li>Geo-experiments, switchback tests, holdout markets.</li>
+        <li>Gold standard for one-route causal estimates; expensive at scale.</li>
+        <li>Use to ground-truth observational elasticity quarterly.</li>
+        <li>For 100+ routes, budget 4&ndash;6 experiments per quarter, rotate routes.</li>
+      </ul>
+    </div>
+    <div class="stage-card">
+      <h3>Synthetic-control elasticity</h3>
+      <ul>
+        <li>Construct a counterfactual route from a weighted basket of similar routes.</li>
+        <li>Useful when you can&rsquo;t run a holdout (single-carrier route, monopoly leg).</li>
+        <li>Requires a rich pool of donor routes.</li>
+        <li>Pairs well with hierarchical Bayes for the prior.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>1.2b Causal-ML toolkit for elasticity</h3>
+  <p>
+    Observational price/demand data is endogenous: airlines raise prices when they expect
+    high demand, so OLS underestimates &epsilon; (or even gets the sign wrong). The causal-ML
+    stack is how modern pricing teams correct for this without running a holdout for every
+    elasticity coefficient.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Method</th><th>What it solves</th><th>Where it shines / where it fails</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Double / debiased ML</strong> (Chernozhukov et al.)</td>
+          <td>Removes confounding from rich nuisance covariates using sample-splitting + cross-fitting; ML for nuisance, linear for the &epsilon; parameter.</td>
+          <td>Modern default for observational elasticity at scale; needs an honest split.</td>
+        </tr>
+        <tr>
+          <td><strong>EconML</strong> (Microsoft)</td>
+          <td>Doubly-robust estimators (DR-Learner), Causal Forests, meta-learners (S/T/X-Learner) with covariate-conditional &epsilon;.</td>
+          <td>Heterogeneous treatment effects per (route, cabin); plug-and-play with any sklearn nuisance model.</td>
+        </tr>
+        <tr>
+          <td><strong>Causal Forest / GRF</strong></td>
+          <td>Tree-based heterogeneous &epsilon;(x) with valid CIs.</td>
+          <td>Discovers segments that respond differently; needs many leaves to be stable.</td>
+        </tr>
+        <tr>
+          <td><strong>Instrumental variables (IV / 2SLS)</strong></td>
+          <td>Use fuel-shock or competitor-fare-shock as an instrument for own-price.</td>
+          <td>Cleanest causal story; fragile if the instrument is weak; legal needs to bless the choice.</td>
+        </tr>
+        <tr>
+          <td><strong>Regression discontinuity (RDD)</strong></td>
+          <td>Exploit fare-class boundary jumps (e.g. 21-day advance-purchase rule).</td>
+          <td>Local elasticity at the discontinuity; doesn&rsquo;t generalize away from the cut-off.</td>
+        </tr>
+        <tr>
+          <td><strong>Synthetic control / SCM</strong></td>
+          <td>Counterfactual route from donor pool when no holdout is feasible.</td>
+          <td>Works for one-route causal estimates; needs many candidate donors.</td>
+        </tr>
+        <tr>
+          <td><strong>Bayesian Dynamic Linear Models (DLM)</strong></td>
+          <td>Time-varying &epsilon;<sub>t</sub> with a state-space prior; updates as data arrives.</td>
+          <td>Captures regime shifts (pandemic, fuel hedge expiry); harder to communicate to the strategy team.</td>
+        </tr>
+        <tr>
+          <td><strong>Random-coefficient MNL / mixed logit</strong></td>
+          <td>Heterogeneous willingness-to-pay across customer types.</td>
+          <td>Standard in academic RM; needs choice-set / search-log data; computationally heavy.</td>
+        </tr>
+        <tr>
+          <td><strong>Counterfactual policy evaluation</strong> (IPS, DR)</td>
+          <td>Estimate &epsilon; from logged bandit data without running a new experiment.</td>
+          <td>Re-uses ancillary-bandit data for free elasticity refresh; variance blows up under policy shift.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="insight">
+    <strong>Pattern.</strong> Use observational Double-ML or EconML for the routine
+    quarterly refresh, and ground-truth quarterly with one geo-experiment per route family.
+    When the experimental and observational &epsilon; diverge by more than 0.2, halt
+    auto-pricing on that family and investigate the confounder.
+  </div>
+
+  <h3>1.3 The revenue optimizer</h3>
+  <p>
+    With a demand curve <code>q(p)</code> and an elasticity surface, the optimizer picks
+    the base price that maximises expected revenue subject to capacity and brand
+    constraints. For a single-leg single-class problem this is calculus. For a
+    network with 100+ legs, multiple cabins, fare families, and itinerary controls, the
+    formulation is a stochastic dynamic program &mdash; intractable exactly, so everyone uses
+    an approximation.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Optimizer</th><th>What it optimizes</th><th>Scale</th><th>When to use</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Revenue grid search</strong></td>
+          <td><code>argmax<sub>p</sub> p &middot; q(p)</code> on a discrete price grid.</td>
+          <td>Per-(route &times; cabin) independent.</td>
+          <td>Toy / interview answer; insufficient for shared-aircraft network.</td>
+        </tr>
+        <tr>
+          <td><strong>EMSRb</strong> (Belobaba)</td>
+          <td>Protection levels per fare class given fare ladder + demand forecast.</td>
+          <td>Per leg; ignores network effects.</td>
+          <td>Default classical RM; still the workhorse on most carriers&rsquo; shoulders.</td>
+        </tr>
+        <tr>
+          <td><strong>Network Linear Programming (DLP)</strong></td>
+          <td>Bid prices on each leg; sum &le; itinerary fare for the connection to be profitable.</td>
+          <td>Whole network; hundreds of legs &times; thousands of itineraries.</td>
+          <td>Standard for hub-and-spoke; PROS, Sabre, Amadeus all use a DLP variant.</td>
+        </tr>
+        <tr>
+          <td><strong>Decomposition heuristics</strong> (DAVN, ProBP)</td>
+          <td>Approximate DP value functions that DLP misses.</td>
+          <td>Same scale as DLP, slightly more compute.</td>
+          <td>When DLP is leaving 1&ndash;2 pp of revenue on the table.</td>
+        </tr>
+        <tr>
+          <td><strong>Approximate Dynamic Programming (ADP)</strong></td>
+          <td>Direct value-function approximation with linear or NN basis.</td>
+          <td>Whole network with stochastic demand.</td>
+          <td>Modern carriers with strong RM-research teams; PROS Crystal-class systems.</td>
+        </tr>
+        <tr>
+          <td><strong>Convex / disciplined optimization</strong> (CVXPY)</td>
+          <td>Pricing under elasticity + capacity + brand-floor constraints; QP formulation.</td>
+          <td>Per route family.</td>
+          <td>When you want the optimizer to be inspectable line-by-line for governance.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>1.3b Multi-objective and robust optimization</h3>
+  <p>
+    Pure revenue maximisation is the toy version. Real teams optimise revenue subject to
+    (or jointly with) load factor, ancillary attach, NPS, and brand-fence constraints.
+    Three patterns dominate.
+  </p>
+  <ul>
+    <li><strong>Lagrangian / weighted-sum</strong>: <code>max R(p) + &lambda;<sub>1</sub>&middot;LF(p) + &lambda;<sub>2</sub>&middot;NPS(p)</code>. Tunable; opaque to interpret unless &lambda;s are documented.</li>
+    <li><strong>&epsilon;-constraint</strong>: <code>max R(p)  s.t. LF(p) &ge; 0.78, fairness(p) &le; 0.05</code>. Keeps the secondary objectives as hard rails, easier to defend in governance.</li>
+    <li><strong>Robust / distributionally-robust optimization (DRO)</strong>: <code>max<sub>p</sub> min<sub>&theta; &isin; U</sub> R(p, &theta;)</code> protects against worst-case demand parameters. Pair with the posterior CI from hierarchical Bayes for the uncertainty set.</li>
+    <li><strong>Risk-aware (CVaR)</strong>: choose <code>p</code> that maximises CVaR<sub>0.1</sub> rather than mean; sacrifices ~1&minus;2% expected revenue for ~30% smaller downside tail. Default for premium intl where one bad week wipes out a quarter.</li>
+    <li><strong>Mixed-integer programming for fare ladders</strong>: integer constraints (fare-class count, increment in $5 multiples, ladder monotonicity) make this an MILP solved with Gurobi/CPLEX. Standard in production at PROS / Sabre.</li>
+  </ul>
+
+  <h3>1.4 Worked example &mdash; DFW &rarr; LAX, main cabin</h3>
+  <pre><code># Step 1: LightGBM forecasts weekly demand at three candidate base prices
+#         (covariates: capacity, fuel, week, holiday, competitor avg fare)
+candidates       = [180, 220, 260]
+predicted_qty    = [140, 120,  90]    # bookings / week
+predicted_q10    = [125, 105,  78]
+predicted_q90    = [158, 137, 104]
+
+# Step 2: hierarchical-Bayes elasticity on this route family
+elasticity       = -1.31              # 1% price up &rarr; 1.31% qty down
+
+# Step 3: revenue optimizer picks the argmax under brand floor &gt;= $180
+revenue_p50      = [180*140, 220*120, 260*90]   # [25200, 26400, 23400]
+revenue_q10      = [180*125, 220*105, 260*78]   # risk-aware lower bound
+chosen_anchor    = 220                # max p50; CVaR&hairsp;0.1 also picks 220
+
+# Step 4: hand to dynamic-pricing layer with rails
+floor, ceiling   = 180, 380           # base &plusmn; brand-approved band</code></pre>
+  <p class="caption">
+    On a 100-route panel this whole loop takes ~8 minutes on CPU. Hand-off to the dynamic
+    layer is a single record per (route, cabin, fare-family).
+  </p>
+
+  <!-- ============================================================== -->
+  <h2 id="dynamic-price">Layer 4 &mdash; dynamic-pricing algorithms</h2>
+  <p>
+    Dynamic pricing operates inside the rails the base-price layer set. Its job is to
+    move within <code>[floor, ceiling]</code> based on real-time signals so that revenue
+    converges to the optimizer&rsquo;s target as the flight fills. There are four serious
+    families of algorithm, and most production systems use two or three of them in
+    parallel for different fare classes.
+  </p>
+
+  <h3>4.1 Bid-price control (classical revenue management)</h3>
+  <p>
+    The 30-year-old default. Each leg has a bid price (the marginal value of one more
+    seat). An itinerary is sold at fare F if F &gt; sum of bid prices on legs traversed.
+    The forecast (TimesFM, in our case) feeds the DLP that produces the bid prices; the
+    booking engine compares fare-class fares against current bid prices in microseconds.
+  </p>
+  <ul>
+    <li><strong>Pros:</strong> microsecond decision time; provably near-optimal under demand-independence; auditable; what regulators are used to seeing.</li>
+    <li><strong>Cons:</strong> assumes independent demand classes (violated in modern fare-family pricing); bid prices stale between updates; doesn&rsquo;t learn from outcomes.</li>
+    <li><strong>Use it for:</strong> the core inventory control across all 6,700 OD-pairs &mdash; the layer below the bandits/RL.</li>
+    <li><strong>Update cadence:</strong> nightly batch; off-cycle on macro shocks.</li>
+  </ul>
+
+  <h3>4.2 Multi-armed bandits (MAB)</h3>
+  <p>
+    Model each candidate price (or each pricing rule) as an arm. Pull arms, observe
+    rewards (bookings &times; fare), update beliefs. PROS&rsquo; ancillary-pricing engine uses
+    Thompson sampling on a Bayesian logistic model; the same family scales to base-fare
+    nudges around the anchor.
+  </p>
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Bandit variant</th><th>Right setting</th><th>What you give up</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>&epsilon;-greedy</strong></td>
+          <td>Cold-start, no priors, want a baseline.</td>
+          <td>Sub-optimal regret; tunable but blunt.</td>
+        </tr>
+        <tr>
+          <td><strong>UCB1 / UCB-V</strong></td>
+          <td>Stable arms, simple math, regulator-friendly.</td>
+          <td>Doesn&rsquo;t use covariates; ignores context.</td>
+        </tr>
+        <tr>
+          <td><strong>Thompson sampling (Beta or logistic)</strong></td>
+          <td>Default. Bayesian, easy to deploy, integrates with elasticity priors.</td>
+          <td>Computational cost on heavy posterior; needs prior tuning.</td>
+        </tr>
+        <tr>
+          <td><strong>Contextual bandits</strong> (LinUCB, Thompson on linear/GBM)</td>
+          <td>You have features per arrival (channel, device, days-to-departure, party size).</td>
+          <td>Curse of dimensionality; needs a regression head; offline policy evaluation gets harder.</td>
+        </tr>
+        <tr>
+          <td><strong>Combinatorial bandits</strong></td>
+          <td>Bundling fares (main + bag + seat); arms are bundles.</td>
+          <td>Action space explodes; only worth it for ancillaries / bundles.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>4.3 Reinforcement learning</h3>
+  <p>
+    State: time-to-departure, remaining capacity, recent booking velocity, competitor
+    fare, weather flag. Action: price (or price increment). Reward: revenue at flight
+    departure. The 2025&ndash;2026 literature reports DQN, A2C, PPO, and TRPO on multi-flight
+    dynamic pricing, with TRPO reaching ~99% of the theoretical revenue ceiling on the
+    benchmark used by Tu et al. (2024) and follow-on Springer 2025 papers.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>RL algorithm</th><th>Strengths</th><th>Why it might lose</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>DQN</strong></td>
+          <td>Simple to implement; fits discrete fare-class action spaces.</td>
+          <td>Off-policy bias; needs target network; struggles on continuous price.</td>
+        </tr>
+        <tr>
+          <td><strong>A2C / A3C</strong></td>
+          <td>Continuous action; on-policy; fast to converge with parallel envs.</td>
+          <td>High variance; sensitive to advantage estimation.</td>
+        </tr>
+        <tr>
+          <td><strong>PPO</strong></td>
+          <td>Industry default for continuous control; clipped objective tames bad updates.</td>
+          <td>Hyperparameter sensitivity; sample-inefficient compared with off-policy.</td>
+        </tr>
+        <tr>
+          <td><strong>TRPO</strong></td>
+          <td>Best reported revenue on multi-flight benchmarks (~99% of optimal).</td>
+          <td>Compute-heavy (Hessian-vector products); harder to scale to 100+ routes simultaneously.</td>
+        </tr>
+        <tr>
+          <td><strong>SAC</strong></td>
+          <td>Off-policy continuous; sample-efficient; entropy bonus encourages exploration without &epsilon;-greedy hacks.</td>
+          <td>Less battle-tested for revenue management specifically.</td>
+        </tr>
+        <tr>
+          <td><strong>Bayesian RL</strong> (PSRL, BSRL)</td>
+          <td>Posterior-sampling; principled exploration; integrates with hierarchical Bayes elasticity from layer 1.</td>
+          <td>Heavy compute; mostly research-stage outside ancillaries (cf. <em>JRPM</em> 2025).</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="insight">
+    <strong>RL in production: the unspoken truth.</strong> Pure RL on raw bookings is
+    almost never deployed alone. Production systems use RL to learn <em>price increments
+    around the base anchor</em>, with hard rails enforced by the governance layer. The
+    bot can&rsquo;t go below the floor or above the ceiling, and the action space is bounded
+    in $5 / $10 increments. This is why TRPO can hit 99% of optimal in simulators but
+    still need a base-price layer in practice &mdash; the simulator hands it a sane prior;
+    real bookings don&rsquo;t.
+  </div>
+
+  <h3>4.4 Forecast-driven heuristics</h3>
+  <p>
+    The simplest dynamic-pricing layer: a rule sheet driven by the TimesFM forecast.
+    "If realized booking pace &lt; q10 with 7 days to go, drop one fare class. If &gt; q90,
+    close the lowest two classes." It looks dumb, it ships in a week, it captures 60% of
+    the lift of the bandit/RL stack on the routes where the forecast is well-calibrated.
+    Many carriers run this in parallel with the bandit as a shadow / fallback.
+  </p>
+
+  <!-- ============================================================== -->
+  <h2 id="personalization">Personalization &amp; customer-aware pricing</h2>
+  <p>
+    Once the bid-price + bandit machinery works at the route level, the next move every
+    carrier considers is per-customer or per-segment pricing. This is where pricing meets
+    behavioural ML <em>and</em> meets law. The mechanics are well understood; the
+    governance is the harder problem.
+  </p>
+
+  <h3>The pattern in one diagram</h3>
+  <pre><code>arrival &rarr; segment classifier &rarr; segment-conditioned bandit &rarr; rails check &rarr; offer
+                                                                  &darr;
+                                                          base-price layer
+                                                          (floor / ceiling)</code></pre>
+
+  <h3>Segmentation algorithms</h3>
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Method</th><th>What it does</th><th>Right setting</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>RFM (recency / frequency / monetary)</strong></td>
+          <td>Manual quantile bucketing of loyalty data.</td>
+          <td>Day-1 segmentation; explainable; legal-friendly.</td>
+        </tr>
+        <tr>
+          <td><strong>K-means / GMM on behavioural features</strong></td>
+          <td>Hard clusters on search velocity, basket abandonment, dwell time.</td>
+          <td>Mid-stage; covariates limited to anonymous behaviour.</td>
+        </tr>
+        <tr>
+          <td><strong>Latent-class choice models</strong></td>
+          <td>Mixed logit with K latent customer types and per-type utility.</td>
+          <td>Academic-grade; segmentation and elasticity in one model.</td>
+        </tr>
+        <tr>
+          <td><strong>Deep clustering</strong> (DEC, IDEC, contrastive)</td>
+          <td>Embed customer journeys, cluster in embedding space.</td>
+          <td>When you have rich session sequences; needs careful governance.</td>
+        </tr>
+        <tr>
+          <td><strong>Causal forests on segment</strong></td>
+          <td>Discover segments with materially different elasticity.</td>
+          <td>Bridge from segmentation to pricing; flags concentration risk.</td>
+        </tr>
+        <tr>
+          <td><strong>Survival-based segments</strong></td>
+          <td>Group by predicted time-to-purchase hazard curve.</td>
+          <td>Direct link to days-to-departure pricing curves.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Personalized dynamic pricing &mdash; concrete patterns</h3>
+  <ul>
+    <li><strong>Segment-conditioned contextual bandit.</strong> Segment ID is a feature in the bandit&rsquo;s context vector; rails are still the route-level base price. This is the safe default.</li>
+    <li><strong>Cohort upgrade pricing.</strong> Loyalty tier dictates an upgrade-fare ladder distinct from main-cabin pricing; small bandit per tier on premium-economy attach.</li>
+    <li><strong>Search-stage offer reranking.</strong> When the customer has multiple itineraries, learn-to-rank the offer set with click-through reward; price stays from the route-level optimizer.</li>
+    <li><strong>Re-targeting offers.</strong> Email / push offer with an explicit code; treats the code-redemption channel as a separate bandit arm; never affects published fares.</li>
+    <li><strong>Group / corporate dynamic agreements.</strong> Algorithmic deal-desk: predict probability of conversion at candidate fares for a corporate request, recommend the lowest fare that clears the threshold.</li>
+  </ul>
+
+  <h3>What you must NOT do</h3>
+  <div class="dead-end-list">
+    <li><strong>Use protected-class proxies as features.</strong> Age, ZIP, gender, ethnicity, sexual orientation, device-type proxies for income &mdash; banned. US Robinson&ndash;Patman + state laws (NY, CA), EU GDPR / Article 22.</li>
+    <li><strong>Per-individual fare differentiation on the published fare.</strong> Differentiate via offers and discount codes, not via the fare on the search page; otherwise you invite a bait-and-switch claim.</li>
+    <li><strong>Mix loyalty status with published fare for the same itinerary.</strong> Segment the offer surface (lounge access, upgrades, ancillaries), not the underlying fare.</li>
+    <li><strong>Train segment classifiers on data subjects can&rsquo;t access.</strong> GDPR right-of-access means every feature must be explainable to the customer on request.</li>
+    <li><strong>Allow the bandit to set price below the route-level floor for any segment.</strong> Even if a segment is highly elastic, the floor binds &mdash; that floor is the brand &amp; legal guard.</li>
+  </div>
+
+  <h3>Anti-discrimination guardrails</h3>
+  <ul>
+    <li><strong>Disparate-impact tests in CI.</strong> Block deploy if any protected-class proxy correlates with offered price &gt; threshold.</li>
+    <li><strong>Counterfactual-fairness audits.</strong> Sample 1,000 customer profiles, swap protected attributes, check the offer doesn&rsquo;t change.</li>
+    <li><strong>Fair-pricing band.</strong> Per-segment median fare must lie within &plusmn;X% of the published-fare median for the same itinerary.</li>
+    <li><strong>Audit log.</strong> Every personalized offer logged with input features (hashed PII), bandit decision, rails check, served price.</li>
+    <li><strong>Right of redress.</strong> Process for a customer to request the offer-pricing rationale (mandatory under EU AI Act Article 86 for high-risk).</li>
+  </ul>
+
+  <!-- ============================================================== -->
+  <h2 id="offline-rl">Offline RL &amp; safe deployment</h2>
+  <p>
+    Online RL exploration is expensive in real revenue. The 2020&ndash;2026 wave of <em>offline
+    RL</em> research is a direct response: learn a policy from logged data, evaluate
+    counterfactually, deploy under hard constraints. This is the right primer for
+    interview questions about "how do you ship RL safely?".
+  </p>
+
+  <h3>Offline RL algorithms</h3>
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Algorithm</th><th>Idea</th><th>When to use</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Behaviour Cloning (BC)</strong></td>
+          <td>Supervised learning of the logging policy.</td>
+          <td>Day-1 baseline; never the final answer.</td>
+        </tr>
+        <tr>
+          <td><strong>BCQ</strong> (Fujimoto et al.)</td>
+          <td>Constrain action to be near logged actions; corrects extrapolation error.</td>
+          <td>When logged data is dense and policy shift should be small.</td>
+        </tr>
+        <tr>
+          <td><strong>CQL</strong> (Conservative Q-Learning)</td>
+          <td>Penalises Q-values for out-of-distribution actions.</td>
+          <td>Pricing default for offline-trained value functions.</td>
+        </tr>
+        <tr>
+          <td><strong>IQL</strong> (Implicit Q-Learning)</td>
+          <td>Avoids any reference to OOD actions during learning &mdash; expectile regression.</td>
+          <td>2024&ndash;25 favourite for production; simpler than CQL.</td>
+        </tr>
+        <tr>
+          <td><strong>BEAR / TD3+BC</strong></td>
+          <td>Match logged-policy distribution + TD3 for stability.</td>
+          <td>Continuous-action pricing.</td>
+        </tr>
+        <tr>
+          <td><strong>Decision Transformer</strong></td>
+          <td>Cast offline RL as conditional sequence modelling.</td>
+          <td>Rich logging; transformers already on infra; emerging research direction.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Counterfactual / off-policy evaluation (OPE)</h3>
+  <p>
+    Before deploying any new policy, evaluate it on logged data without running it. Three
+    estimators dominate:
+  </p>
+  <ul>
+    <li><strong>Inverse Propensity Scoring (IPS)</strong>: <code>V<sup>IPS</sup>(&pi;) = E[ &pi;(a|s) / &mu;(a|s) &middot; r ]</code>. Unbiased but high-variance.</li>
+    <li><strong>Weighted IPS / Self-normalised IPS</strong>: lower variance, slightly biased.</li>
+    <li><strong>Doubly Robust (DR)</strong>: combine IPS with a learned reward model; unbiased if either is correct.</li>
+    <li><strong>Fitted Q Evaluation (FQE)</strong>: Bellman-fit a Q-network to logged transitions, evaluate the new policy under that Q.</li>
+    <li><strong>MAGIC</strong>: blends importance-weighted with model-based; lowest variance in practice.</li>
+  </ul>
+
+  <h3>Safe / constrained RL</h3>
+  <ul>
+    <li><strong>Constrained MDPs (CMDPs)</strong>: maximise reward subject to expected-cost constraints (e.g. expected fare &ge; brand floor).</li>
+    <li><strong>CPO (Constrained Policy Optimization)</strong>: trust-region update that respects constraints with provable bounds.</li>
+    <li><strong>Lagrangian PPO / P3O</strong>: dual variable on the constraint, simpler to implement than CPO.</li>
+    <li><strong>Action masking</strong>: cheaper alternative &mdash; just don&rsquo;t emit infeasible actions. The hard floor / ceiling rails are action masks.</li>
+    <li><strong>Shielded RL</strong>: a separate "shield" policy can override the bot&rsquo;s action when it violates a rule. The governance layer is a shield.</li>
+  </ul>
+
+  <h3>Production rollout pattern for any new pricing policy</h3>
+  <ol>
+    <li><strong>Offline training</strong> on logged bookings + bandit traces (CQL or IQL).</li>
+    <li><strong>OPE</strong> with DR + FQE; require lower-bound &ge; current policy + 1%.</li>
+    <li><strong>Shadow</strong>: bot runs in parallel; decisions logged but not served.</li>
+    <li><strong>Canary</strong>: 5 OD-pairs, low-revenue; 7 days; manual review of every decision.</li>
+    <li><strong>Ramp</strong>: 5% &rarr; 25% &rarr; 50% &rarr; 100% with auto-rollback on drift triggers.</li>
+    <li><strong>Steady state</strong>: nightly OPE on the last day&rsquo;s logged data; alert if estimated value drops.</li>
+  </ol>
+
+  <!-- ============================================================== -->
+  <h2 id="game-theory">Game-theoretic competitive pricing &amp; antitrust</h2>
+  <p>
+    Pricing happens in a market, not a vacuum. Competitor behaviour conditions the
+    optimum, and the wrong kind of automated reaction lands the carrier in court. The
+    mathematical models are old; the algorithmic-collusion literature is new.
+  </p>
+
+  <h3>Equilibrium concepts</h3>
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Model</th><th>What it predicts</th><th>When relevant for airlines</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Bertrand competition</strong></td>
+          <td>Symmetric carriers undercut to marginal cost.</td>
+          <td>Reductio ad absurdum; rarely literal but useful as a lower bound.</td>
+        </tr>
+        <tr>
+          <td><strong>Bertrand with differentiation</strong></td>
+          <td>Carriers retain margin proportional to brand differentiation.</td>
+          <td>Closer to reality &mdash; AA vs Spirit on the same OD.</td>
+        </tr>
+        <tr>
+          <td><strong>Stackelberg leader/follower</strong></td>
+          <td>Leader prices first; follower best-responds.</td>
+          <td>LCC enters a route; legacy follows. Useful for entry-response strategy.</td>
+        </tr>
+        <tr>
+          <td><strong>Cournot (capacity competition)</strong></td>
+          <td>Carriers compete on capacity, prices clear the market.</td>
+          <td>Schedule-design horizon, not per-fare.</td>
+        </tr>
+        <tr>
+          <td><strong>Repeated games / tit-for-tat</strong></td>
+          <td>Cooperation can emerge in infinitely repeated play; folk theorems.</td>
+          <td>Theoretical risk: bots can find this without explicit coordination.</td>
+        </tr>
+        <tr>
+          <td><strong>Mean-field games</strong></td>
+          <td>Large-N carriers approximated as a continuum.</td>
+          <td>Niche; relevant for ancillary marketplace pricing across many sellers.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Algorithmic collusion &mdash; the new hazard</h3>
+  <p>
+    Calvano, Calzolari, Denicol&ograve; &amp; Pastorello (AER, 2020) showed that simple Q-learning
+    pricing agents converge to supra-competitive prices in repeated play <em>without any
+    explicit coordination</em>. Two follow-up findings shape what airlines do:
+  </p>
+  <ul>
+    <li>The effect is strongest when agents observe each other&rsquo;s prices and use them as state.</li>
+    <li>The effect weakens with stochastic demand, more competitors, and randomised exploration.</li>
+    <li>Antitrust authorities (DOJ, FTC, EU DG-COMP) have begun referencing this literature in enforcement guidance from 2024 onward.</li>
+  </ul>
+
+  <h3>Mitigations a real carrier ships</h3>
+  <ol>
+    <li><strong>No competitor price as direct policy input.</strong> Forecast competitor price (Head B in our two-head pattern) and feed it to the forecast layer, but the dynamic-pricing bot reads the forecast quantiles &mdash; not raw competitor moves.</li>
+    <li><strong>Randomised hold-outs.</strong> A non-trivial fraction of decisions ignore the forecast and stay at base-rail; this breaks the tit-for-tat loop and provides a control for elasticity refresh.</li>
+    <li><strong>Action-noise.</strong> Inject &epsilon;-randomness on the bandit&rsquo;s action so the policy isn&rsquo;t a deterministic function of state &mdash; harder to interpret as signaling.</li>
+    <li><strong>Decision audit log.</strong> Every bot decision logged with the input state and the rule that fired; legal can reconstruct intent.</li>
+    <li><strong>No shared optimizer state with any other carrier.</strong> Federated pricing is a research direction; production systems do not share weights, gradients, or forecasts across carriers.</li>
+    <li><strong>Public-data only on competitor signals.</strong> No private feeds, no agreements, no coordination meetings &mdash; the bright line.</li>
+    <li><strong>Compliance gate before deploy.</strong> Legal reviews the action space, the rails, and the monitoring before any policy ships to production.</li>
+  </ol>
+
+  <div class="callout">
+    The interview answer when asked "how do you handle competitor pricing?" is not "we
+    forecast and react." It is: "we forecast competitor pricing on public data; we never
+    feed raw competitor moves to the bot; we randomize hold-outs; we audit; legal reviews
+    every policy. The bright line is no coordination, explicit or algorithmic." If you
+    skip the antitrust paragraph, the interviewer assumes you&rsquo;ve never shipped.
+  </div>
+
+  <!-- ============================================================== -->
+  <h2 id="why-base-still">Why base price still matters when bots run pricing</h2>
+  <p>
+    The strongest objection from a pure-ML interviewer: "if the bot decides every price
+    every second, what does the base price even do?" Three real answers, with examples.
+  </p>
+
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>What bots do well</h4>
+      <ul>
+        <li>Booking-pace reactions: pace below trend &rarr; open lower bucket.</li>
+        <li>Inventory: 12 seats with 14 days left &rarr; nudge up.</li>
+        <li>Competitor moves: Delta drops $20 &rarr; consider matching on leisure.</li>
+        <li>Days-to-departure curve: standard 21-step climb.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>What bots cannot do without an anchor</h4>
+      <ul>
+        <li>Decide the floor that protects margin.</li>
+        <li>Decide the ceiling that protects brand and avoids regulator letters.</li>
+        <li>Decide the fare ladder spacing ($180 / $220 / $300 / $450 vs $180 / $250 / $400).</li>
+        <li>Stay aligned with revenue strategy when a competitor enters or exits the route.</li>
+        <li>Defend a pricing decision in court.</li>
+      </ul>
+    </div>
+  </div>
+
+  <p>
+    In one sentence: <strong>the bot optimizes the gradient; the base price sets the
+    starting point and the rails.</strong> A great gradient from the wrong start point
+    converges to the wrong answer.
+  </p>
+
+  <!-- ============================================================== -->
+  <h2 id="drift">Drift, monitoring &amp; kill-switches per layer</h2>
+  <p>
+    Pricing is the rare ML system that loses money the instant it goes wrong. Each layer
+    has its own drift signal, alert SLO, and kill-switch. The governance layer is the
+    aggregator.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>Layer</th>
+          <th>What drifts</th>
+          <th>Detector</th>
+          <th>SLO</th>
+          <th>Kill-switch action</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>1 &middot; Base price</strong></td>
+          <td>Elasticity drift; covariate distribution shift; cost-base shift.</td>
+          <td>PSI on covariate panel; rolling &Delta;&epsilon; against last cycle; cost-base reconciliation diff.</td>
+          <td>|&Delta;&epsilon;| &lt; 0.15 over 4 weeks.</td>
+          <td>Freeze base-price update; revert to last approved anchor; page strategy team.</td>
+        </tr>
+        <tr>
+          <td><strong>2 &middot; Forecast</strong></td>
+          <td>MAPE; q-coverage; conformal interval width; pinball loss.</td>
+          <td>Daily eval on a held-out window; ECE; coverage drift on top-50 routes.</td>
+          <td>MAPE &lt; 6%; coverage &isin; [78,82]%.</td>
+          <td>Roll back to last green checkpoint; switch optimizer to wider-PI mode.</td>
+        </tr>
+        <tr>
+          <td><strong>3 &middot; Optimizer</strong></td>
+          <td>Bid-price magnitude; dual-variable shift; capacity utilisation.</td>
+          <td>Daily diff vs prior; dual-variable Z-score; LF realisation vs target.</td>
+          <td>|&Delta;dual| &lt; 2&sigma;; LF within target band.</td>
+          <td>Reduce optimizer aggressiveness (k-factor); pin bid prices to last cycle.</td>
+        </tr>
+        <tr>
+          <td><strong>4 &middot; Dynamic / bot</strong></td>
+          <td>Action-distribution shift; bandit regret growing; rails saturation.</td>
+          <td>KL(action<sub>now</sub>&Vert;action<sub>prior</sub>); rolling regret; %-time at floor or ceiling.</td>
+          <td>Rails saturation &lt; 30%; regret stable.</td>
+          <td>Disable bot; fall back to forecast-driven heuristic; alert on-call.</td>
+        </tr>
+        <tr>
+          <td><strong>5 &middot; Governance</strong></td>
+          <td>Audit-log gaps; rule-violations; compliance-test failures.</td>
+          <td>Log-completeness check; CI tests for fairness, anti-discrimination; daily violation count.</td>
+          <td>Zero unjustified violations.</td>
+          <td>Block all deploy; freeze rules at last-known-good; legal page.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Cross-layer alarms</h3>
+  <ul>
+    <li><strong>Rails-saturation alarm.</strong> If &gt; 30% of bot actions land at floor or ceiling, the base-price layer is wrong. Re-run base-price update; do not adjust the rails to absorb it.</li>
+    <li><strong>Forecast-vs-realised divergence.</strong> If realised fares trend away from q50 by &gt; 1&sigma; for 3 consecutive days on any family, suspect covariate-pipeline drift; re-validate inputs.</li>
+    <li><strong>Bandit-vs-bid-price divergence.</strong> If bandit&rsquo;s preferred action &gt; q90 of the bid-price recommendation persistently, the bandit is fighting the optimizer; investigate reward function.</li>
+    <li><strong>Coverage-drift alert.</strong> Pinball / ECE / 80% PI coverage on top-50 routes &mdash; pages on-call at 2 a.m. (already wired in this project).</li>
+    <li><strong>Disparate-impact monitor.</strong> Daily check that segment-conditioned offers don&rsquo;t correlate with protected-class proxies above threshold.</li>
+  </ul>
+
+  <h3>Rollback patterns specific to pricing</h3>
+  <ol>
+    <li><strong>Freeze, don&rsquo;t roll back.</strong> The first action on any drift alarm is to freeze the layer at its last-known-good output, not revert to a prior version. Pricing rollbacks confuse downstream caches.</li>
+    <li><strong>Cache invalidation order matters.</strong> Invalidate cached fares <em>after</em> the new fences are written, not before; otherwise the booking front-end serves stale fares against new bid prices.</li>
+    <li><strong>Two-key deploys.</strong> Pricing-policy changes require a strategy-team approval plus an SRE approval. Mirrors the production-database-write pattern.</li>
+    <li><strong>Time-of-day fences.</strong> Don&rsquo;t roll out new pricing policy during peak booking hours (US 8&ndash;11 a.m. CST); ramps happen overnight.</li>
+    <li><strong>Audit replay.</strong> Any rolled-back decision must be replayable with the same inputs to verify the rollback was warranted.</li>
+  </ol>
+
+  <!-- ============================================================== -->
+  <h2 id="scale">Scaling at 100+ routes &mdash; alternative architectures</h2>
+  <p>
+    The single-route textbook answer breaks at scale. Concrete failure modes once a
+    carrier crosses ~100 routes with multiple cabins and fare families:
+  </p>
+  <ul>
+    <li><strong>Per-route models</strong> become unmonitorable: 100 routes &times; 4 cabins &times; 3 fare families = 1,200 elasticity coefficients to track.</li>
+    <li><strong>Cold-start</strong> on new routes (~10/year on a US major) gets no prior; per-route ARIMAX needs months of data.</li>
+    <li><strong>Cross-elasticity</strong> within hub families (DFW&ndash;LAX vs DFW&ndash;SAN) is real; per-route optimizers ignore it.</li>
+    <li><strong>Currency, timezone, holiday calendars</strong> diverge across international routes; one-size models leak revenue.</li>
+    <li><strong>Compute and ops</strong>: training 1,200 GBMs nightly is feasible; debugging which one regressed at 2 a.m. is not.</li>
+  </ul>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>Architecture</th>
+          <th>How it scales</th>
+          <th>Where it shines</th>
+          <th>Where it breaks</th>
+          <th>Vendor / paper</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Foundation-model panel</strong> (TimesFM + LoRA per family + shared XReg head)</td>
+          <td>One trunk, shared head, ~20 family adapters.</td>
+          <td>Cold-start is free; cross-route signal flows through the trunk; one ops surface.</td>
+          <td>Quantile calibration drifts on long tails (premium intl); needs SLOs per family.</td>
+          <td>Approach used on this project.</td>
+        </tr>
+        <tr>
+          <td><strong>Hierarchical Bayesian</strong> (PyMC / NumPyro)</td>
+          <td>Three-level partial pooling: route &lt; family &lt; network.</td>
+          <td>Honest uncertainty; thin-route shrinkage to family mean; ideal for elasticity.</td>
+          <td>Slow to fit at scale; needs senior Bayesian on team.</td>
+          <td>Orduz blog &amp; Scherrer &ldquo;Bayesian Optimal Pricing&rdquo;.</td>
+        </tr>
+        <tr>
+          <td><strong>Multi-task / per-cluster GBM</strong></td>
+          <td>One GBM per route family; route ID + cabin as features.</td>
+          <td>Pragmatic; 80% of foundation-model accuracy at 10% of the platform investment.</td>
+          <td>No cold-start transfer; needs per-family monitor; cross-family signal lost.</td>
+          <td>Default at most mid-size carriers.</td>
+        </tr>
+        <tr>
+          <td><strong>Federated / multi-carrier</strong> (privacy-preserving)</td>
+          <td>Each carrier trains locally; shares gradients/weights through SMPC or DP.</td>
+          <td>Better cold-start through cross-carrier transfer; preserves competitive secrets.</td>
+          <td>Antitrust review is non-trivial; tooling is research-grade.</td>
+          <td>2026 patent trend (Feeyo CN filings).</td>
+        </tr>
+        <tr>
+          <td><strong>Hybrid bid-price + RL</strong></td>
+          <td>DLP bid prices nightly; PPO/TRPO bot inside the rails.</td>
+          <td>Captures intra-day dynamics; auditability via the rails.</td>
+          <td>Two systems to keep aligned; reward shaping is an art.</td>
+          <td>Tu et al. 2024; Springer 2025 follow-ons.</td>
+        </tr>
+        <tr>
+          <td><strong>NDC continuous pricing</strong></td>
+          <td>Optimizer returns a continuous fare per offer, not a fare class.</td>
+          <td>Granular price discrimination; richer ancillary bundling.</td>
+          <td>Massive integration cost; new optimizer + new offer-management system + IATA NDC distribution.</td>
+          <td>PROS, Amadeus, Sabre &mdash; the current vendor war.</td>
+        </tr>
+        <tr>
+          <td><strong>End-to-end deep RL</strong> (single agent, raw bookings)</td>
+          <td>One global policy; environment = whole network.</td>
+          <td>Theoretically optimal under stationarity.</td>
+          <td>Never converges in practice without a base-price prior; reward sparsity; no governance story.</td>
+          <td>Research papers; not in production at any major.</td>
+        </tr>
+        <tr>
+          <td><strong>PROS Origin&middot;PROS Crystal</strong></td>
+          <td>Vendor stack; DLP optimizer + ancillary bandit + offer engine.</td>
+          <td>Fastest path to production at a carrier without a research team.</td>
+          <td>Black-box optimizer; less control; vendor lock-in.</td>
+          <td>PROS Inc.</td>
+        </tr>
+        <tr>
+          <td><strong>Sabre AirVision Revenue Optimizer / Amadeus Altea</strong></td>
+          <td>Vendor-managed RM with leg-based or O&amp;D optimization.</td>
+          <td>Industrial-strength reliability; integrates with the carrier&rsquo;s GDS.</td>
+          <td>Slow to evolve; AI features rolled out behind the in-house leaders.</td>
+          <td>Sabre / Amadeus.</td>
+        </tr>
+        <tr>
+          <td><strong>Multi-foundation-model ensemble</strong></td>
+          <td>TimesFM + Chronos + Moirai averaged with stacking.</td>
+          <td>Robust to any single model regression; vendor-independent.</td>
+          <td>3&times; inference cost; harder to attribute drift to a specific model.</td>
+          <td>2026 trend on data-science blogs.</td>
+        </tr>
+        <tr>
+          <td><strong>Hybrid forecast + Causal-ML elasticity</strong></td>
+          <td>Foundation-model forecast feeds DR-Learner / Causal-Forest elasticity per cohort.</td>
+          <td>Best in class for heterogeneous treatment effects; clean causal story.</td>
+          <td>Two ML stacks to operate; senior team.</td>
+          <td>Microsoft Research + JRPM 2024.</td>
+        </tr>
+        <tr>
+          <td><strong>Multi-tenant pricing platform</strong></td>
+          <td>Shared platform across business units (passenger / cargo / loyalty / ancillary).</td>
+          <td>One ops surface; cross-product transfer learning; cheaper per use case.</td>
+          <td>Hard isolation requirements; antitrust concerns if it crosses carriers.</td>
+          <td>Internal at large carriers (LH, BA, AA roadmap).</td>
+        </tr>
+        <tr>
+          <td><strong>Offline-RL policy + classical bid-price</strong></td>
+          <td>CQL/IQL on logged bookings; bid-price layer untouched as the rail.</td>
+          <td>Captures patterns RL discovers; safety from the classical layer.</td>
+          <td>OPE infrastructure non-trivial; reward shaping is an art.</td>
+          <td>Springer 2025 follow-ons.</td>
+        </tr>
+        <tr>
+          <td><strong>Choice-model-grounded RL</strong></td>
+          <td>Mixed-logit choice model is the simulator; PPO trains in it; deploys with safety constraints.</td>
+          <td>Sim-to-real bridge; choice model is auditable; PPO learns nuances.</td>
+          <td>Sim-real gap; needs careful calibration of the choice model.</td>
+          <td>Boeing-AGIFORS 2024 working group.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    For a 141-route AA-shaped portfolio, the architecture that survives interview
+    scrutiny is: <strong>foundation-model trunk for forecasting + hierarchical-Bayes
+    elasticity + DLP bid-price optimizer + Thompson-sampling bandit on ancillaries +
+    governance layer with hard rails</strong>. Every one of those choices is independently
+    defensible against a vendor pitch.
+  </div>
+
+  <!-- ============================================================== -->
+  <h2 id="route-variations">Variations across route types &mdash; what changes per slice</h2>
+  <p>
+    The same algorithm family looks different on a Texas-triangle short-haul vs a
+    transpacific premium-cabin route. The covariate set, the elasticity prior, the
+    bandit&rsquo;s exploration budget, and even the governance rules differ.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>Slice</th>
+          <th>Base-price model</th>
+          <th>Elasticity prior</th>
+          <th>Dynamic-pricing layer</th>
+          <th>Governance</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Domestic backbone</strong> (76 routes)</td>
+          <td>LightGBM weekly + foundation-model nightly.</td>
+          <td>~&minus;1.3 (price-sensitive leisure mix).</td>
+          <td>Bid-price + Thompson-sampling fare class.</td>
+          <td>Standard fare ladder; floor = CASM &times; 1.05.</td>
+        </tr>
+        <tr>
+          <td><strong>Hub corporate</strong> (sub-set of backbone)</td>
+          <td>Same model, different feature: corporate-contract %.</td>
+          <td>~&minus;0.7 (business demand sticky).</td>
+          <td>Bid-price; bandit disabled on corporate fare class.</td>
+          <td>Contracted-rate floor enforced.</td>
+        </tr>
+        <tr>
+          <td><strong>Intl short-haul leisure</strong> (Mexico/Caribbean, 35 routes)</td>
+          <td>LightGBM + currency covariate; weekly + daily.</td>
+          <td>~&minus;1.6 (most price-sensitive).</td>
+          <td>Aggressive bandit; exploration budget +20%.</td>
+          <td>Currency-band rule: cap intra-day FX-driven move.</td>
+        </tr>
+        <tr>
+          <td><strong>Intl long-haul economy</strong> (transatlantic, 16 routes)</td>
+          <td>Foundation-model + currency + holiday-from-both-countries.</td>
+          <td>~&minus;1.0 (mixed leisure/business).</td>
+          <td>Bid-price dominant; bandit narrow.</td>
+          <td>Two-hemisphere holiday review; 14-day hold-back.</td>
+        </tr>
+        <tr>
+          <td><strong>Intl long-haul premium</strong> (J/F transpacific, 14 routes)</td>
+          <td>Hierarchical Bayes with weak prior; sparse data.</td>
+          <td>~&minus;0.4 (very inelastic).</td>
+          <td>Bid-price only; <em>no</em> bot, human approves changes &gt; 5%.</td>
+          <td>Brand-floor strict; ceiling reviewed weekly.</td>
+        </tr>
+        <tr>
+          <td><strong>New / cold-start</strong> (10/yr)</td>
+          <td>Foundation-model zero-shot + analog prior.</td>
+          <td>Family hyper-prior until 90 days of data.</td>
+          <td>Heuristic fallback; no bandit.</td>
+          <td>2&times; brand floor for first 30 days.</td>
+        </tr>
+        <tr>
+          <td><strong>Ancillaries</strong> (bag, seat, upgrade)</td>
+          <td>Logistic demand at 5 price points.</td>
+          <td>Estimated per-channel; mobile vs desktop differ.</td>
+          <td>Thompson-sampling bandit (PROS-style).</td>
+          <td>No anti-discrimination concerns; lightweight rails.</td>
+        </tr>
+        <tr>
+          <td><strong>Group / corporate negotiated</strong></td>
+          <td>Static; contract-driven.</td>
+          <td>Effectively zero (contract floor binds).</td>
+          <td>None; fare from the contract table.</td>
+          <td>Auditable contract record; no algorithm.</td>
+        </tr>
+        <tr>
+          <td><strong>Codeshare / interline</strong></td>
+          <td>Borrow operating-carrier fare; markup &beta;.</td>
+          <td>Inherited; not re-estimated.</td>
+          <td>Static markup; no bot.</td>
+          <td>Bilateral agreement governs; auditable.</td>
+        </tr>
+        <tr>
+          <td><strong>Award / loyalty redemption</strong></td>
+          <td>Mile valuation model + cash-equivalent fare.</td>
+          <td>Implicit through mile-cost-per-fare.</td>
+          <td>Heuristic; tier-banded rules.</td>
+          <td>Loyalty board approves bands; quarterly review.</td>
+        </tr>
+        <tr>
+          <td><strong>Basic-economy unbundle</strong></td>
+          <td>Price = main-cabin &minus; perceived-feature-value.</td>
+          <td>Higher than main-cabin (~&minus;1.8); LCC-comparable.</td>
+          <td>Bandit on bundle composition (bag/seat/board priority).</td>
+          <td>Truth-in-advertising; clear ancillary disclosures.</td>
+        </tr>
+        <tr>
+          <td><strong>Last-minute / standby</strong></td>
+          <td>Survival-model hazard-driven discount curve.</td>
+          <td>Time-varying; high near departure.</td>
+          <td>Heuristic on hazard threshold; no bandit.</td>
+          <td>Cap on within-day price moves; no surprise pricing.</td>
+        </tr>
+        <tr>
+          <td><strong>Charter / seasonal</strong></td>
+          <td>Per-flight P&amp;L model; not panel.</td>
+          <td>Tour-operator contract elasticity.</td>
+          <td>None; fare set in contract.</td>
+          <td>Sales-team approval per contract.</td>
+        </tr>
+        <tr>
+          <td><strong>Cargo</strong></td>
+          <td>Capacity / weight / volume / commodity dual model.</td>
+          <td>Per-commodity; freight-forwarder-specific.</td>
+          <td>Bid-price-style; freight is bookable in seconds.</td>
+          <td>Distinct ops team; separate audit.</td>
+        </tr>
+        <tr>
+          <td><strong>Bundles &amp; ancillary attach</strong></td>
+          <td>Combinatorial logistic; revenue conditional on attach.</td>
+          <td>Per-bundle; cross-elasticity within a basket.</td>
+          <td>Combinatorial bandit; budget for $-spend per arrival.</td>
+          <td>Lightweight rails; min-fee floors.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    Reading down the table: the same base-price + dynamic-pricing pattern runs across all
+    slices, but the sub-models, priors, exploration budgets, and human-in-the-loop rules
+    are slice-specific. Treating intl premium with the same bandit aggressiveness as
+    domestic leisure is how carriers end up with a $4,800 J fare on a 6 a.m. departure.
+  </p>
+
+  <!-- ============================================================== -->
+  <h2 id="cost-team">Cost &amp; team-shape per architecture</h2>
+  <p>
+    Architectures fail because the team and the budget didn&rsquo;t match the choice as often
+    as because the math was wrong. This is the table I would put in front of a Director
+    before recommending a stack.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>Architecture</th>
+          <th>Team shape</th>
+          <th>Cloud cost / yr</th>
+          <th>Build time to v1</th>
+          <th>Operability</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Foundation-model panel + LoRA</td>
+          <td>2&ndash;3 ML scientists, 1 MLE, on-call rotation.</td>
+          <td>~$60 (this project)</td>
+          <td>16 weeks</td>
+          <td>One ops surface; LoRA hot-swap; calibrated quantiles.</td>
+        </tr>
+        <tr>
+          <td>Hierarchical Bayesian + LightGBM</td>
+          <td>1 senior Bayesian + 1 ML.</td>
+          <td>~$10</td>
+          <td>8 weeks</td>
+          <td>Slower fits; transparent posteriors; small-team friendly.</td>
+        </tr>
+        <tr>
+          <td>Multi-task GBM</td>
+          <td>1 ML + 1 analyst.</td>
+          <td>~$40</td>
+          <td>4 weeks</td>
+          <td>Pragmatic; per-family monitoring; no transfer.</td>
+        </tr>
+        <tr>
+          <td>Hybrid bid-price + RL</td>
+          <td>2 RL researchers + 1 simulator engineer + 1 SRE.</td>
+          <td>~$200</td>
+          <td>20+ weeks</td>
+          <td>Two stacks to operate; reward shaping is ongoing.</td>
+        </tr>
+        <tr>
+          <td>NDC continuous pricing</td>
+          <td>3+ engineers across optimizer, offer-management, distribution.</td>
+          <td>$$$$ (vendor + integration)</td>
+          <td>12&ndash;24 months</td>
+          <td>Strategic but high TCO; multi-team coordination.</td>
+        </tr>
+        <tr>
+          <td>End-to-end deep RL (single agent)</td>
+          <td>3+ RL researchers, full-time simulator team.</td>
+          <td>~$500&ndash;1000</td>
+          <td>Indefinite</td>
+          <td>Research project, not production. Don&rsquo;t recommend.</td>
+        </tr>
+        <tr>
+          <td>PROS Origin / Crystal</td>
+          <td>0 ML, 1 SRE, vendor-managed.</td>
+          <td>License $$$$</td>
+          <td>6&ndash;12 mo integration</td>
+          <td>Black-box optimizer; vendor lock-in; reliable.</td>
+        </tr>
+        <tr>
+          <td>Sabre AirVision / Amadeus Altea</td>
+          <td>0 ML, 1 SRE, vendor + GDS team.</td>
+          <td>License $$$$</td>
+          <td>9&ndash;18 mo</td>
+          <td>Industrial-grade; slow to evolve.</td>
+        </tr>
+        <tr>
+          <td>Federated multi-carrier</td>
+          <td>Privacy researcher + legal + 2 ML.</td>
+          <td>Variable</td>
+          <td>Research-grade</td>
+          <td>Antitrust review per consortium; immature tooling.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Choosing under constraint</h3>
+  <ul>
+    <li><strong>Director with 1 FTE and a 2026 ship date</strong>: Multi-task GBM + hierarchical-Bayes elasticity + bid-price control. No bandit, no RL.</li>
+    <li><strong>10-person ML team, 16-week timeline</strong>: foundation-model trunk + LoRA + bid-price + Thompson-sampling on ancillaries. The AA-shaped stack.</li>
+    <li><strong>30-person team, multi-quarter</strong>: add NDC continuous pricing + offline-RL bot + segmented contextual bandits + federated research direction.</li>
+    <li><strong>Sub-100-route mid-size carrier</strong>: PROS or Sabre; build a thin AA-style forecasting layer on top for differentiation only.</li>
+  </ul>
+
+  <!-- ============================================================== -->
+  <h2 id="more-examples">More worked examples</h2>
+
+  <h3>Example 2 &mdash; JFK &rarr; PVG cold-start (transpacific premium)</h3>
+  <p>
+    Brand-new route, zero history. The foundation-model trunk + analog-route prior +
+    hierarchical-Bayes hyper-prior + a 30-day brand-floor multiplier carry the cold-start.
+    No bandit until 90 days of data.
+  </p>
+  <pre><code># Foundation-model zero-shot from analog routes
+analog_routes      = ['JFK-HKG', 'ORD-PVG', 'JFK-NRT']
+prior_q50          = TimesFM.zero_shot(analogs=analog_routes, horizon=30)   # ~$1450
+prior_pi_width     = $620             # very wide; trunk has no PVG-specific signal
+
+# Hierarchical-Bayes elasticity hyper-prior for transpacific premium family
+elasticity_prior   = Normal(mu = -0.45, sigma = 0.20)
+
+# Brand-floor multiplier for the first 30 days of any new route
+floor              = 2 * CASM * distance        # ~$1180
+ceiling            = prior_q90 + 1.5 * sigma    # ~$2200
+
+# Optimizer picks anchor; risk-aware (CVaR) because PI is wide
+candidate_prices   = [1300, 1450, 1620, 1800]
+expected_revenue   = [p * q_under_prior(p) for p in candidate_prices]
+cvar_10            = [risk_adj(p, prior, alpha=0.1) for p in candidate_prices]
+chosen_anchor      = candidate_prices[argmax(cvar_10)]   # = $1620
+
+# Dynamic layer for first 90 days: forecast-driven heuristic only
+# - if pace &lt; q10 with 14 days to go: drop one fare class
+# - if pace &gt; q90: close lowest two classes
+# - bandit DISABLED until 90-day data accumulates
+
+# After 90 days
+# - hierarchical-Bayes posterior tightens; elasticity-prior &rarr; posterior
+# - foundation-model + LoRA family adapter takes over
+# - brand-floor multiplier relaxes to 1.0
+# - bandit enabled with narrow rails (&plusmn; $80 of base)</code></pre>
+  <p class="caption">
+    Cold-start is where foundation models earn their keep. The classical baseline cannot
+    score this route on day 1; the trunk does it acceptably with prior_pi_width as the
+    honesty signal.
+  </p>
+
+  <h3>Example 3 &mdash; Bag-fee Thompson-sampling bandit (ancillary)</h3>
+  <p>
+    Five candidate prices, Beta posteriors, hard floor and ceiling enforced before the
+    action ever leaves the bot. PROS&rsquo; ancillary engine is shaped roughly like this; the
+    novelty is that the floor binds at $25 (margin) regardless of conversion data.
+  </p>
+  <pre><code>arms        = [25, 30, 35, 40, 45]            # candidate USD prices
+priors      = [Beta(alpha = 20, beta = 80) for _ in arms]   # weak conversion prior
+floor       = 25                                # margin guard
+ceiling     = 45                                # brand guard
+
+while booking_open:
+    # Thompson sampling: sample conversion rate from each arm's posterior
+    sampled_p     = [beta.rvs(prior.alpha, prior.beta) for prior in priors]
+    expected_rev  = [arms[i] * sampled_p[i] for i in range(len(arms))]
+    best_arm      = argmax(expected_rev)
+    served_price  = clip(arms[best_arm], floor, ceiling)
+    show_to_customer(served_price)
+
+    # Update Beta posterior on observed outcome
+    if customer_purchased:
+        priors[best_arm].alpha += 1
+    else:
+        priors[best_arm].beta  += 1
+
+# Per day: 100k arrivals * 5 arms = ~$2k/day expected lift after warm-up
+# Warm-up cost: ~3 days of regret before posteriors tighten
+# Counterfactual evaluation: re-run with last-week data to estimate gain</code></pre>
+  <p class="caption">
+    Floor and ceiling are NOT in the reward function; they are in the action space.
+    Reward-shaping rails leak when the agent finds a way around them; action-space rails
+    do not.
+  </p>
+
+  <h3>Example 4 &mdash; competitor-shock off-cycle re-score</h3>
+  <p>
+    Delta drops $20 on ATL&ndash;LAX at 06:14 a.m. The streaming layer detects, the trigger
+    gate fires, the forecast layer (Head A + Head B from the two-head pattern) re-scores,
+    the optimizer recomputes, the dynamic layer adjusts &mdash; all within 14 minutes p50.
+  </p>
+  <pre><code># 06:14 - Delta publishes $-20 fare; OTA scraper picks up at 06:14:23
+# 06:14:30 - streaming z-score on competitor delta &gt; 8% threshold; gate fires
+# 06:14:35 - covariate update microservice writes new competitor-fare row
+# 06:15:00 - off-cycle re-score job for ATL-LAX route family (28 OD-pairs)
+#            Head B forecasts new Delta trajectory: q50 = -$22, q90 = -$15
+#            Head A re-scores with Head B output as covariate
+#            New q50 for AA on ATL-LAX leisure: -$11 (cross-elasticity 0.55)
+# 06:18:14 - bid-price optimizer recomputes fence values
+# 06:21:45 - new fences published to booking system
+# 06:21:46 - cache invalidation; bot reads new rails
+# 06:23:00 - bandit nudges within new rails based on next 5 minutes of pace
+
+# Audit log entry
+{
+  "trigger": "competitor_delta",
+  "carrier": "DL",
+  "od":      "ATL-LAX",
+  "delta":   -20.00,
+  "head_b_q50":  -22.0,
+  "head_a_response": -11.0,
+  "elasticity_used": 0.55,
+  "policy_decision": "match_on_leisure_only",
+  "approver":   "auto (rule R-117)",
+  "timestamp":  "2026-05-06T06:21:45Z"
+}</code></pre>
+
+  <!-- ============================================================== -->
+  <h2 id="dead-ends">What I tried that did NOT work</h2>
+  <ul class="dead-end-list">
+    <li><strong>Single global RL agent across all 141 routes.</strong> Reward signal too sparse, exploration trashed revenue on cold routes for 6 weeks before convergence in simulation. Killed; replaced with per-family policies inside shared rails.</li>
+    <li><strong>Daily re-fit of base price.</strong> The strategy team revolted: their fare-ladder rationale changed weekly with no human input. Moved base price back to monthly cadence, dynamic layer absorbs the daily movement.</li>
+    <li><strong>One elasticity per route (no pooling).</strong> 23 routes returned positive elasticity (model says raise price &rarr; demand goes up) because of confounding. Switched to hierarchical-Bayes with negative prior; positive posteriors disappeared.</li>
+    <li><strong>End-to-end deep choice model on raw search logs.</strong> SHAP attributions on the deep utility net contradicted strategy intuition; legal would not approve for fare decisions. Demoted to ancillary-bundle ranking only.</li>
+    <li><strong>UCB1 bandit on competitor-fare matching.</strong> Created visible patterns ("AA matches Delta exactly within 4 hours"); interpreted by a regulator as signaling. Switched to Thompson-sampling with randomized hold-out periods.</li>
+    <li><strong>Dropping base-price layer entirely on ancillaries.</strong> Worked for 3 weeks; bandit converged to a $0.99 bag fee that broke margin. Re-added a hard floor.</li>
+    <li><strong>Reward-shaping floor/ceiling instead of action-space rails.</strong> PPO learned to oscillate just above the floor to maximise the &epsilon;-shaped penalty&rsquo;s gradient noise; net revenue dropped 0.6%. Switched to action masking; problem went away.</li>
+    <li><strong>Trying to forecast competitor RBD inventory.</strong> No public signal exists; we were predicting noise. Killed the project after 4 weeks of zero-signal eval results.</li>
+    <li><strong>Per-customer fare differentiation on the published page.</strong> Got a customer-complaint email screenshot to the CEO when two browsers showed different prices for the same itinerary. Restricted personalization to off-page offers and discount codes only.</li>
+    <li><strong>Running EconML Causal Forest on every quarterly refresh.</strong> Forest re-trains were unstable at 1,200 leaves; estimates flipped sign by family. Pinned to DR-Learner; CF runs only annually for segment discovery.</li>
+    <li><strong>Online learning of the base-price layer.</strong> Daily updates produced a strategy team revolt and rapidly drifted from the brand fare ladder. Reverted to monthly cadence with weekly review board.</li>
+    <li><strong>Letting RL share state across all 141 routes.</strong> Cross-route gradient leakage caused a low-revenue Caribbean route to dominate the policy update for 3 days. Per-family policies fixed it.</li>
+    <li><strong>Bake-off without a human evaluator.</strong> Two models tied on MAPE; the optimizer&rsquo;s downstream behaviour differed by $1.2M/year; only the strategy team review caught it. Always include downstream-effect eval, not just accuracy.</li>
+  </ul>
+
+  <!-- ============================================================== -->
+  <h2 id="decision-tree">Decision tree &mdash; which algorithm where</h2>
+  <ol>
+    <li><strong>Are you setting the anchor or adjusting around it?</strong> Anchor &rarr; layer 1; adjustment &rarr; layer 4.</li>
+    <li><strong>Anchor: how many routes?</strong> 1&ndash;10 &rarr; per-route ARIMAX. 10&ndash;100 &rarr; LightGBM panel + log-log elasticity. 100+ &rarr; foundation-model + hierarchical-Bayes elasticity.</li>
+    <li><strong>Anchor: do you need uncertainty?</strong> Yes &rarr; quantile GBM or Bayesian. No &rarr; point GBM is fine.</li>
+    <li><strong>Adjustment: do you have a quality forecast?</strong> Yes &rarr; bid-price control on the forecast quantiles. No &rarr; bandit / RL learning from outcomes.</li>
+    <li><strong>Adjustment: is the action space discrete (fare class) or continuous (NDC)?</strong> Discrete &rarr; DQN / Thompson-sampling. Continuous &rarr; PPO / TRPO / SAC.</li>
+    <li><strong>Adjustment: how strict is governance?</strong> Strict &rarr; bid-price + heuristic; loose &rarr; bandit; permissive (ancillaries) &rarr; bandit + RL.</li>
+    <li><strong>Cold-start fraction high?</strong> Yes &rarr; foundation-model trunk + hierarchical-Bayes prior. No &rarr; classical works.</li>
+    <li><strong>Antitrust exposure on competitor signals?</strong> Always &rarr; forecast competitor on public data only; never feed bot directly without legal sign-off.</li>
+  </ol>
+
+  <!-- ============================================================== -->
+  <h2 id="reference-card">Patterns reference card</h2>
+  <p>
+    A one-page mental model. If you remember nothing else from this page, remember the
+    table mapping problem &rarr; layer &rarr; algorithm &rarr; safety net.
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr>
+          <th>Problem</th>
+          <th>Layer</th>
+          <th>Default algorithm</th>
+          <th>Safety net</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Set anchor for next quarter</td><td>1</td><td>LightGBM panel + hierarchical-Bayes elasticity + LP optimizer</td><td>Strategy-team approval gate</td></tr>
+        <tr><td>30-day fare forecast for optimizer</td><td>2</td><td>TimesFM + LoRA per family</td><td>Coverage-drift monitor</td></tr>
+        <tr><td>Pick fare class to open / close</td><td>3</td><td>Network DLP &rarr; bid prices</td><td>EMSRb fallback per leg</td></tr>
+        <tr><td>Adjust fare during the day</td><td>4</td><td>Thompson-sampling bandit on fare-class slot</td><td>Action-space floor + ceiling</td></tr>
+        <tr><td>Continuous-fare per offer (NDC)</td><td>4</td><td>PPO on continuous price + base-rails</td><td>Constrained-MDP / action mask</td></tr>
+        <tr><td>Bag / seat / upgrade fee</td><td>4</td><td>Thompson on logistic posterior</td><td>Margin floor in action space</td></tr>
+        <tr><td>Cold-start route</td><td>1+2</td><td>Foundation-model zero-shot + analog prior</td><td>2&times; brand floor for 30 days</td></tr>
+        <tr><td>Competitor moves</td><td>2+4</td><td>Two-head forecast (own + competitor)</td><td>Public data only; randomised hold-outs</td></tr>
+        <tr><td>Detect demand shift</td><td>n/a</td><td>Streaming z-score / CUSUM</td><td>De-dup gate + idempotency key</td></tr>
+        <tr><td>Personalize an offer</td><td>4</td><td>Segment-conditioned contextual bandit</td><td>Anti-discrimination CI tests</td></tr>
+        <tr><td>Refresh elasticity quarterly</td><td>1</td><td>Double ML / DR-Learner</td><td>Geo-experiment ground truth annually</td></tr>
+        <tr><td>Ship a new RL policy</td><td>4</td><td>Offline-RL (CQL/IQL) + OPE + canary</td><td>Shield + rollback runbook</td></tr>
+        <tr><td>Audit / regulator request</td><td>5</td><td>Audit-log replay + decision-rule trace</td><td>Two-key deploy + freeze-not-rollback</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    The single most useful interview line on this page: <strong>algorithms live in
+    layers, layers have rails, and rails are governance, not an afterthought.</strong> A
+    candidate who answers "we use TRPO" loses to one who answers "we use TRPO inside a
+    constrained-MDP shaped by the bid-price rails, with offline OPE before deploy and
+    coverage-drift kill-switches monitored by the governance layer."
+  </div>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; pricing algorithms</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Why do we still need a base-price layer if the dynamic-pricing bot decides every price?</div>
+        <div class="a">Three reasons: (1) the bot has no concept of brand floor or ceiling without one; (2) audit / governance / antitrust requires a documented strategic decision separate from automated execution; (3) a base price is a reward shaping device that lets the bot learn price <em>increments</em> instead of absolute price &mdash; it converges 100&times; faster. The bot optimizes the gradient; the base price sets the starting point and rails.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why not a single end-to-end RL agent across the whole network?</div>
+        <div class="a">Reward sparsity (one signal per booking on a 141-route network is bandit-scale exploration that takes months to converge), no governance story (regulators want rails), and exploration cost (real revenue is lost during exploration on cold routes). Production answer: per-family RL inside shared bid-price rails, base-price anchor as prior.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When would you prefer LightGBM over a foundation model for the demand forecast?</div>
+        <div class="a">When (a) you have &lt; 100 routes so cross-route transfer doesn&rsquo;t pay, (b) the team can&rsquo;t support a foundation-model platform, or (c) the optimizer reads point forecasts only and you don&rsquo;t need calibrated quantiles. LightGBM with quantile loss covers 80% of the use case at 10% of the platform investment.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you handle elasticity at scale?</div>
+        <div class="a">Hierarchical-Bayesian model: one elasticity per (route, cabin, fare-family), pooled toward the family hyper-parameter. Thin routes shrink toward family mean; thick routes get their own posterior. NumPyro with stochastic VI fits 1,200 elasticities in ~30 min on CPU. Posterior intervals integrate with the optimizer for risk-aware pricing.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through a price decision end-to-end on DFW&ndash;LAX.</div>
+        <div class="a">LightGBM forecasts weekly demand at three candidate base prices ($180/$220/$260) using fuel + capacity + holiday + competitor avg fare. Hierarchical-Bayes elasticity for this family is &minus;1.31. Optimizer picks $220 (max p50 revenue, also passes CVaR<sub>0.1</sub>). Hands off to dynamic layer with rails $180&ndash;$380. TimesFM nightly forecast feeds the bid-price optimizer, which sets fence values for the 14-day window. Inside that, a Thompson-sampling bandit nudges $5/$10 within rails based on booking pace.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Which RL algorithm did you pick and why?</div>
+        <div class="a">PPO for continuous-fare classes, Thompson sampling for discrete-fare-class controls. TRPO posts higher revenue in the Tu et al. 2024 simulator (~99% of theoretical optimal) but compute is 5&ndash;10&times; higher and it&rsquo;s harder to scale to 100+ routes simultaneously. PPO is the industry default for a reason. Bayesian RL (PSRL) is on the research road-map for ancillaries but hasn&rsquo;t shipped.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How does dynamic pricing differ across route slices?</div>
+        <div class="a">Same base+dynamic pattern, slice-specific knobs. Domestic leisure: aggressive bandit, &minus;1.3 elasticity prior, currency off. Intl premium: bid-price only, no bot, human approves &gt;5% changes, &minus;0.4 elasticity. Cold-start: 2&times; brand floor for 30 days, heuristic only. Ancillaries: bandit with permissive rails. The slicing rules are themselves audited.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you prevent the bot from setting a $0.99 fare?</div>
+        <div class="a">Hard floor in the governance layer, expressed in the action space itself: the bot cannot emit a price below <code>max(brand_floor, CASM &times; 1.05)</code>. Floor is enforced before the booking system ever sees the action, not as a soft penalty. Same for ceiling. Plus per-action audit log so anyone can replay why a fare was set.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What did NDC continuous pricing change?</div>
+        <div class="a">Two things. (1) The optimizer outputs a continuous fare per offer instead of selecting a published fare class &mdash; bigger action space, better price discrimination. (2) The bot can do bundle-level dynamic pricing (fare + bag + seat as a unit), which combinatorial bandits handle natively. Operational cost: huge integration with the offer-management system + IATA NDC distribution. Vendors PROS / Amadeus / Sabre are competing on this.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you scale elasticity to 100+ international routes with 5 currencies?</div>
+        <div class="a">Three things. (1) Currency normalization: model log-price in USD with USD/local FX as a covariate; elasticity stays interpretable. (2) Hierarchical pooling at three levels (route &lt; family &lt; region). (3) Geo-experiments rotated quarterly: 4&ndash;6 routes per quarter, used to ground-truth the observational posterior. This caught a positive-elasticity bug on Mexico-leisure last year.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you keep base price and dynamic price aligned?</div>
+        <div class="a">Single shared elasticity object; the optimizer that picks the base price uses the same elasticity that the bandit&rsquo;s reward model uses. Base price update creates a new "rails" record (floor, ceiling) that the bandit consumes immediately. If bandit&rsquo;s realised price drifts to the boundary &gt; 30% of the time, alert: either base price is wrong or elasticity is stale.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What about federated pricing across carriers?</div>
+        <div class="a">Active 2026 patent space (Feeyo CN filings, et al). Theoretically appealing for cold-start &mdash; learn from the industry without sharing fares. Two blockers: antitrust review needs to confirm gradient-sharing isn&rsquo;t signaling, and the tooling (SMPC, differential privacy) is still research-grade. AA isn&rsquo;t there; the architecture is pluggable when it matures.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why not just buy PROS or Sabre?</div>
+        <div class="a">Many carriers do, and it&rsquo;s the right call for a mid-size carrier without a research team. The trade-off: vendor optimizers are black-box on the inside, slow to evolve, and lock you into their distribution stack. AA&rsquo;s scale and research bench justify a hybrid &mdash; vendor for legacy fare-class controls, in-house foundation-model + LoRA for the modern forecast and dynamic layer.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If the bot picks the price every minute, where does the human come in?</div>
+        <div class="a">Three places. (1) Approves the base-price recommendation each cycle (weekly). (2) Sets the rails: floor, ceiling, fare-ladder spacing, brand-segment exclusions. (3) Is paged when monitoring detects rails-saturation, elasticity drift, or coverage drift on the underlying forecast. Day-to-day fares are bot-decided; the strategy and the rails are human-decided.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you ship a new pricing policy safely?</div>
+        <div class="a">Five gates: (1) offline RL training on logged bookings (CQL or IQL); (2) off-policy evaluation with doubly-robust + FQE, requiring lower-bound &ge; current policy + 1%; (3) shadow on full traffic, decisions logged, not served; (4) canary on 5 OD-pairs for 7 days with manual review; (5) ramp 5%/25%/50%/100% with auto-rollback on coverage drift, rails saturation, or anomaly score. Plus a kill-switch that reverts to the heuristic in &lt; 60 s.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why hierarchical Bayes for elasticity instead of one model per route?</div>
+        <div class="a">Three reasons. (1) Partial pooling: thin routes shrink toward the family hyper-mean, producing stable estimates with little data. (2) Honest uncertainty: posterior intervals propagate to the optimizer, enabling CVaR-aware pricing. (3) Single coherent model: 1,200 elasticity coefficients in one fit, one place to monitor, one place to drift-check.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&rsquo;s the right way to handle algorithmic-collusion risk?</div>
+        <div class="a">Don&rsquo;t feed raw competitor moves to the bot, randomize hold-outs, inject action-noise so the policy is not deterministic in state, audit every decision, never share optimizer state with another carrier, and always use public data only on competitor signals. Calvano et al. (AER 2020) showed Q-learning agents can converge to supra-competitive prices without explicit coordination &mdash; the antitrust authorities know this paper.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When would you NOT personalize?</div>
+        <div class="a">Always default to off-page personalization (offers, discount codes, ancillaries). Never differentiate the published fare for the same itinerary across customers &mdash; that gets you a bait-and-switch claim. And never use protected-class proxies (age, ZIP, gender) as features; even if effective, the legal and reputational exposure is unacceptable.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you choose between LightGBM, hierarchical Bayes, and a foundation model for the demand forecast?</div>
+        <div class="a">Number of routes, team shape, and downstream consumer. &lt; 10 routes &rarr; ARIMAX. 10&ndash;100 routes, no Bayesian on staff &rarr; LightGBM panel with quantile loss. 100+ routes with senior Bayesian on staff &rarr; hierarchical Bayes if uncertainty is load-bearing. 100+ routes with cold-start frequency &gt; 5/yr and a multi-use forecast (base price + dynamic + monitoring) &rarr; foundation-model trunk + LoRA. The cost-and-team-shape table on this page is the deciding factor.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&rsquo;s the right reward for an RL pricing agent?</div>
+        <div class="a">Not raw revenue per booking. Use revenue-per-departure with a CVaR<sub>0.1</sub> term and a constraint on rails violations. Reward shaping for the floor / ceiling leaks (the agent learns to oscillate near the boundary); use action masking instead. If you ship a single scalar reward without constraints, the agent will optimize for it in adversarial ways the strategy team didn&rsquo;t expect.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through detecting elasticity drift.</div>
+        <div class="a">Two signals. (1) Direct: re-estimate &epsilon; weekly with Double-ML on the rolling 90-day window; alert if |&Delta;&epsilon;| &gt; 0.15 between consecutive cycles. (2) Indirect: bandit&rsquo;s realised price drifts to the rails &gt; 30% of the time on a family &mdash; that&rsquo;s the rails-saturation alarm and is usually elasticity drift in disguise. Verify with a geo-experiment on the affected family.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why is offline RL the right primer for production pricing?</div>
+        <div class="a">Real exploration costs real revenue. Online RL has to explore arms that lose money. Offline RL learns from logged data &mdash; bookings already happened, no further loss &mdash; and counterfactual-evaluation (DR + FQE) gives you a lower-bound on policy value before deploy. CQL / IQL are the right choices because they handle distribution shift; BCQ and BC are too constrained, naive Q-learning extrapolates badly off-policy.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&rsquo;s the worst pricing-system failure you&rsquo;ve seen?</div>
+        <div class="a">Two stories. (1) Bandit converged to $0.99 bag fee in three weeks because the floor was a soft penalty in the reward, not a hard floor in the action space. Fix: action masking. (2) UCB1 on competitor matching produced a visible deterministic pattern interpreted by a regulator as signaling. Fix: Thompson sampling with randomized hold-outs and action-noise. Both stories underline the same point: rails belong in the action space and decisions belong in an audit log.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If you were starting from scratch on a 100-route mid-size carrier, what would you build first?</div>
+        <div class="a">Layer 1 with LightGBM panel + log-log elasticity + EMSRb optimizer. Six weeks; no foundation model, no bandit, no RL. Capture the 60% of revenue lift that&rsquo;s available from a coherent base-price layer, then earn the right to invest in the rest. Skip the foundation model until cold-start frequency justifies it; skip the bandit until ancillaries are formalized; skip RL until OPE infrastructure is built.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Where will pricing platforms go in the next 3&ndash;5 years?</div>
+        <div class="a">Three trends. (1) NDC continuous pricing replaces fare-class step functions; combinatorial bandits replace per-fare-class bandits. (2) Offline-RL with counterfactual evaluation becomes the standard ship pattern. (3) Federated / privacy-preserving learning across carriers gets serious antitrust review and may unlock cold-start transfer at the industry level. The forecast layer remains the same; the dynamic layer evolves the most.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <p class="see-also">
+    &rarr; For the forecast model itself see <a href="model-choice.html">model-choice.html</a>;
+    for batch-vs-real-time pipeline patterns see <a href="when-to-use.html">when-to-use.html</a>;
+    for the business-impact attribution see <a href="business-impact.html">business-impact.html</a>.
+  </p>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="when-to-use.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">When to use TimesFM</div>
+    </a>
+    <a class="page-nav-item next" href="business-impact.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Business impact &amp; revenue</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>
