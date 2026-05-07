@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Foundation TS Models Survey &middot; AA Pricing Forecast</title>
+<meta name="description" content="Architecture-by-architecture deep dive of foundation time-series models: TimesFM 2.5, Chronos-T5, Chronos-Bolt, Moirai, Moirai-MoE, Lag-Llama, TimeGPT, MOMENT, Tiny Time Mixers (TTM). Pretraining corpora, output styles, when to pick each at AA's scale." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Architectures</a> &nbsp;/&nbsp; <span>Foundation TS survey</span>
+  </nav>
+
+  <h1>Foundation TS models &mdash; architecture-by-architecture</h1>
+  <p class="lead">
+    A model-by-model deep dive of every foundation time-series model that
+    seriously competes for the forecast layer. Each section: parameters, output
+    style, training corpus, attention pattern, why the design choices were made,
+    and when you would pick this one over TimesFM at AA&apos;s 6,700-route footprint.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> The space is now ~9 credible foundation TS models
+    (TimesFM, Chronos-T5, Chronos-Bolt, Moirai, Moirai-MoE, Lag-Llama, TimeGPT,
+    MOMENT, TTM). Three architectural axes split them: <em>encoder vs decoder
+    vs MLP-mixer</em>, <em>continuous regression vs discrete-token
+    classification</em>, and <em>dense vs sparse-MoE</em>. TimesFM (decoder,
+    continuous, dense) wins for our footprint. Chronos-Bolt is the best
+    head-to-head competitor. Moirai-MoE is the most compelling research bet for
+    the next refresh. TTM is the right pick if a tier-3 carrier asked us to
+    deploy on CPU.
+  </div>
+
+  <h2>The decision axes</h2>
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Axis</th><th>Options</th><th>What each implies</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Backbone</td>
+          <td>decoder-only / encoder-decoder / encoder-only / MLP-mixer / SSM</td>
+          <td>Decoder for variable horizon; enc-dec for fixed horizon; mixer for cheap inference; SSM for very long context.</td>
+        </tr>
+        <tr>
+          <td>Output style</td>
+          <td>continuous quantile / Gaussian / Student-T / discrete-token / NegBin / sample-based</td>
+          <td>Continuous quantile is the audit-friendly default; discrete-token (Chronos) shines on heavy-tailed series; Gaussian fails on count data.</td>
+        </tr>
+        <tr>
+          <td>Tokenization</td>
+          <td>raw value / patched / lagged / quantile-binned</td>
+          <td>Patched is dominant; quantile-binned (Chronos) is the only way to apply pure NLP transformers; lagged (Lag-Llama) is interpretable.</td>
+        </tr>
+        <tr>
+          <td>Sparsity</td>
+          <td>dense / sparse-MoE / hard-routed / soft-MoE</td>
+          <td>Dense scales by parameters; sparse-MoE scales by total parameters with constant FLOPs per token (Moirai-MoE).</td>
+        </tr>
+        <tr>
+          <td>Multivariate handling</td>
+          <td>channel-independent / channel-mixing / global-attention / variate-token (iTransformer)</td>
+          <td>Channel-independent (TimesFM, PatchTST) is more robust under spurious correlation; channel-mixing wins when correlations are real.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>1 &middot; TimesFM 2.5 (Google Research)</h2>
+  <p><strong>Released:</strong> March 2026. <strong>Params:</strong> 200 M dense, frozen for fine-tune.</p>
+  <p>
+    Decoder-only transformer over patches of 32 timepoints; emits a 128-step
+    forecast with continuous-quantile output head; RoPE + QK-norm attention.
+    Open weights under research license. Full architecture deep-dive in
+    <a href="timesfm-internals.html">timesfm-internals.html</a>.
+  </p>
+  <ul>
+    <li><strong>Pretraining corpus</strong>: ~2 T tokens. Google Trends + Wikipedia pageviews + LOTSA + Monash + GIFT-Eval + synthetic procedurally-generated series.</li>
+    <li><strong>Output</strong>: continuous quantile (q10..q90) over 128 future patches.</li>
+    <li><strong>Strengths</strong>: cold-start, long-horizon, 16 K context, native covariates via XReg head.</li>
+    <li><strong>Weaknesses</strong>: no joint multivariate dynamics; struggles on regime shifts inside the window.</li>
+    <li><strong>When to pick</strong>: 100+ series, mix of mature and new (cold-start), 30+ day horizons, audit-friendly. <em>Our pick.</em></li>
+  </ul>
+
+  <h2>2 &middot; Chronos-T5 (Amazon)</h2>
+  <p><strong>Released:</strong> March 2024. <strong>Params:</strong> 8 M / 20 M / 46 M / 200 M / 710 M (Tiny / Mini / Small / Base / Large).</p>
+  <p>
+    Encoder-decoder T5 transformer over <em>quantile-tokenized</em> series. The
+    central insight: scale the time series into 4096 buckets, treat each
+    bucket as a vocabulary token, then literally apply a T5 language model.
+    Output is a sequence of bucket tokens; sampling produces a probabilistic
+    forecast.
+  </p>
+  <ul>
+    <li><strong>Pretraining corpus</strong>: ~84 M sequences from Monash, GluonTS, real-world utility/finance/retail data, plus ~10 M synthetic Gaussian-process and ARIMA series.</li>
+    <li><strong>Output</strong>: discrete sample-based. 20 sample paths from the decoder, each step is an autoregressive token.</li>
+    <li><strong>Strengths</strong>: cleanest probabilistic forecasts (every quantile derivable from sample paths); strong on heavy-tailed series because tokenization is uniform-bucket.</li>
+    <li><strong>Weaknesses</strong>: autoregressive sampling is slow (one token per step per sample &times; 20 samples = 20&times; the cost of TimesFM); fixed bucket vocabulary loses precision on tight-distribution series.</li>
+    <li><strong>When to pick</strong>: heavy-tailed series (intraday volatility, anomaly forecasting), short horizon, latency budget that tolerates 20&times; sampling. <em>Not for us.</em></li>
+  </ul>
+
+  <h2>3 &middot; Chronos-Bolt (Amazon)</h2>
+  <p><strong>Released:</strong> December 2024. <strong>Params:</strong> 9 M / 21 M / 48 M / 205 M (Tiny / Mini / Small / Base).</p>
+  <p>
+    A T5 encoder-decoder, but <em>patched</em> like TimesFM and with a <em>direct
+    multi-step</em> quantile head instead of autoregressive token sampling. Up to
+    250&times; faster and ~5% more accurate than original Chronos at the same
+    parameter count. Trained on 100 B time-series observations.
+  </p>
+  <ul>
+    <li><strong>Pretraining corpus</strong>: ~100 B observations. Same Monash/GluonTS base + new synthetic + real-world panels.</li>
+    <li><strong>Output</strong>: continuous quantile head, direct multi-step (parallel emit, no autoregressive loop).</li>
+    <li><strong>Strengths</strong>: closest head-to-head to TimesFM; encoder-decoder gives a slight edge on horizon-1; smallest size (9 M) runs on CPU.</li>
+    <li><strong>Weaknesses</strong>: no native covariates as of release; decoder commits to a fixed output length; pretraining corpus is smaller than TimesFM&apos;s 2 T tokens.</li>
+    <li><strong>When to pick</strong>: tight latency, small footprint, no covariates needed, willing to give up some long-horizon for short-horizon accuracy. <em>Our runner-up; benchmarked at 5.9% MAPE vs TimesFM&apos;s 5.1%.</em></li>
+  </ul>
+
+  <h2>4 &middot; Moirai (Salesforce)</h2>
+  <p><strong>Released:</strong> February 2024. <strong>Params:</strong> 14 M / 91 M / 311 M (Small / Base / Large).</p>
+  <p>
+    Encoder-only masked transformer trained on <em>any-variate</em> series &mdash;
+    the same model handles univariate and multivariate inputs through a
+    flatten-and-attend trick. Each variate is patched, all variates of a
+    multivariate series are concatenated as one token sequence, and a
+    binary mask token marks variate boundaries.
+  </p>
+  <ul>
+    <li><strong>Pretraining corpus</strong>: LOTSA &mdash; 27 B observations across 9 domains. The largest open-data effort at the time.</li>
+    <li><strong>Output</strong>: distributional output head (mixture of Student-T + Gaussian + lognormal, learned weights).</li>
+    <li><strong>Strengths</strong>: native multivariate; mixture distribution flexible across heavy-tailed and bounded series.</li>
+    <li><strong>Weaknesses</strong>: encoder-only means a separate forecast head per horizon length; the flatten-and-attend trick scales quadratically with variate count.</li>
+    <li><strong>When to pick</strong>: tight multivariate problems (energy + weather joint), short horizons, willing to retrain head per task. <em>Not the right shape for our per-series 6,700-route problem.</em></li>
+  </ul>
+
+  <h2>5 &middot; Moirai-MoE (Salesforce)</h2>
+  <p><strong>Released:</strong> November 2024. <strong>Params:</strong> 117 M total / 11 M active (Small); 935 M / 86 M (Base).</p>
+  <p>
+    Replaces Moirai&apos;s dense feed-forward layers with a sparse mixture of
+    experts. Token-level routing means different experts handle different
+    series patterns (trend, seasonality, regime shift) without any
+    human-defined heuristic. Each token activates ~8% of total parameters.
+  </p>
+  <ul>
+    <li><strong>Pretraining corpus</strong>: same as Moirai (LOTSA) plus extended panels.</li>
+    <li><strong>Output</strong>: same mixture-distributional head as Moirai.</li>
+    <li><strong>Strengths</strong>: 17% accuracy improvement over Moirai at same active size; can compete with TimesFM and Chronos using <em>65&times; fewer activated parameters</em>; the right scaling axis.</li>
+    <li><strong>Weaknesses</strong>: sparse-MoE inference has higher memory pressure (must hold all experts in HBM); load-balancing makes batching harder; tooling immaturity.</li>
+    <li><strong>When to pick</strong>: large heterogeneous panel where you want token-level specialisation; ample HBM. <em>Our research bet for the next refresh; on the watch list.</em></li>
+  </ul>
+
+  <h2>6 &middot; Lag-Llama</h2>
+  <p><strong>Released:</strong> October 2023. <strong>Params:</strong> ~2.5 M (Small) / 22 M (Base) &mdash; deliberately small.</p>
+  <p>
+    Decoder-only transformer based on the Llama architecture (RMSNorm, RoPE).
+    Tokenizes a series by stacking its <em>lag features</em>: the input at time
+    <code>t</code> is the value at <code>t</code> plus the value at
+    <code>t-1, t-7, t-14, t-30</code>, etc. The lag schedule is hand-picked.
+    Distribution head outputs Student-T parameters per step (degrees-of-freedom,
+    mean, scale).
+  </p>
+  <ul>
+    <li><strong>Pretraining corpus</strong>: ~7,500 series from Monash + Lottery + Synthetic. Smallest pretraining among the credible foundation models.</li>
+    <li><strong>Output</strong>: Student-T per-step distribution; samples drawn for quantiles.</li>
+    <li><strong>Strengths</strong>: small (2.5 M), interpretable lag features, runs on CPU, easy to fine-tune.</li>
+    <li><strong>Weaknesses</strong>: hand-picked lag schedule is a strong prior; doesn&apos;t learn its own time structure; pretraining corpus is small enough that the transfer story is shaky on novel domains.</li>
+    <li><strong>When to pick</strong>: small footprint, daily/weekly seasonal series, want interpretable features. <em>Not for our scale.</em></li>
+  </ul>
+
+  <h2>7 &middot; TimeGPT-1 (Nixtla)</h2>
+  <p><strong>Released:</strong> October 2023, closed-API only. <strong>Params:</strong> not disclosed (~150&ndash;200 M reported).</p>
+  <p>
+    Encoder-decoder transformer with patching and exogenous-variable input.
+    Closed-source; accessed via Nixtla&apos;s API. Output is direct multi-step
+    quantile forecasts. Pretrained on a proprietary mix of 100 B+ series spanning
+    finance, retail, IoT, energy, and weather.
+  </p>
+  <ul>
+    <li><strong>Pretraining corpus</strong>: undisclosed proprietary mix; reported ~100 B time points.</li>
+    <li><strong>Output</strong>: direct multi-step quantile + point.</li>
+    <li><strong>Strengths</strong>: best-in-class hosted-API experience; supports exogenous variables natively; calibrated quantile output.</li>
+    <li><strong>Weaknesses</strong>: closed-source &mdash; no audit story for AA; data leaves AA Azure boundary if you call the API; unclear training-data lineage.</li>
+    <li><strong>When to pick</strong>: hackathon, MVP, environments where data egress is fine. <em>Doesn&apos;t pass AA&apos;s data-residency audit.</em></li>
+  </ul>
+
+  <h2>8 &middot; MOMENT (CMU)</h2>
+  <p><strong>Released:</strong> February 2024. <strong>Params:</strong> 40 M / 125 M / 385 M (Small / Base / Large).</p>
+  <p>
+    Encoder-only transformer with masked modeling pretraining (BERT-style). The
+    series is patched, ~30% of patches are masked, and the model is trained to
+    reconstruct masked patches from context. After pretraining, attach
+    task-specific heads for forecasting, anomaly detection, classification, or
+    imputation.
+  </p>
+  <ul>
+    <li><strong>Pretraining corpus</strong>: Time-series Pile &mdash; 13 public collections, ~1.13 B observations.</li>
+    <li><strong>Output</strong>: depends on task head. For forecasting, MLP head on encoder output.</li>
+    <li><strong>Strengths</strong>: same backbone for forecast / classify / impute / anomaly; useful when one team owns multiple TS tasks. Good imputation performance &mdash; useful when raw data has gaps.</li>
+    <li><strong>Weaknesses</strong>: encoder-only means a fresh forecast head per horizon length; not the strongest forecaster (Chronos and TimesFM beat it on horizon ≥ 7).</li>
+    <li><strong>When to pick</strong>: a team that needs forecasting + anomaly detection + imputation from one model. <em>Not for forecast-only stacks.</em></li>
+  </ul>
+
+  <h2>9 &middot; Tiny Time Mixers (TTM, IBM)</h2>
+  <p><strong>Released:</strong> NeurIPS 2024. <strong>Params:</strong> 1 M / 3 M / 5 M (extremely small).</p>
+  <p>
+    <em>Not a transformer.</em> A TSMixer-based architecture &mdash; MLPs
+    interleaved with gated attention &mdash; that mixes features within patches,
+    across patches, and across channels. Adaptive patching: different layers
+    operate at different patch lengths for resolution-mixing pretraining.
+    Pretrained on ~1 B samples from Monash + LibCity (city-traffic).
+  </p>
+  <ul>
+    <li><strong>Pretraining corpus</strong>: ~1 B samples, Monash + LibCity public datasets.</li>
+    <li><strong>Output</strong>: linear forecast head; quantile head optional.</li>
+    <li><strong>Strengths</strong>: 1&ndash;5 M parameters, GPU-free inference (runs on CPU at server-grade latency). Up to 40&times; smaller than Chronos-Bolt-Tiny while competitive on standard benchmarks. Best-in-class for edge / resource-constrained deployment.</li>
+    <li><strong>Weaknesses</strong>: smaller pretraining corpus than the transformer-based models; no native cross-series transfer beyond what fits in 5 M params.</li>
+    <li><strong>When to pick</strong>: edge or CPU-only deployment, small panels, latency &lt; 50 ms. <em>If we ever deploy AA pricing forecast on a regional carrier&apos;s on-prem stack, this is the model.</em></li>
+  </ul>
+
+  <h2>Comparison matrix</h2>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Backbone</th>
+        <th>Params (active)</th>
+        <th>Output style</th>
+        <th>Pretrain tokens</th>
+        <th>Cold-start</th>
+        <th>Native covariates</th>
+        <th>Verdict for AA</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="row-chosen">
+        <td>TimesFM 2.5</td>
+        <td>Decoder-only, patched</td>
+        <td>200 M</td>
+        <td>Continuous quantile</td>
+        <td>~2 T</td>
+        <td>Strong</td>
+        <td>Yes (XReg, restored)</td>
+        <td>Chosen &mdash; 5.1% network MAPE</td>
+      </tr>
+      <tr>
+        <td>Chronos-T5 Large</td>
+        <td>Enc-dec, quantile-tokenized</td>
+        <td>710 M</td>
+        <td>Discrete sample-based</td>
+        <td>~84 M seq</td>
+        <td>Medium</td>
+        <td>No</td>
+        <td>20&times; slower; loses on horizon ≥ 7</td>
+      </tr>
+      <tr>
+        <td>Chronos-Bolt Base</td>
+        <td>Enc-dec, patched</td>
+        <td>205 M</td>
+        <td>Continuous quantile</td>
+        <td>~100 B</td>
+        <td>Strong</td>
+        <td>Limited</td>
+        <td>Runner-up &mdash; 5.9% MAPE</td>
+      </tr>
+      <tr>
+        <td>Moirai Large</td>
+        <td>Encoder-only, any-variate</td>
+        <td>311 M</td>
+        <td>Mixture distribution</td>
+        <td>~27 B</td>
+        <td>Medium</td>
+        <td>Limited</td>
+        <td>Multivariate-first; not our shape</td>
+      </tr>
+      <tr>
+        <td>Moirai-MoE Base</td>
+        <td>Encoder-only, sparse-MoE</td>
+        <td>86 M (active)</td>
+        <td>Mixture distribution</td>
+        <td>~27 B+</td>
+        <td>Strong</td>
+        <td>Limited</td>
+        <td>Watch-list for next refresh</td>
+      </tr>
+      <tr>
+        <td>Lag-Llama Base</td>
+        <td>Decoder-only, lag features</td>
+        <td>22 M</td>
+        <td>Student-T per step</td>
+        <td>~600 K</td>
+        <td>Weak</td>
+        <td>Limited</td>
+        <td>Too small a pretraining for transfer</td>
+      </tr>
+      <tr>
+        <td>TimeGPT-1</td>
+        <td>Enc-dec, patched, closed</td>
+        <td>~150 M</td>
+        <td>Continuous quantile</td>
+        <td>~100 B (proprietary)</td>
+        <td>Strong</td>
+        <td>Yes</td>
+        <td>Closed-source; data egress; audit fail</td>
+      </tr>
+      <tr>
+        <td>MOMENT Large</td>
+        <td>Encoder-only, masked-pretrain</td>
+        <td>385 M</td>
+        <td>Task-specific heads</td>
+        <td>~1.13 B</td>
+        <td>Medium</td>
+        <td>No</td>
+        <td>Multi-task focus; not forecast-first</td>
+      </tr>
+      <tr>
+        <td>TTM (IBM)</td>
+        <td>MLP-mixer, patched</td>
+        <td>1&ndash;5 M</td>
+        <td>Linear / quantile</td>
+        <td>~1 B</td>
+        <td>Strong</td>
+        <td>Limited</td>
+        <td>CPU / edge use only</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Three architectural patterns to take seriously</h2>
+
+  <h3>Pattern 1 &mdash; quantile-bin tokenization (Chronos)</h3>
+  <p>
+    Bin the series into 4,096 quantile buckets. Treat each bucket as a vocabulary
+    token. Apply a vanilla T5 LM. The advantage: every NLP technique transfers
+    (sampling, beam search, KV cache, in-context learning). The disadvantage:
+    bucket precision degrades at the tails; sampling is autoregressive.
+    Chronos-Bolt fixed the latter by replacing autoregressive sampling with a
+    direct quantile head.
+  </p>
+  <p>
+    For our footprint, quantile-bin tokenization loses precision on tight-spread
+    fares (most of our routes have a fare std &lt; $30 around a $300 mean &mdash;
+    $30 / 4096 = $0.007 per bucket, fine). The bigger blocker was 20&times;
+    sampling cost; Chronos-Bolt fixed it but the encoder-decoder still costs
+    more than TimesFM&apos;s decoder-only forward pass.
+  </p>
+
+  <h3>Pattern 2 &mdash; sparse mixture of experts (Moirai-MoE)</h3>
+  <p>
+    Replace the dense MLPs with a router + N experts. Each token is routed to
+    top-k experts; only those experts compute. Total parameters scale to 1B+
+    while active per-token compute stays at 100 M. The router learns
+    pattern-specific specialisation autonomously: one expert handles trend, one
+    handles seasonality, one handles spikes &mdash; without any hand-coded prior.
+  </p>
+  <p>
+    Why we&apos;re watching it: 17% accuracy lift over dense Moirai, 65&times;
+    fewer activated params than TimesFM Large at competitive accuracy. The
+    deployment story is harder (must hold all experts in HBM, batching is
+    harder), but the Pareto frontier is moving in this direction.
+  </p>
+
+  <h3>Pattern 3 &mdash; MLP-mixer instead of transformer (TTM)</h3>
+  <p>
+    Patches still apply, but the cross-patch and cross-channel mixing is done by
+    MLPs with gating, not attention. Two consequences: (a) FLOPs scale linearly
+    with sequence length, not quadratically; (b) inference fits on CPU at
+    server latency. The model loses some attention-style flexibility (can&apos;t
+    do long-range queries cheaply), but for short-horizon problems on edge
+    hardware this is the right choice.
+  </p>
+  <p>
+    Practical implication: <em>not every TS problem needs a transformer.</em>
+    For a 50-store retail chain with 2 GB RAM per node, TTM beats every
+    transformer on cost-per-inference.
+  </p>
+
+  <h2>Decision tree &mdash; which foundation TS model fits your problem</h2>
+
+<pre><code>Q1: Do you need to handle joint multivariate dynamics (energy + weather)?
+   YES: Moirai or Moirai-MoE.
+   NO:  continue.
+
+Q2: Is data residency / closed-source a hard requirement?
+   YES (must run on-prem):  TimesFM, Chronos-Bolt, Moirai, Lag-Llama, TTM.
+   NO  (API ok):            add TimeGPT.
+
+Q3: Latency SLO &lt; 50 ms / running on CPU?
+   YES: TTM.
+   NO:  continue.
+
+Q4: Heavy-tailed (jumps, fat tails, anomaly forecasting)?
+   YES: Chronos-T5 (sample-based) or Moirai-MoE (mixture).
+   NO:  continue.
+
+Q5: Mostly mature series (panel-of-100 well-known) OR cold-start (28%+
+    new series with &lt; 90d history)?
+   MATURE-ONLY:        TFT or TiDE per panel (cheaper).
+   COLD-START AT SCALE: TimesFM 2.5 or Chronos-Bolt.
+
+Q6: Need native covariate API (holidays, promos, prices)?
+   YES: TimesFM 2.5 or TimeGPT.
+   NO:  TimesFM, Chronos-Bolt, Moirai-MoE all comparable.
+
+Default for a new pricing-forecast project at airline scale: TimesFM 2.5.
+Default if budget is &lt; $1k/yr compute: TTM or Chronos-Bolt-Tiny.
+Default if you need joint multivariate: Moirai-MoE.
+</code></pre>
+
+  <h2>What you would actually benchmark</h2>
+  <p>
+    The table above is from third-party benchmarks plus our internal harness.
+    But the right question is not &ldquo;which is best on average&rdquo; &mdash;
+    it is &ldquo;which is best on <em>my</em> data.&rdquo; Our protocol:
+  </p>
+  <ol>
+    <li><strong>Build a leak-proof eval harness.</strong> 90-day holdout, walk-forward, no peeking. See <a href="evaluation.html">evaluation.html</a>.</li>
+    <li><strong>Zero-shot baseline.</strong> Run every candidate at zero-shot and record q10/q50/q90 + point MAPE on the same 141-route panel.</li>
+    <li><strong>Cheap fine-tune.</strong> LoRA rank-8 on each, where the model supports it. Budget 1 GPU-hour per candidate per family.</li>
+    <li><strong>Cost-per-forecast.</strong> Measure wall-clock on production hardware (A10G, BF16, batch 64).</li>
+    <li><strong>Cold-start subset.</strong> Re-run on routes with &lt; 90 days history. Many models look great on the mature subset and fall apart on cold-start.</li>
+    <li><strong>Calibration check.</strong> ECE, coverage at 80% PI, pinball at q10 and q90. Point MAPE is not enough.</li>
+  </ol>
+  <p>
+    On our footprint this protocol produced the ranking: TimesFM 2.5 (5.1%
+    MAPE), Chronos-Bolt Base (5.9%), TimesFM 2.0 (5.4%, but 2.5&times; the
+    inference cost), Moirai Large (6.1%, but 4&times; cost), TFT-per-family
+    (5.6% on mature, 8.3% on cold-start), Lag-Llama (8.1%), TTM (7.4% but 30&times;
+    cheaper). For a different team and a different footprint the answer would be
+    different; the harness is the portable artefact, not the ranking.
+  </p>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; foundation TS survey</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Walk me through the architectural axes that split foundation TS models.</div>
+        <div class="a">Five axes. (1) Backbone &mdash; decoder vs enc-dec vs encoder vs MLP-mixer vs SSM. (2) Output style &mdash; continuous quantile vs Gaussian vs Student-T vs discrete-token vs sample-based. (3) Tokenization &mdash; raw / patched / lagged / quantile-binned. (4) Sparsity &mdash; dense vs sparse-MoE. (5) Multivariate handling &mdash; channel-independent vs channel-mixing vs variate-token. TimesFM is decoder-only / patched / continuous-quantile / dense / channel-independent.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why didn&apos;t you pick Chronos?</div>
+        <div class="a">Original Chronos uses autoregressive token sampling &mdash; 20&times; the cost of a single TimesFM forward pass for the same forecast. Chronos-Bolt fixed that with direct multi-step heads and is our runner-up at 5.9% MAPE vs TimesFM&apos;s 5.1%. The remaining gap is mainly that TimesFM was pretrained on ~2 T tokens vs Chronos-Bolt&apos;s ~100 B, and TimesFM&apos;s native covariate API was the deciding factor.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When would you pick Moirai-MoE over TimesFM?</div>
+        <div class="a">When the panel is large and heterogeneous and you want token-level pattern specialisation without hand-engineering it. Moirai-MoE achieves competitive accuracy with 65&times; fewer activated parameters than dense models. The deployment cost (must hold all experts in HBM) is the catch. We&apos;re watching it for the next refresh.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why is TTM not a transformer?</div>
+        <div class="a">It&apos;s a TSMixer &mdash; gated MLPs interleaved with light attention &mdash; deliberately designed to avoid quadratic attention. Two reasons IBM made that choice. (1) FLOPs scale linearly with sequence length. (2) Inference fits on CPU at server latency. For edge deployment it&apos;s the right shape; for our scale on Azure A10G there&apos;s no reason to give up the transformer&apos;s representational headroom.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the difference between Chronos&apos;s discrete tokenization and Lag-Llama&apos;s lag features?</div>
+        <div class="a">Both are alternatives to raw-value patches. Chronos quantile-bins values into vocabulary tokens (4,096 buckets, Z-scored) so it can apply a vanilla LM. Lag-Llama embeds each timepoint as a vector of fixed-lag features (t, t-1, t-7, t-30, ...). Chronos requires no hand-coded priors but loses precision at the bucket edges; Lag-Llama is interpretable but commits to a hand-picked lag schedule that may not transfer.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why didn&apos;t you go with TimeGPT given it has the best UX?</div>
+        <div class="a">Closed-source. Data has to leave the AA Azure boundary to call the API; we have no audit story for the training data; we have no rollback path if the vendor changes the model. For an MVP or hackathon, TimeGPT is great. For a regulated airline RM stack, it fails the data-residency review.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What would you swap in if a regional partner needed AA pricing forecasting on CPU?</div>
+        <div class="a">TTM-Tiny (1 M params), with the family LoRA logic re-implemented. We&apos;d give up some accuracy (TTM benchmarks at ~7.4% MAPE on our panel vs 5.1% for TimesFM), but gain CPU deployment, &lt; 50 ms latency, and 30&times; lower compute cost. The architecture decision is footprint-driven, not religion-driven.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What does &ldquo;channel-independent&rdquo; mean and why does it matter?</div>
+        <div class="a">In a multivariate setting, channel-independent means you forecast each variate using the same model weights but separate forward passes &mdash; the model never sees other variates&apos; values. Channel-mixing has the model attend across variates. Channel-independent (TimesFM, PatchTST) is more robust under spurious correlation; channel-mixing (Moirai, iTransformer) wins when correlations are real and dense. For airlines, route-level forecasts on routes that are weakly coupled, channel-independent is the safer choice.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If you started fresh today, would you still pick TimesFM 2.5?</div>
+        <div class="a">Yes for our footprint. The Chronos-Bolt gap is 0.8 pp MAPE; the cost difference is ~2&times;; covariates tipped it. If we were starting on a heavy-tailed series problem (say, fraud volume forecasting), I&apos;d revisit Chronos-T5 or Moirai-MoE. Architecture choice is footprint-conditional.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Where is foundation TS research going next?</div>
+        <div class="a">Three vectors. (1) Sparse MoE at scale &mdash; Moirai-MoE pointed the way; expect 1B-active-param models with 50 M-equivalent inference cost. (2) Multimodal grounding &mdash; conditioning forecasts on text descriptions of the series (&ldquo;daily ticket sales for an airline route during a holiday week&rdquo;) so the model can ingest priors via prompt. (3) Hierarchical-aware pretraining &mdash; teach the model to forecast coherently across hierarchies (route &rarr; family &rarr; network) at pretrain time, not at post-hoc reconciliation.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <h2>Sources</h2>
+  <ul>
+    <li>Das, A., Kong, W., Sen, R., Zhou, Y. (2024). <em>A decoder-only foundation model for time-series forecasting (TimesFM).</em> ICML.</li>
+    <li>Ansari, A.F. et al. (2024). <em>Chronos: Learning the Language of Time Series.</em> arXiv:2403.07815.</li>
+    <li>AWS Blog (Dec 2024). <em>Fast and accurate zero-shot forecasting with Chronos-Bolt.</em></li>
+    <li>Woo, G. et al. (2024). <em>Unified Training of Universal Time Series Forecasting Transformers (Moirai).</em></li>
+    <li>Liu, X. et al. (2024). <em>Moirai-MoE: Empowering Time Series Foundation Models with Sparse Mixture of Experts.</em> arXiv:2410.10469.</li>
+    <li>Rasul, K. et al. (2023). <em>Lag-Llama: Towards Foundation Models for Probabilistic Time Series Forecasting.</em> arXiv:2310.08278.</li>
+    <li>Goswami, M. et al. (2024). <em>MOMENT: A Family of Open Time-series Foundation Models.</em></li>
+    <li>Ekambaram, V. et al. (2024). <em>Tiny Time Mixers (TTMs): Fast Pre-trained Models for Enhanced Zero/Few-Shot Forecasting.</em> NeurIPS.</li>
+    <li>Nixtla. <em>TimeGPT-1 documentation.</em></li>
+  </ul>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="timesfm-internals.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">TimesFM 2.5 internals</div>
+    </a>
+    <a class="page-nav-item next" href="transformer-variants-ts.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Transformer variants for TS</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>

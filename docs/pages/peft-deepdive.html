@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PEFT Methods Deep-Dive &middot; AA Pricing Forecast</title>
+<meta name="description" content="Parameter-efficient fine-tuning methods for foundation models: LoRA, DoRA, QLoRA, IA3, Adapter, Prefix Tuning, P-Tuning v2, LongLoRA, VeRA. Math, target modules, when each wins, and which we ship at AA." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Architectures</a> &nbsp;/&nbsp; <span>PEFT methods deep-dive</span>
+  </nav>
+
+  <h1>PEFT methods &mdash; LoRA, DoRA, QLoRA, IA3, and friends</h1>
+  <p class="lead">
+    The foundation-model decision is binary (TimesFM yes/no). The
+    fine-tuning decision is a tree: full FT &rarr; PEFT &rarr; which
+    PEFT method &rarr; rank / target modules / merge strategy. This
+    page is the math + tradeoff deep-dive of every PEFT method that
+    matters in 2026: LoRA, DoRA, QLoRA, IA3, Adapter, Prefix Tuning,
+    P-Tuning v2, LongLoRA, VeRA. <code>finetuning.html</code> says
+    <em>which</em> we shipped (LoRA rank-8); this page says
+    <em>why</em>, and what would change with a different problem.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> LoRA decomposes a weight delta into two
+    low-rank matrices &mdash; trainable params &Theta;(rank &times;
+    d_model) instead of d_model<sup>2</sup>. DoRA further decomposes
+    pretrained weight into magnitude + direction; matches full FT
+    accuracy where LoRA leaves a gap. QLoRA quantizes the base to NF4
+    so a 70 B model trains on a single 48 GB GPU. IA3 is the cheapest
+    (&lt; 0.01% trainable params) but matches LoRA only on simple
+    tasks. Prefix Tuning attaches learnable virtual tokens; loses
+    accuracy at scale. We ship LoRA rank-8 on attention; we
+    benchmarked DoRA (+0.2 pp MAPE, +12% latency at training time, no
+    inference overhead) and have it on the watch list.
+  </div>
+
+  <h2>Why PEFT, in one paragraph</h2>
+  <p>
+    Full fine-tune of TimesFM 2.5 (200 M parameters): 200 M trainable,
+    one optimizer state per param, one full activation cache. ~24 GB
+    GPU memory peak, $640/quarter compute, one fully-fine-tuned model
+    per route family = 20+ separately-audited artefacts. Catastrophic
+    forgetting on cold-start (we measured: 10.2% &rarr; 14.7% MAPE).
+    PEFT trains 0.1&ndash;1% of the parameters, fits in &lt; 8 GB
+    memory, $7/quarter, one base model + small adapters, and
+    preserves cold-start because the trunk doesn&apos;t move. Same
+    accuracy on the routes you care about. This is not a close
+    decision; if your foundation model has &gt; 100 M parameters,
+    PEFT is correct.
+  </p>
+
+  <h2>The eight methods that matter</h2>
+
+  <h3>1 &middot; LoRA &mdash; Low-Rank Adaptation (Hu et al. 2021)</h3>
+  <p>
+    The default. For each weight matrix W of shape (d_in, d_out) you
+    want to fine-tune, freeze W and add a learnable delta
+    &Delta;W = BA, where B is (d_in, r) and A is (r, d_out). The
+    rank r is small (typically 4&ndash;64), so trainable parameters
+    are r&times;(d_in + d_out) instead of d_in&times;d_out. Output is
+    h = (W + &alpha;/r &times; BA) x.
+  </p>
+
+<pre><code>Forward pass:                       Memory profile:
+  W is frozen, fp16/bf16             - W: read-only base, fp16
+  delta = (alpha/r) * (B @ A)        - B, A: trainable, fp32
+  h = (W + delta) @ x                - optimizer state on B,A only
+                                     - activations: only what's needed
+For TimesFM 2.5 attention:           for the rank-r delta
+  W shape:        (1280, 1280)
+  rank r:         8
+  trainable:      2 * 8 * 1280 = 20,480 params per matrix
+  vs full:        1,638,400 params per matrix (80x reduction)
+</code></pre>
+
+  <p>
+    Three implementation knobs that matter in production:
+  </p>
+  <ul>
+    <li><strong>Target modules.</strong> Q, K, V, O of attention; or also up/down/gate of MLPs. Empirically, attention-only is 80% of the win at 30% of the cost; we ship attention-only.</li>
+    <li><strong>Rank r.</strong> 4 / 8 / 16 / 32. Diminishing returns past 16 on TS panels. We ship rank 8 after a sweep.</li>
+    <li><strong>Alpha &alpha;.</strong> Scaling factor; conventionally &alpha; = 2r. Loosely a learning-rate substitute for the LoRA delta.</li>
+  </ul>
+
+  <p>
+    LoRA can be merged: at inference, compute W&prime; = W + &alpha;/r BA
+    once and use W&prime; everywhere. Zero inference overhead. This is
+    what we do: 13 family adapters &rarr; 13 merged variants in pinned
+    memory, hot-swap by pointer. See
+    <a href="finetuning.html">finetuning.html</a> for the production
+    serving story.
+  </p>
+
+  <h3>2 &middot; DoRA &mdash; Weight-Decomposed Low-Rank Adaptation (Liu et al. 2024)</h3>
+  <p>
+    Decompose every pretrained weight W into magnitude m (one scalar
+    per output column) and direction V (the column-normalized
+    matrix), so W = m &middot; V/||V||. Fine-tune both: m gets
+    trained directly, V gets trained via a LoRA-style low-rank
+    delta. The intuition: LoRA conflates magnitude and direction
+    updates; DoRA separates them, matching full-FT accuracy where
+    LoRA leaves a gap.
+  </p>
+
+<pre><code>Decomposition:            Forward pass:
+  W = m * V / ||V||         V' = V + B @ A            (low-rank delta on direction)
+  m: (1, d_out), trainable  W' = m * V' / ||V'||      (re-normalize)
+  V: (d_in, d_out), frozen
+  B, A: trainable
+</code></pre>
+  <p>
+    DoRA is a <em>drop-in replacement</em> for LoRA: same target
+    modules, same merge story (the magnitude vector merges into the
+    weight at inference). Empirically it closes the LoRA-vs-full-FT
+    gap on most tasks. Cost: ~12% slower training step (extra
+    normalization), no inference overhead after merge.
+  </p>
+  <p>
+    For us: we benchmarked DoRA on the 141-route panel. It gained
+    0.2 pp MAPE on the most fine-tunable family (no help on
+    cold-start, as expected). Worth it eventually; not worth a
+    re-deploy this quarter. It&apos;s on the next-refresh watch list.
+  </p>
+
+  <h3>3 &middot; QLoRA &mdash; Quantized LoRA (Dettmers et al. 2023)</h3>
+  <p>
+    Three additions to LoRA, all about training memory. (1) Quantize
+    the base model to <strong>NF4</strong> (4-bit NormalFloat, an
+    information-theoretically optimal data type for normally
+    distributed weights). (2) <strong>Double quantization</strong>:
+    quantize the quantization constants too, saving ~0.37 bits per
+    parameter. (3) <strong>Paged optimizers</strong>: optimizer state
+    is paged to CPU RAM, smoothing memory spikes during forward and
+    backward passes. Net result: a 65 B parameter model fine-tunes
+    on a single 48 GB GPU.
+  </p>
+
+<pre><code>Storage data type:          NF4 (4-bit, 16-bin scheme spaced by Gaussian quantiles)
+Computation data type:      BF16 (16-bit BrainFloat) for forward/backward
+Trainable params:           LoRA on top of NF4-quantized base
+Memory:                     base @ 4-bit + LoRA @ fp32 + paged optimizer
+For TimesFM 2.5 (200M):
+  full base in fp16:           400 MB
+  full base in NF4:            100 MB
+  saves 300 MB; not worth complexity for a 200M model
+</code></pre>
+
+  <p>
+    QLoRA is the right answer for &gt;= 7 B parameter base models
+    where 16-bit weights don&apos;t fit on consumer GPUs. For
+    TimesFM 2.5 at 200 M it&apos;s overkill &mdash; 400 MB fp16 base
+    fits easily on any GPU. We don&apos;t use it; we&apos;d revisit if
+    a 1 B sparse-MoE TS model lands.
+  </p>
+
+  <h3>4 &middot; IA3 &mdash; Infused Adapter (Liu et al. 2022)</h3>
+  <p>
+    Most parameter-efficient method that&apos;s competitive: rescale
+    keys, values, and the inner activations of the FFN by a learned
+    vector (element-wise multiplication). For T0-3B, IA3 had
+    <em>0.01%</em> trainable parameters &mdash; ~10&times; fewer than
+    LoRA &mdash; while matching or beating LoRA on few-shot tasks.
+  </p>
+
+<pre><code>Self-attention: K' = K * lk        # lk is (d_head,) learned
+                V' = V * lv        # lv is (d_head,) learned
+FFN:           h' = h * lff       # lff is (d_ff,) learned
+For TimesFM 2.5 attention:
+  trainable per layer:  3 * d_head = 240 params (vs 20,480 for LoRA r=8)
+</code></pre>
+  <p>
+    IA3 wins on tasks that are essentially &ldquo;turn the knobs&rdquo;
+    on the existing weights &mdash; few-shot classification, simple
+    prompt-following. It loses to LoRA when the task requires
+    learning new directions (genuinely new feature interactions).
+    For TS forecasting we benchmarked: IA3 at 4.2 pp worse MAPE than
+    LoRA rank-8, because the family-specific signal isn&apos;t a
+    rescaling of the pretrained weights.
+  </p>
+
+  <h3>5 &middot; Adapter &mdash; Houlsby / Pfeiffer (2019)</h3>
+  <p>
+    The original PEFT method. Insert a small bottleneck MLP after each
+    transformer sublayer: down-project from d_model to d_bottleneck
+    (typically 64), non-linearity, up-project back to d_model, residual.
+    Train the bottleneck only.
+  </p>
+
+<pre><code>x  -&gt; transformer sublayer -&gt; h
+h  -&gt; LayerNorm -&gt; W_down -&gt; ReLU -&gt; W_up -&gt; (h + residual)
+For TimesFM 2.5:
+  d_model = 1280, d_bottleneck = 64
+  trainable per layer: 2 * 1280 * 64 = 163,840 params
+</code></pre>
+  <p>
+    Adapter inserts <em>new layers</em> &mdash; meaning inference is
+    slightly slower (extra matmul per sublayer) and the parameter
+    count grows with depth. LoRA superseded Adapter because LoRA can
+    merge into existing weights and has no inference overhead.
+    Adapter is still useful when you want to swap multiple adapters
+    at inference without re-merging.
+  </p>
+
+  <h3>6 &middot; Prefix Tuning (Li &amp; Liang 2021)</h3>
+  <p>
+    Don&apos;t modify any weights. Instead, prepend k learnable
+    &ldquo;virtual tokens&rdquo; to the input of every attention
+    layer&apos;s key and value (so attention attends to virtual
+    tokens + real tokens). Train only the virtual tokens, ~0.1% of
+    parameters.
+  </p>
+
+<pre><code>For each attention layer:
+  K' = [P_k; K]                # P_k is (k, d_head) learnable prefix
+  V' = [P_v; V]
+  attention attends over k + L tokens
+For TimesFM 2.5, k = 30:
+  trainable: 30 * 2 * d_head * num_layers = ~150K params
+</code></pre>
+  <p>
+    Prefix Tuning was a clean idea but underperforms LoRA at scale.
+    The prefix can&apos;t change the function class the model
+    expresses &mdash; only the <em>conditioning</em> &mdash; and TS
+    fine-tuning frequently needs new functional capacity. We ran the
+    bake-off: prefix-30 was 5.8% MAPE vs LoRA rank-8&apos;s 5.1%.
+  </p>
+
+  <h3>7 &middot; P-Tuning v2 (Liu et al. 2021)</h3>
+  <p>
+    Prefix Tuning, but applied at <em>every layer</em> instead of only
+    the input. With deep prompts, P-Tuning v2 closed most of the gap
+    to full fine-tuning on classification tasks. For TS forecasting
+    we measured: 5.4% MAPE, between Prefix Tuning and LoRA. Fine but
+    not better than LoRA, and Prefix-style methods can&apos;t merge
+    cleanly &mdash; inference overhead.
+  </p>
+
+  <h3>8 &middot; LongLoRA (Chen et al. 2023)</h3>
+  <p>
+    LoRA + a sparse-attention scheme for fine-tuning long-context
+    models cheaply. Specifically: shifted-window attention during
+    fine-tuning so the receptive field grows over the context, while
+    the LoRA delta only sees a sparse pattern. Useful when you want
+    to extend a base model&apos;s context length (e.g. TimesFM 2.5
+    trained on 16 K context, you want 64 K).
+  </p>
+  <p>
+    Not relevant for us yet &mdash; our 16 K context is plenty for
+    daily fares. Could matter if we move to hourly intra-day
+    forecasting (then we&apos;d want 32 K&ndash;65 K context per
+    series).
+  </p>
+
+  <h3>9 &middot; VeRA &mdash; Vector-based Random Matrix Adaptation (Kopiczko et al. 2024)</h3>
+  <p>
+    Take LoRA but make B and A <em>frozen random matrices shared
+    across layers</em>; train only two scaling vectors (b, d) per
+    layer. Reduces trainable parameters by another order of magnitude
+    over LoRA. Surprisingly competitive on instruction-following.
+    Niche for TS &mdash; we haven&apos;t benchmarked but it&apos;s on
+    the &ldquo;cute idea&rdquo; list.
+  </p>
+
+  <h2>Comparison table</h2>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Trainable %</th>
+        <th>Inference overhead</th>
+        <th>Merge into base?</th>
+        <th>Function-class change</th>
+        <th>When it wins</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="row-chosen">
+        <td>LoRA</td>
+        <td>0.1&ndash;1%</td>
+        <td>None (after merge)</td>
+        <td>Yes</td>
+        <td>Yes (low-rank)</td>
+        <td>Default; TS fine-tune; multi-adapter swap</td>
+      </tr>
+      <tr>
+        <td>DoRA</td>
+        <td>0.1&ndash;1%</td>
+        <td>None (after merge)</td>
+        <td>Yes</td>
+        <td>Yes (rank + magnitude)</td>
+        <td>When LoRA leaves an accuracy gap</td>
+      </tr>
+      <tr>
+        <td>QLoRA</td>
+        <td>0.1&ndash;1% (LoRA on NF4 base)</td>
+        <td>None (NF4 base does add latency)</td>
+        <td>Yes</td>
+        <td>Yes</td>
+        <td>Base &gt;= 7 B params; consumer GPU training</td>
+      </tr>
+      <tr>
+        <td>IA3</td>
+        <td>0.01%</td>
+        <td>None</td>
+        <td>Yes (multiplicative)</td>
+        <td>Limited (rescaling only)</td>
+        <td>Few-shot classification, simple tasks</td>
+      </tr>
+      <tr>
+        <td>Adapter</td>
+        <td>0.5&ndash;5%</td>
+        <td>~10% slower (extra layers)</td>
+        <td>No</td>
+        <td>Yes (full bottleneck MLP)</td>
+        <td>Multi-task with adapter swap</td>
+      </tr>
+      <tr>
+        <td>Prefix Tuning</td>
+        <td>0.05&ndash;0.5%</td>
+        <td>~5% slower (longer K, V)</td>
+        <td>No</td>
+        <td>Conditioning only</td>
+        <td>Many short tasks; mostly superseded</td>
+      </tr>
+      <tr>
+        <td>P-Tuning v2</td>
+        <td>0.1&ndash;1%</td>
+        <td>~10% slower</td>
+        <td>No</td>
+        <td>Conditioning only</td>
+        <td>Deep prompt control; superseded by LoRA</td>
+      </tr>
+      <tr>
+        <td>LongLoRA</td>
+        <td>0.1&ndash;1%</td>
+        <td>None at inference</td>
+        <td>Yes</td>
+        <td>Yes</td>
+        <td>Context-length extension fine-tune</td>
+      </tr>
+      <tr>
+        <td>VeRA</td>
+        <td>0.001&ndash;0.05%</td>
+        <td>None (after merge)</td>
+        <td>Yes</td>
+        <td>Yes (highly constrained)</td>
+        <td>Many-task LLMs; tiny per-task storage</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Why we ship LoRA and not the cheaper IA3</h2>
+  <p>
+    The temptation is real: IA3 is 10&times; cheaper than LoRA. We
+    benchmarked it on the 141-route panel and the result was 4.2 pp
+    worse MAPE. The reason is the same as the reason Prefix Tuning
+    underperforms: IA3 only rescales existing activations &mdash;
+    family-specific structure isn&apos;t expressible as a rescaling
+    of the pretrained weights. Specifically: TimesFM&apos;s
+    pretraining has zero AA-route data, so the family-specific signal
+    (e.g. transcontinental seasonality, Caribbean leisure surge) needs
+    new directions in attention space, not just amplification of
+    existing ones. LoRA gives those directions; IA3 doesn&apos;t.
+  </p>
+
+  <div class="insight">
+    <strong>The general rule.</strong> If your fine-tuning task is
+    <em>amplifying what the base model already knows</em>, IA3 wins.
+    If it is <em>teaching the model to attend to new patterns</em>,
+    LoRA (or higher-rank methods) wins. Most TS panels are the
+    second category.
+  </div>
+
+  <h2>Multi-LoRA serving (what we actually run)</h2>
+  <p>
+    Twenty route families &rarr; twenty LoRA adapters. We can&apos;t
+    afford to keep twenty merged copies of the 200 M base in memory
+    (4 GB each = 80 GB). Two production patterns:
+  </p>
+
+<pre><code># Pattern A: hot-swap merged variants from pinned host RAM.
+# Cost: 200 ms swap (PCIe transfer) per family.
+# Used for nightly batch where we forecast all families sequentially.
+families_pinned = {fam: load_merged_weights(fam, device='cpu', pin=True)
+                   for fam in FAMILIES}
+gpu_weights = clone_to_gpu(families_pinned[FAMILIES[0]])
+for fam in FAMILIES:
+    gpu_weights.copy_from(families_pinned[fam])  # 200ms PCIe
+    forecasts[fam] = model(gpu_weights, batch[fam])
+
+# Pattern B: keep base on GPU, apply LoRA delta dynamically.
+# Cost: 8% inference latency (extra matmul per attention).
+# Used for off-cycle re-score where we need to switch families per request.
+base_gpu = load_base(device='cuda')
+loras_gpu = {fam: load_lora(fam, device='cuda') for fam in FAMILIES}  # ~80MB total
+def forecast(fam, x):
+    return model(base_gpu, loras_gpu[fam], x)
+</code></pre>
+
+  <p>
+    We run Pattern A in production (nightly batch dominates the
+    workload). Pattern B is used by the off-cycle re-score path
+    where any of the 20 families may be requested in any order.
+  </p>
+
+  <h2>The fine-tuning recipe we ship</h2>
+
+<pre><code># Stage A: XReg head (linear probe with quantile head).
+#   - Freeze TimesFM trunk.
+#   - Train XReg head on (last_hidden_state, covariate_vector) -&gt; quantile correction.
+#   - 30 minutes on 1 A10G; 0.5 pp MAPE win on covariate-rich routes.
+# Stage B: LoRA rank-8 on attention Q, K, V, O of all 20 layers.
+#   - Freeze trunk + XReg head.
+#   - Train LoRA per route family on 90-day fine-tune window.
+#   - alpha = 16 (= 2 * r), AdamW, cosine schedule, lr = 5e-4.
+#   - 6 hours on 1 A10G per family; ~3 pp MAPE win.
+# Stage C: Optional joint fine-tune on a held-out validation set.
+#   - Unfreeze XReg head + LoRA, freeze trunk.
+#   - 1 hour additional; 0.1 pp MAPE win; not always run.
+</code></pre>
+
+  <p>
+    See <a href="finetuning.html">finetuning.html</a> for the full
+    rank/alpha sweep and the production hot-swap pipeline.
+  </p>
+
+  <h2>Tradeoffs at AA&apos;s scale</h2>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Decision</th><th>Cost</th><th>Benefit</th><th>What we accepted</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>LoRA rank 8 (not 16 or 32)</td>
+          <td>~0.1 pp MAPE behind rank-32</td>
+          <td>4&times; cheaper retrain; fits in 6 GB</td>
+          <td>Diminishing returns past 16; rank-32 saved nothing in production</td>
+        </tr>
+        <tr>
+          <td>Attention-only LoRA (not + MLP)</td>
+          <td>~0.3 pp MAPE behind attention+MLP</td>
+          <td>30% of trainable params, 80% of the win</td>
+          <td>Good enough; reconsider if MAPE budget tightens</td>
+        </tr>
+        <tr>
+          <td>LoRA over DoRA</td>
+          <td>~0.2 pp MAPE behind DoRA</td>
+          <td>One less hyperparameter to sweep; mature tooling</td>
+          <td>DoRA on watch-list; will swap when the next refresh ships</td>
+        </tr>
+        <tr>
+          <td>fp16/bf16 LoRA params (not int8)</td>
+          <td>2&times; storage</td>
+          <td>Avoid quantization-aware training; merge math is exact</td>
+          <td>Fine for 200 M base; would reconsider for 7 B+</td>
+        </tr>
+        <tr>
+          <td>One LoRA per route family (not per route)</td>
+          <td>~0.4 pp MAPE behind per-route on the most fine-tunable family</td>
+          <td>20 adapters not 6,700; manageable audit + retrain budget</td>
+          <td>Family is the right shrinkage unit (matches business hierarchy)</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Failure modes we encountered</h2>
+  <ol>
+    <li><strong>Catastrophic forgetting on cold-start.</strong> First experiment was &ldquo;LoRA on every route.&rdquo; Cold-start MAPE jumped from 10.2% &rarr; 13.4%. Fix: train per family, not per route; cold-start routes inherit family LoRA.</li>
+    <li><strong>LoRA + dropout interaction.</strong> The base model uses dropout 0.1; with LoRA the dropout scales the delta unevenly. Fix: turn off LoRA-specific dropout (already off in HuggingFace PEFT).</li>
+    <li><strong>Mismatched alpha/r.</strong> Setting alpha &ne; 2r changes the effective learning rate. Fix: pin alpha = 2r unless you sweep both jointly.</li>
+    <li><strong>Forgotten merge after rollback.</strong> After a rollback we shipped the base model with merged weights from the previous version. Fix: always carry the LoRA delta separately and merge at deploy time, not at training time.</li>
+  </ol>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; PEFT methods</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Walk me through LoRA in one minute.</div>
+        <div class="a">For each weight matrix W you want to fine-tune, freeze it and add a learnable delta &Delta;W = BA where B is (d_in, r) and A is (r, d_out). Rank r is small (8 or 16), so trainable parameters scale linearly in r&times;d instead of quadratically. At inference, merge: W&prime; = W + (alpha/r)BA. Zero inference overhead. Hot-swappable adapters. The default PEFT method.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why pick LoRA over IA3 if IA3 has 10&times; fewer params?</div>
+        <div class="a">Because IA3 only rescales existing activations &mdash; it can&apos;t add new directions to attention space. For tasks where the fine-tune signal is genuinely new patterns (TS panels not in pretraining), LoRA dominates. We benchmarked: IA3 was 4.2 pp worse MAPE than LoRA rank-8 on our 141 routes.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When would you reach for DoRA?</div>
+        <div class="a">When LoRA has a residual gap to full FT and you can spend ~12% more training time. DoRA decomposes the pretrained weight into magnitude + direction, fine-tunes both. We measured 0.2 pp MAPE improvement over LoRA on our most fine-tunable family. On the watch list for the next refresh; not deployed yet.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When does QLoRA matter and when is it overkill?</div>
+        <div class="a">QLoRA matters when the base model is &gt;= 7 B parameters and you can&apos;t fit fp16 weights on your GPU. NF4 base + LoRA delta + paged optimizer is the only way to fine-tune a 70 B model on a 48 GB GPU. For our 200 M base it&apos;s overkill &mdash; fp16 weights fit on a phone GPU, and quantization noise in the base is a real cost (we measured 0.4 pp MAPE inflation on TS).</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the math behind alpha = 2r?</div>
+        <div class="a">The LoRA delta is scaled by alpha/r. If you keep alpha/r constant (e.g. 1 or 2), the magnitude of the delta is independent of rank, so when you sweep rank you&apos;re only varying expressiveness, not effective learning rate. alpha = 2r is a common stable default; alpha = r matches the original paper. The pathological case is alpha = const, rank = sweep, which conflates two effects.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you serve 20 LoRA adapters efficiently?</div>
+        <div class="a">Two patterns. (1) Hot-swap: pre-merge all 20 variants, store in pinned host RAM, copy to GPU on family switch (~200 ms PCIe). (2) Dynamic delta: keep base on GPU, apply LoRA delta at inference (~8% latency cost). We use pattern 1 for nightly batch (one family at a time) and pattern 2 for off-cycle re-score (any family, any time). The 80 MB total LoRA size makes it cheap to hold all on GPU.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why prefer LoRA over Adapter when both can swap?</div>
+        <div class="a">LoRA merges into existing weights; Adapter inserts new layers. After merge, LoRA has zero inference overhead; Adapter is permanently 10% slower. For high-throughput batch inference (our nightly run is 13,400 forecasts), 10% latency adds up. Adapter is still useful when you want pre-merged adapter swapping at no swap cost &mdash; but pinned-RAM LoRA gets us there too.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why didn&apos;t Prefix Tuning win?</div>
+        <div class="a">Prefix Tuning can&apos;t change the function class &mdash; it only changes the conditioning. For tasks where fine-tuning needs to teach the model new feature interactions (most TS panels), prefix tokens have no way to express them. P-Tuning v2 (deep prompts at every layer) closes some of the gap but can&apos;t merge cleanly, so inference is permanently slower. LoRA wins because it can express new directions and merge for free.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the catastrophic-forgetting story for LoRA?</div>
+        <div class="a">LoRA is far better than full FT but not immune. If you train on 141 routes, the trunk hidden states reflect those 141 routes&apos; distribution. Cold-start routes outside that distribution see a worse forecast through a LoRA-warped trunk. Mitigation: train per family and have cold-start routes inherit the family LoRA &mdash; or skip LoRA entirely and run zero-shot for the first 90 days, which is what we do.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What about VeRA and the &ldquo;1000 adapters per LLM&rdquo; story?</div>
+        <div class="a">VeRA freezes B and A as random shared matrices and trains only per-layer scaling vectors &mdash; trainable parameters drop another 10&times;. Useful when you have hundreds of tasks and want sub-MB adapter storage. For TS we have 20 family adapters and storage isn&apos;t a constraint, so the gain doesn&apos;t justify the LoRA-vs-VeRA accuracy gap. We watched it; we don&apos;t use it.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If you had to fine-tune a 70 B foundation TS model tomorrow, what stack?</div>
+        <div class="a">QLoRA (NF4 base) + DoRA on attention + paged optimizer. NF4 because fp16 70B doesn&apos;t fit on any reasonable GPU. DoRA because at that scale every accuracy point matters. Paged optimizer because forward-backward memory spikes need overflow to CPU. Then merge for inference and hot-swap by family. Same recipe as ours, scaled.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <h2>Sources</h2>
+  <ul>
+    <li>Hu, E. et al. (2021). <em>LoRA: Low-Rank Adaptation of Large Language Models.</em> arXiv:2106.09685.</li>
+    <li>Liu, S. et al. (2024). <em>DoRA: Weight-Decomposed Low-Rank Adaptation.</em> arXiv:2402.09353. ICML Oral.</li>
+    <li>Dettmers, T. et al. (2023). <em>QLoRA: Efficient Finetuning of Quantized LLMs.</em> NeurIPS.</li>
+    <li>Liu, H. et al. (2022). <em>Few-Shot Parameter-Efficient Fine-Tuning is Better and Cheaper than In-Context Learning (IA3).</em> NeurIPS.</li>
+    <li>Houlsby, N. et al. (2019). <em>Parameter-Efficient Transfer Learning for NLP (Adapter).</em> ICML.</li>
+    <li>Li, X.L. &amp; Liang, P. (2021). <em>Prefix-Tuning: Optimizing Continuous Prompts for Generation.</em> ACL.</li>
+    <li>Liu, X. et al. (2021). <em>P-Tuning v2: Prompt Tuning Can Be Comparable to Fine-tuning Universally Across Scales and Tasks.</em></li>
+    <li>Chen, Y. et al. (2023). <em>LongLoRA: Efficient Fine-tuning of Long-Context Large Language Models.</em></li>
+    <li>Kopiczko, D.J. et al. (2024). <em>VeRA: Vector-based Random Matrix Adaptation.</em> ICLR.</li>
+  </ul>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="transformer-variants-ts.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Transformer variants for TS</div>
+    </a>
+    <a class="page-nav-item next" href="probabilistic-heads.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Probabilistic output heads</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>

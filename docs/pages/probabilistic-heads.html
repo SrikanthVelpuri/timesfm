@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Probabilistic Output Heads &middot; AA Pricing Forecast</title>
+<meta name="description" content="The probabilistic-forecasting toolbox: continuous quantile heads, parametric distributional heads (Gaussian, Student-T, NegBin, mixtures), discrete-token heads (Chronos), conformal prediction, monotonic CDF parameterizations. Math, calibration, when each wins." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Architectures</a> &nbsp;/&nbsp; <span>Probabilistic output heads</span>
+  </nav>
+
+  <h1>Probabilistic output heads &mdash; how a model emits an uncertainty</h1>
+  <p class="lead">
+    A point forecast is one number. A probabilistic forecast is a
+    distribution &mdash; or a quantile sweep, or a sample path, or a
+    conformal interval. The choice of <em>output head</em> determines
+    what kind of uncertainty you can express and how much you can
+    trust it. <code>evaluation.html</code> covered the metrics
+    (pinball, CRPS, ECE, coverage); this page covers the
+    <em>architectures</em> that produce the distributions those
+    metrics measure.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Five output-head families. (1) Quantile
+    head &mdash; predict q10..q90 directly with pinball loss; what
+    TimesFM 2.5 ships. (2) Parametric distributional &mdash; predict
+    mean+variance of Gaussian / Student-T / NegBin (DeepAR,
+    Lag-Llama). (3) Discrete-token head &mdash; bin into 4096 buckets
+    and sample as if it were language (Chronos-T5). (4) Mixture
+    distribution &mdash; weighted combination (Moirai). (5) Conformal
+    prediction &mdash; post-hoc wrapper that gives finite-sample
+    coverage guarantees regardless of head choice. We ship continuous
+    quantile head (TimesFM 2.5 native) + conformal-prediction wrapper
+    on top for hard coverage guarantees.
+  </div>
+
+  <h2>Why output-head choice matters</h2>
+  <p>
+    Three things depend entirely on the head you choose. First, the
+    <em>loss function you can train with</em> &mdash; pinball loss for
+    quantiles, NLL for parametric, cross-entropy for tokens. Second,
+    the <em>kind of question you can answer</em> at inference &mdash;
+    P(y &gt; threshold) is easy with parametric, hard with quantile.
+    Third, the <em>calibration story</em> &mdash; conformal prediction
+    gives you finite-sample guarantees; everything else is
+    asymptotic.
+  </p>
+
+  <h2>1 &middot; Quantile head &mdash; predict q10..q90 directly</h2>
+  <p>
+    Train the model to emit K quantile estimates per future timepoint.
+    Loss is the pinball (quantile regression) loss, summed over
+    quantiles:
+  </p>
+
+<pre><code>Pinball loss for quantile q in (0, 1):
+  L_q(y, y_hat) = max(q * (y - y_hat), (q - 1) * (y - y_hat))
+
+Total loss:
+  L = sum over q in {0.1, 0.2, ..., 0.9} of L_q(y, y_hat_q)
+</code></pre>
+
+  <p>
+    Two flavours: <em>discrete</em> (one head per quantile, K
+    independent outputs) and <em>continuous</em> (one head that
+    parameterises a monotone CDF, sampled at any q at inference). v1
+    of TimesFM was discrete-K; v2.5 is continuous &mdash; eliminates
+    the &ldquo;non-monotone quantile&rdquo; bug where q60 &lt; q50 by
+    construction.
+  </p>
+
+  <h3>Continuous monotone parameterisation</h3>
+  <p>
+    The trick: parameterise the CDF as a cumulative-softplus over
+    learned bin edges. Output a vector e[0..B] of bin edges and
+    monotone increments d[1..B] = softplus(raw[1..B]). The CDF
+    inverse is then constructed by linear interpolation between
+    cumulative sums. By construction q1 &lt; q2 implies forecast(q1)
+    &lt; forecast(q2). No post-hoc fixup needed.
+  </p>
+
+<pre><code>Output head:
+  raw     = MLP(hidden) -&gt; (128, B)         # 128 future timepoints, B bin edges
+  delta   = softplus(raw)                   # positive increments
+  cdf_inv = e0 + cumsum(delta)              # monotone in q
+
+For any quantile q in (0, 1):
+  forecast_q = linear_interp(cdf_inv, q * (B-1))
+</code></pre>
+
+  <ul>
+    <li><strong>Pros</strong>: trains with pinball loss; calibration is direct; head architecture is small (one MLP); supports any quantile at inference.</li>
+    <li><strong>Cons</strong>: pinball loss is heuristic if you actually want a likelihood; coverage is asymptotic, not finite-sample (use conformal on top).</li>
+    <li><strong>When to pick</strong>: TS forecasting, audit-friendly defaults. <em>Our pick.</em></li>
+  </ul>
+
+  <h2>2 &middot; Parametric distributional head</h2>
+  <p>
+    Predict the parameters of a known distribution per future
+    timepoint. Train with negative log-likelihood (NLL). Inference:
+    sample from the predicted distribution, or compute exact
+    quantiles in closed form.
+  </p>
+
+  <h3>Gaussian head (DeepAR, classical)</h3>
+<pre><code>head outputs (mu, sigma) per timepoint:
+  mu    = linear(hidden)
+  sigma = softplus(linear(hidden))   # positivity
+NLL loss:
+  L = 0.5 * log(2*pi*sigma^2) + 0.5 * (y - mu)^2 / sigma^2
+At inference:
+  q_alpha = mu + sigma * z_alpha     # closed-form quantiles
+  P(y &gt; t) = 1 - Phi((t - mu) / sigma)
+</code></pre>
+  <p>
+    Cheap, well-calibrated when the residual <em>is</em> Gaussian.
+    Fails on heavy tails (jumps blow up sigma; model under-predicts
+    extremes) and on bounded domains (Gaussian can predict negative
+    fares).
+  </p>
+
+  <h3>Student-T head (Lag-Llama, robust forecasting)</h3>
+<pre><code>head outputs (mu, sigma, df):
+  df  = softplus(linear(hidden)) + 2     # df &gt; 2 for finite variance
+NLL closed-form for Student-T.
+</code></pre>
+  <p>
+    Heavy-tailed distribution; robust to outliers. Trades calibration
+    for tail coverage &mdash; useful for fraud / anomaly forecasting,
+    overkill for AA fare data which is well-Gaussian past
+    normalization.
+  </p>
+
+  <h3>Negative Binomial head (count data)</h3>
+<pre><code>head outputs (mu, alpha):                # alpha is overdispersion
+NLL closed-form for NegBin.
+</code></pre>
+  <p>
+    Right answer for count data: bookings per minute, requests per
+    second, failures per day. Variance &gt; mean is allowed; Poisson
+    breaks down the moment overdispersion appears, NegBin handles
+    it.
+  </p>
+
+  <h3>Mixture distributional head (Moirai, robust foundation)</h3>
+<pre><code>head outputs k components and weights:
+  for i in 1..k:
+      (mu_i, sigma_i, family_i) = MLP(hidden)
+  weights w = softmax(linear(hidden))
+log-likelihood:
+  L = -log(sum_i w_i * pdf(family_i; mu_i, sigma_i)(y))
+</code></pre>
+  <p>
+    Mixture of Gaussian + Student-T + lognormal handles
+    heterogeneous series (some bounded, some heavy-tailed) without
+    pre-classification. Moirai uses this for its
+    &ldquo;any-distribution&rdquo; foundation. Cost: more parameters,
+    slower convergence, harder to debug.
+  </p>
+
+  <ul>
+    <li><strong>Pros (parametric)</strong>: closed-form quantiles, P(y &gt; t), and CRPS; fewer parameters than quantile head; natural for Bayesian aggregation.</li>
+    <li><strong>Cons (parametric)</strong>: family choice is a strong prior; Gaussian fails on heavy tails; mixtures are unstable to train.</li>
+    <li><strong>When to pick</strong>: when domain knowledge supplies the right family; count data needs NegBin; bounded data needs truncated.</li>
+  </ul>
+
+  <h2>3 &middot; Discrete-token head (Chronos-T5)</h2>
+  <p>
+    Quantile-bin the series into B = 4,096 buckets (uniform on
+    Z-scored values). Each bucket is a vocabulary token. The model
+    is a vanilla T5 LM emitting one token per future timepoint.
+    Probabilistic forecast: sample S = 20 token sequences from the
+    decoder, denormalize, take empirical quantiles.
+  </p>
+
+<pre><code># Tokenization
+mu, sigma = mean_std(context)
+z         = (y - mu) / sigma
+buckets   = digitize(z, edges_4096)         # bucket id in [0, 4095]
+
+# Training
+loss = cross_entropy(logits, buckets)       # standard LM training
+
+# Inference
+S = 20
+samples = []
+for s in 1..S:
+    tokens = decoder.sample(decoded_so_far) # autoregressive
+    samples.append(unbin(tokens) * sigma + mu)
+q_alpha = empirical_quantile(samples, alpha)
+</code></pre>
+
+  <ul>
+    <li><strong>Pros</strong>: zero distributional assumption; every NLP technique transfers (sampling, beam search, in-context learning); strong on heavy-tailed series because uniform buckets allocate tail capacity.</li>
+    <li><strong>Cons</strong>: bucket precision degrades at the extremes; autoregressive sampling is 20&times; slower; quantization noise floor.</li>
+    <li><strong>When to pick</strong>: heavy-tailed series, language-model-like training pipeline preferred, latency budget allows sampling.</li>
+  </ul>
+
+  <h2>4 &middot; Sample-based heads (DDPM-style, normalizing flows)</h2>
+  <p>
+    Two adjacent ideas. <em>Diffusion-based</em> forecasting (TimeGrad,
+    ScoreGrad) trains a denoising network to reverse a noising
+    process; samples are produced by 50&ndash;1000 reverse steps.
+    <em>Normalizing flows</em> (RealNVP, MAF for TS) parameterise an
+    invertible mapping from a simple base distribution to the data
+    distribution; exact NLL and exact sampling.
+  </p>
+  <ul>
+    <li><strong>Pros</strong>: most flexible distributional output; can capture multimodality; exact likelihoods (flows).</li>
+    <li><strong>Cons</strong>: training is unstable; inference is slow (diffusion needs many reverse steps); production tooling immature.</li>
+    <li><strong>When to pick</strong>: research; multimodal demand (e.g. one mode for normal day, one for holiday). Not in production at AA.</li>
+  </ul>
+
+  <h2>5 &middot; Conformal prediction &mdash; post-hoc coverage guarantees</h2>
+  <p>
+    The only output mechanism with <em>finite-sample</em> coverage
+    guarantees: under exchangeability, an &alpha;-conformal
+    prediction interval contains the true value with probability
+    &ge; 1 &minus; &alpha; for any black-box model. Doesn&apos;t care
+    if your model was a quantile head, parametric, sample-based, or
+    a coin flip.
+  </p>
+
+  <h3>The basic recipe (split conformal)</h3>
+<pre><code># Calibration set:
+res_i = |y_i - y_hat_i|       for i in calibration set
+qhat = ceil((n+1) * (1-alpha)) / n -th quantile of {res_i}
+# At inference:
+PI = [y_hat - qhat, y_hat + qhat]
+# Coverage guarantee: P(y in PI) &gt;= 1 - alpha for any new exchangeable y.
+</code></pre>
+
+  <h3>Conformalized Quantile Regression (CQR, Romano et al. 2019)</h3>
+<pre><code># Use the model's own q_low, q_high as a starting point.
+res_i = max(q_low_i - y_i, y_i - q_high_i)   # signed conformity score
+qhat  = (1-alpha)-quantile of {res_i}
+PI    = [q_low - qhat, q_high + qhat]
+</code></pre>
+  <p>
+    CQR is what we run on top of TimesFM&apos;s quantile head:
+    coverage is empirical instead of asymptotic, and the band width
+    adapts to local model confidence.
+  </p>
+
+  <h3>Weighted conformal (for non-exchangeable TS)</h3>
+  <p>
+    Pure conformal assumes the calibration set and test point are
+    exchangeable. For TS that&apos;s violated by drift. Weighted
+    conformal (Tibshirani et al.) re-weights the calibration set
+    by importance weights to compensate. Or: use the most recent N
+    calibration points to mitigate drift effects (sliding-window
+    conformal).
+  </p>
+
+  <ul>
+    <li><strong>Pros</strong>: distribution-free; finite-sample guarantees; trivially layered on top of any head.</li>
+    <li><strong>Cons</strong>: requires a held-out calibration set; assumes exchangeability (which TS violates &mdash; weighted conformal is a partial fix); intervals are symmetric unless you use CQR.</li>
+    <li><strong>When to pick</strong>: any time you need a hard coverage SLO. <em>We use it.</em></li>
+  </ul>
+
+  <h2>Comparison matrix</h2>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Head</th>
+        <th>Loss</th>
+        <th>Outputs</th>
+        <th>Closed-form P(y &gt; t)</th>
+        <th>Heavy-tail handling</th>
+        <th>Inference cost</th>
+        <th>Calibration</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="row-chosen">
+        <td>Continuous quantile (TimesFM 2.5)</td>
+        <td>Pinball</td>
+        <td>q10..q90 monotone</td>
+        <td>Approximate via interpolation</td>
+        <td>Good (no distribution assumption)</td>
+        <td>1 forward pass</td>
+        <td>Asymptotic; conformal fixes</td>
+      </tr>
+      <tr>
+        <td>Discrete quantile (TimesFM 1.0)</td>
+        <td>Pinball</td>
+        <td>q10..q90 (sometimes non-monotone)</td>
+        <td>No</td>
+        <td>Good</td>
+        <td>1 forward pass</td>
+        <td>Asymptotic + post-hoc fix</td>
+      </tr>
+      <tr>
+        <td>Gaussian (DeepAR)</td>
+        <td>NLL</td>
+        <td>(&mu;, &sigma;)</td>
+        <td>Yes (closed-form)</td>
+        <td>Poor</td>
+        <td>1 forward pass + sample</td>
+        <td>Strong if Gaussian, fails otherwise</td>
+      </tr>
+      <tr>
+        <td>Student-T (Lag-Llama)</td>
+        <td>NLL</td>
+        <td>(&mu;, &sigma;, df)</td>
+        <td>Yes</td>
+        <td>Good</td>
+        <td>1 forward pass + sample</td>
+        <td>Robust</td>
+      </tr>
+      <tr>
+        <td>Mixture (Moirai)</td>
+        <td>NLL</td>
+        <td>k components</td>
+        <td>Yes (sum)</td>
+        <td>Excellent</td>
+        <td>1 forward pass + sample</td>
+        <td>Hardest to verify</td>
+      </tr>
+      <tr>
+        <td>Discrete-token (Chronos)</td>
+        <td>Cross-entropy</td>
+        <td>S sample paths</td>
+        <td>Empirical from samples</td>
+        <td>Excellent</td>
+        <td>S * H autoregressive steps</td>
+        <td>Asymptotic, sample-noise floor</td>
+      </tr>
+      <tr>
+        <td>Diffusion (TimeGrad)</td>
+        <td>Score matching</td>
+        <td>S sample paths</td>
+        <td>Empirical from samples</td>
+        <td>Excellent</td>
+        <td>S * H * T_diff steps</td>
+        <td>Asymptotic</td>
+      </tr>
+      <tr>
+        <td>+ Conformal wrapper</td>
+        <td>Any</td>
+        <td>(L, U) hard interval</td>
+        <td>No</td>
+        <td>N/A (wraps any head)</td>
+        <td>+1 sort over calibration</td>
+        <td>Finite-sample guarantee</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>What we ship at AA &mdash; the full output stack</h2>
+
+<pre><code>(1) TimesFM 2.5 native head:
+       continuous-quantile, monotone-by-construction
+       output: q10, q20, ..., q90 for each future timepoint
+
+(2) Conformalized Quantile Regression on top:
+       per-route calibration set: last 90 days of holdout residuals
+       qhat_route = (1-alpha)-quantile of conformity scores
+       PI_route = [q10 - qhat_route, q90 + qhat_route]
+
+(3) Coverage SLO monitoring:
+       target: 80% PI covers actual 80 +/- 2% of the time
+       window: rolling 30-day actuals
+       breach: PSI alarm + paged ML-on-call
+
+(4) Reporting outputs:
+       q50  -&gt; revenue-management point forecast
+       q10  -&gt; demand-floor for capacity planning
+       q90  -&gt; demand-ceiling for spoilage avoidance
+       PI   -&gt; conformal interval to RM dashboard
+</code></pre>
+
+  <p>
+    Why this stack and not a parametric Gaussian head: AA fare data
+    is heavy-tailed enough at the extremes (last-minute price
+    spikes, weather-driven crashes) that Gaussian under-covers q90
+    by 5&ndash;7 percentage points. We measured that in the
+    bake-off. Pinball loss with conformal fixup gives us reliable
+    coverage without committing to a distribution family.
+  </p>
+
+  <h2>Calibration tests we run</h2>
+  <ul>
+    <li><strong>Coverage at 80% PI</strong> &mdash; expected 80 &plusmn; 2% on rolling 30-day window. Fail = PSI alarm.</li>
+    <li><strong>Pinball at q10 and q90</strong> &mdash; tail loss; spikes when extreme bookings shift.</li>
+    <li><strong>ECE (Expected Calibration Error)</strong> &mdash; bucket forecasts by predicted quantile, measure empirical coverage. Reliability diagram should be near the diagonal.</li>
+    <li><strong>PIT (Probability Integral Transform) histogram</strong> &mdash; CDF(actual) under the predicted distribution should be uniform on [0, 1]. A peaked PIT means under-coverage; a U-shaped PIT means over-coverage.</li>
+    <li><strong>CRPS</strong> &mdash; Continuous Ranked Probability Score, the proper scoring rule for the full distribution. We track it as a single-number summary.</li>
+  </ul>
+
+  <p>
+    See <a href="evaluation.html">evaluation.html</a> for how each of
+    these is computed in the eval harness.
+  </p>
+
+  <h2>Tradeoffs at AA&apos;s scale</h2>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Decision</th><th>Cost</th><th>Benefit</th><th>What we accepted</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Continuous quantile over discrete</td>
+          <td>~3% slower head; ~5% more head params</td>
+          <td>Monotone q10..q90 by construction; no post-fixup</td>
+          <td>Easy fix; v1&apos;s 0.4% non-monotone rate created reportable bugs</td>
+        </tr>
+        <tr>
+          <td>Pinball + conformal over Gaussian NLL</td>
+          <td>Conformal needs a calibration set; intervals re-computed nightly</td>
+          <td>Distribution-free; matches heavy-tailed fare distribution</td>
+          <td>Gaussian under-covered q90 by 5&ndash;7 pp on heavy-tail routes</td>
+        </tr>
+        <tr>
+          <td>Sample-based heads (Chronos-style) NOT used</td>
+          <td>Lose token-level flexibility</td>
+          <td>20&times; faster inference; deterministic forecast</td>
+          <td>For our use cases, the determinism is worth more than the flexibility</td>
+        </tr>
+        <tr>
+          <td>Per-route conformal calibration</td>
+          <td>One qhat per route maintained nightly</td>
+          <td>Coverage holds even when route-specific bias drifts</td>
+          <td>Storage trivial; alternative (global qhat) under-covered tail routes</td>
+        </tr>
+        <tr>
+          <td>No diffusion / no flows</td>
+          <td>Can&apos;t handle multi-modal predictive distributions</td>
+          <td>Production simplicity; faster; auditable</td>
+          <td>Multi-modality is rare for daily fare; if we ever forecast event-driven hourly demand, revisit</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; probabilistic output heads</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Why pinball loss instead of MLE?</div>
+        <div class="a">Pinball loss directly targets quantiles without committing to a distribution family. MLE under e.g. Gaussian is more efficient if the data really is Gaussian, but on heavy-tailed AA fares, Gaussian NLL under-covers q90 by 5&ndash;7 percentage points. Pinball is the safer default; we use conformal prediction on top for hard coverage guarantees.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through the continuous-quantile head.</div>
+        <div class="a">Output a vector of monotone-by-construction CDF values. The trick: parameterise via cumulative softplus over learned bin edges &mdash; output is e0 + cumsum(softplus(raw)). By construction the result is non-decreasing in q. At inference, sample any quantile by linear interpolation. Solves the v1/v2 bug where ~0.4% of forecasts had q60 &lt; q50.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When does Gaussian NLL fail badly?</div>
+        <div class="a">Three scenarios. (1) Heavy-tailed data &mdash; the variance estimate is dominated by extremes, q90 is biased low. (2) Bounded data &mdash; Gaussian predicts negative values; we&apos;d need post-hoc clamp or a log-link. (3) Multi-modal data &mdash; Gaussian is unimodal, single mean and variance can&apos;t express two demand regimes. NegBin or mixture solves cases (1) and (3); truncated Gaussian solves (2).</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What does conformal prediction buy you over a calibrated quantile head?</div>
+        <div class="a">Finite-sample coverage guarantee. A quantile head&apos;s &ldquo;80% PI&rdquo; is a best-effort prediction; conformal calibrates it post-hoc with an exchangeability-based margin. Result: P(y in PI) &ge; 1 - alpha for any new exchangeable y, regardless of model error. Cheap to compute (one quantile over the calibration set), and the only output method with hard coverage promises.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Is conformal prediction valid for time series?</div>
+        <div class="a">Pure conformal assumes exchangeability, which TS violates under drift. Two practical fixes. (1) Sliding-window conformal: use the last N residuals as calibration; coverage is approximately valid as long as drift is slow relative to N. (2) Weighted conformal (Tibshirani et al. 2019): re-weight calibration residuals by importance weights derived from a drift estimator. We use sliding-window in production with N = 90 days; weighted conformal is on the watch list for high-drift routes.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How does Chronos&apos;s discrete-token head compare to a quantile head?</div>
+        <div class="a">Chronos quantile-bins values into 4,096 vocabulary tokens and trains a vanilla LM with cross-entropy. Probabilistic forecast comes from sampling 20 token paths and taking empirical quantiles. Pros: zero distribution assumption, every NLP trick (sampling, beam search) transfers. Cons: 20&times; inference cost, token quantization noise floor (precision ~0.001 sigma at the edges). For high-throughput batch forecasting, the cost is the deal-breaker.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s CRPS and why do you track it alongside MAPE?</div>
+        <div class="a">CRPS (Continuous Ranked Probability Score) is the integral of squared difference between the predicted CDF and the empirical CDF of the actual; it generalises MAE to distributions and is a proper scoring rule. MAPE measures only the q50 forecast; CRPS measures the whole distribution. A model that&apos;s 5% MAPE with a tight (under-confident) PI is worse than 5% MAPE with calibrated PI &mdash; CRPS catches that.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through the PIT histogram check.</div>
+        <div class="a">For each forecast, compute the predicted CDF at the actual value &mdash; PIT(y) = F_predicted(y). If the model is well-calibrated, PIT values are uniform on [0, 1]. Plot the histogram of PIT values across the test set. A peaked-in-the-middle histogram means under-coverage (model overestimates uncertainty). A U-shape means over-coverage (model is overconfident). Cheap, visual, and catches calibration bugs that ECE alone misses.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When would you use a mixture-distribution head over a quantile head?</div>
+        <div class="a">When the predictive distribution is genuinely multimodal &mdash; e.g. demand has a &ldquo;normal day&rdquo; mode and a &ldquo;holiday&rdquo; mode and you can&apos;t condition on a holiday flag because you don&apos;t know the holiday is coming. A mixture of Gaussians can express both modes; a quantile head will smear them together. For AA fares, daily demand is unimodal once you condition on day-of-week and holiday, so we don&apos;t need it.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why didn&apos;t you ship a diffusion-based forecaster?</div>
+        <div class="a">Two reasons. (1) Inference cost &mdash; 50&ndash;1000 reverse steps per sample &times; 20 samples is 1,000&ndash;20,000&times; the cost of one TimesFM forward pass. (2) Production maturity &mdash; the tooling is research-grade; we don&apos;t have an audit story. The accuracy gain over a well-calibrated quantile head is small for unimodal demand. We&apos;d revisit if we forecast multimodal event-driven demand.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">If you had to forecast minute-level booking volume, what head?</div>
+        <div class="a">Negative Binomial. Booking volume is count data with overdispersion (peaks during fare drops, zeros at night). Poisson would underestimate variance; Gaussian would predict negative counts. NegBin&apos;s (mu, alpha) parameterisation handles overdispersion and stays non-negative. Train with NegBin NLL.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <h2>Sources</h2>
+  <ul>
+    <li>Koenker, R. &amp; Bassett, G. (1978). <em>Regression Quantiles.</em> Econometrica.</li>
+    <li>Salinas, D. et al. (2020). <em>DeepAR: Probabilistic Forecasting with Autoregressive Recurrent Networks.</em> International Journal of Forecasting.</li>
+    <li>Gneiting, T. &amp; Raftery, A.E. (2007). <em>Strictly Proper Scoring Rules, Prediction, and Estimation.</em> JASA.</li>
+    <li>Vovk, V., Gammerman, A., Shafer, G. (2005). <em>Algorithmic Learning in a Random World</em> (Conformal Prediction).</li>
+    <li>Romano, Y., Patterson, E., Cand&egrave;s, E. (2019). <em>Conformalized Quantile Regression.</em> NeurIPS.</li>
+    <li>Tibshirani, R. et al. (2019). <em>Conformal Prediction Under Covariate Shift.</em> NeurIPS.</li>
+    <li>Rasul, K. et al. (2021). <em>Multivariate Probabilistic Time Series Forecasting via Conditioned Normalizing Flows.</em> ICLR.</li>
+    <li>Rasul, K. et al. (2021). <em>Autoregressive Denoising Diffusion Models for Multivariate Probabilistic Time Series Forecasting (TimeGrad).</em> ICML.</li>
+  </ul>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="peft-deepdive.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">PEFT methods deep-dive</div>
+    </a>
+    <a class="page-nav-item next" href="causal-elasticity-deepdive.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Causal elasticity deep-dive</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>

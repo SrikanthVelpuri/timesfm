@@ -130,9 +130,12 @@
 
   <h2 id="decisions">Deep-dive pages &mdash; design decisions</h2>
   <p>
-    Nine interview-prep pages on the major design decisions behind the project. Each
-    page has a TL;DR, a decision matrix, code samples where relevant, trade-offs, and
-    an interview Q&amp;A section.
+    The interview-prep pages on the major design decisions behind the project,
+    including architecture deep-dives (TimesFM internals, foundation TS survey,
+    transformer variants for TS, PEFT methods, probabilistic output heads, causal
+    elasticity, pricing optimization, hierarchical forecasting). Each page has a
+    TL;DR, a decision matrix, code samples where relevant, trade-offs, and an
+    interview Q&amp;A section.
   </p>
   <div class="page-index-grid">
     <a class="page-index-card decision" href="pages/when-to-use.html" style="border-left-color: #b45309;">
@@ -144,6 +147,16 @@
       <span class="tag" style="background: rgba(14,116,144,0.18); color: #0e7490;">Algorithms</span>
       <h3 style="color: #0e7490;">Pricing algorithms &mdash; base price, dynamic price, and everything in between</h3>
       <p>The full stack: base-price layer (LightGBM / hierarchical-Bayes / DeepAR), elasticity (log-log, MNL, deep choice), revenue optimizer (EMSRb, DLP, ADP), dynamic layer (bid-price, Thompson-sampling bandits, DQN/PPO/TRPO RL). Plus alternatives at 100+ routes and per-slice variations across domestic, intl-short, intl-long, premium, ancillaries.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/base-price-strategy.html" style="border-left-color: #6b21a8;">
+      <span class="tag" style="background: rgba(168,85,247,0.18); color: #6b21a8;">Strategy</span>
+      <h3 style="color: #6b21a8;">Base price as a strategic layer &mdash; where TimesFM stops and the bot begins</h3>
+      <p>The four-layer pricing stack: forecast (TimesFM) &rarr; elasticity (GBM/Bayes) &rarr; base price (MIP/Bayesian opt) &rarr; dynamic bot (bandits). Why base price matters more, not less, when bots run the dynamic loop. JSON contracts between layers, antitrust separation, partial-pooling decisions per layer.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/alt-models-bakeoff.html" style="border-left-color: var(--accent-cyan);">
+      <span class="tag" style="background: rgba(14,116,144,0.18); color: var(--accent-cyan);">Alt models</span>
+      <h3 style="color: var(--accent-cyan);">Alt-models bake-off &mdash; elasticity, base-price, competitor reaction</h3>
+      <p>Honest model comparison for the layers TimesFM does NOT solve: TFT/TiDE/Chronos-Bolt as forecast alternatives; LightGBM+RE / hierarchical Bayes / Double ML / DeepIV / GPBoost for elasticity; Bayesian opt / contextual bandits for base-price; multi-agent / inverse optimization for competitor. With citations.</p>
     </a>
     <a class="page-index-card decision" href="pages/market-routes.html" style="border-left-color: var(--accent-green);">
       <span class="tag" style="background: rgba(34,197,94,0.15); color: #15803d;">Markets</span>
@@ -160,10 +173,50 @@
       <h3>Model choice &mdash; Why TimesFM 2.5</h3>
       <p>9-way comparison: ARIMAX, Prophet, DeepAR, NBEATS, PatchTST, Chronos, Lag-Llama, GPT-tools, and TimesFM. Decision matrix with weights.</p>
     </a>
+    <a class="page-index-card decision" href="pages/timesfm-internals.html" style="border-left-color: var(--aa-blue);">
+      <span class="tag" style="background: rgba(0,120,200,0.15); color: var(--aa-blue);">Architecture</span>
+      <h3 style="color: var(--aa-blue);">TimesFM 2.5 internals &mdash; the model, opened up</h3>
+      <p>Patching, RoPE + QK-norm attention, continuous quantile head, training corpus. v2.5 vs v1 changes (60% smaller, 8&times; longer context, restored covariates). Tradeoffs at 6,700-route scale.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/foundation-ts-survey.html" style="border-left-color: var(--aa-blue);">
+      <span class="tag" style="background: rgba(0,120,200,0.15); color: var(--aa-blue);">Architecture</span>
+      <h3 style="color: var(--aa-blue);">Foundation TS models &mdash; architecture-by-architecture</h3>
+      <p>TimesFM, Chronos-T5, Chronos-Bolt, Moirai, Moirai-MoE, Lag-Llama, TimeGPT, MOMENT, TTM. Pretraining corpora, output heads, decision tree, and when each wins.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/transformer-variants-ts.html" style="border-left-color: var(--aa-blue);">
+      <span class="tag" style="background: rgba(0,120,200,0.15); color: var(--aa-blue);">Architecture</span>
+      <h3 style="color: var(--aa-blue);">Transformer variants for TS</h3>
+      <p>Vanilla Transformer, Informer (ProbSparse), Autoformer (decomposition + autocorrelation), FEDformer (FFT), PatchTST (patching + channel-independent), Crossformer, iTransformer.</p>
+    </a>
     <a class="page-index-card decision" href="pages/finetuning.html">
       <span class="tag">Decision</span>
       <h3>Fine-tuning strategy &mdash; LoRA vs alternatives</h3>
       <p>PEFT comparison: full FT, adapters, LoRA, QLoRA, prefix tuning, BitFit, IA<sup>3</sup>. Math, rank sweep, hot-swap implementation.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/peft-deepdive.html" style="border-left-color: var(--accent-purple);">
+      <span class="tag" style="background: rgba(168,85,247,0.18); color: var(--accent-purple);">Technique</span>
+      <h3 style="color: var(--accent-purple);">PEFT methods deep-dive</h3>
+      <p>Math + tradeoffs for LoRA, DoRA, QLoRA (NF4 + double-quant), IA3 (rescaling), Adapter, Prefix Tuning, P-Tuning v2, LongLoRA, VeRA. Multi-LoRA serving patterns.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/probabilistic-heads.html" style="border-left-color: var(--accent-purple);">
+      <span class="tag" style="background: rgba(168,85,247,0.18); color: var(--accent-purple);">Technique</span>
+      <h3 style="color: var(--accent-purple);">Probabilistic output heads</h3>
+      <p>Quantile / Gaussian / Student-T / NegBin / mixture / discrete-token / diffusion / conformal. Math, calibration tests, and the full output stack we ship at AA.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/causal-elasticity-deepdive.html" style="border-left-color: var(--accent-purple);">
+      <span class="tag" style="background: rgba(168,85,247,0.18); color: var(--accent-purple);">Technique</span>
+      <h3 style="color: var(--accent-purple);">Causal elasticity deep-dive</h3>
+      <p>Why a forecast coefficient is NOT an elasticity. Identification (RCT, IV, DiD, RDD, FE). Double ML, DeepIV, causal forests, GPBoost, hierarchical Bayes. The recommended OR stack.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/pricing-optimization.html" style="border-left-color: var(--accent-purple);">
+      <span class="tag" style="background: rgba(168,85,247,0.18); color: var(--accent-purple);">Technique</span>
+      <h3 style="color: var(--accent-purple);">Pricing optimization techniques</h3>
+      <p>MIP for the base price, Bayesian optimization for constraint tuning, contextual bandits (Thompson sampling, LinUCB) for the bot, doubly-robust off-policy evaluation. Why bandits don&apos;t belong on the strategic anchor.</p>
+    </a>
+    <a class="page-index-card decision" href="pages/hierarchical-forecasting.html" style="border-left-color: var(--accent-purple);">
+      <span class="tag" style="background: rgba(168,85,247,0.18); color: var(--accent-purple);">Technique</span>
+      <h3 style="color: var(--accent-purple);">Hierarchical forecasting &amp; reconciliation</h3>
+      <p>Bottom-up, top-down, middle-out, OLS reconciliation, MinT (minimum-trace). The 5-level hierarchy: network &rarr; region &rarr; family &rarr; OD &rarr; cabin. Probabilistic reconciliation.</p>
     </a>
     <a class="page-index-card decision" href="pages/inference.html">
       <span class="tag">Decision</span>

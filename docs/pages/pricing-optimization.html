@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pricing Optimization Techniques &middot; AA Pricing Forecast</title>
+<meta name="description" content="Optimization techniques for the base-price and dynamic-pricing layers: MIP, Bayesian optimization, contextual bandits (LinUCB, Thompson sampling, NeuralBandit), off-policy evaluation (IPS, DR, SNIPS), reinforcement learning. Math, when each wins, deployment story." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Architectures</a> &nbsp;/&nbsp; <span>Pricing optimization</span>
+  </nav>
+
+  <h1>Pricing optimization &mdash; MIP, Bayesian opt, bandits, off-policy</h1>
+  <p class="lead">
+    Once you have a forecast and an elasticity, the optimizer has to
+    pick a price. This page is the deep-dive of the four techniques
+    that compete at the L3 (base-price) and L4 (dynamic bot) layers
+    of <a href="base-price-strategy.html">the four-layer stack</a>:
+    Mixed-Integer Programming, Bayesian Optimization, Contextual
+    Bandits, and Reinforcement Learning. Plus the off-policy
+    evaluation tooling (IPS, DR, SNIPS) you need to compare them
+    safely.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> L3 (base price, weekly): <em>MIP</em>
+    with the elasticity grid linearised + offline <em>Bayesian
+    optimization</em> for constraint settings. Auditable, no
+    exploration, regulator-friendly. L4 (per-request bot): <em>contextual
+    bandit</em> with Thompson Sampling, bounded by floor/ceiling
+    from L3. The bandit explores at the per-request level where it&apos;s
+    cheap; the strategic anchor doesn&apos;t explore. RL only if
+    you have a high-fidelity simulator (we don&apos;t). Off-policy
+    evaluation (IPS, DR, SNIPS) is non-negotiable: any new policy
+    is graded on logged data before going live.
+  </div>
+
+  <h2>Where each technique lives in the stack</h2>
+
+<pre><code>L1 Forecast   (TimesFM)          -- nightly batch
+                |
+                v
+L2 Elasticity (Double ML, GPBoost) -- weekly
+                |
+                v
+L3 Base-price (MIP + Bayesian opt)  -- weekly to monthly
+                |  produces anchor, ladder, floor, ceiling
+                v
+L4 Bot        (Contextual bandit)    -- per-request, ms latency
+</code></pre>
+
+  <p>
+    The same problem (set a price) takes different forms at different
+    layers. L3 is a constrained offline optimisation; L4 is online
+    decision-making with exploration. Different math, different
+    tools.
+  </p>
+
+  <h2>1 &middot; Mixed-Integer Programming for base prices</h2>
+  <p>
+    MIP is the production default for the strategic anchor. The
+    setup: maximise expected revenue subject to the fare ladder,
+    floor / ceiling, brand-positioning, and competitive constraints.
+    The non-linear demand-vs-price relationship is approximated by a
+    piecewise-linear function (the elasticity grid).
+  </p>
+
+<pre><code># Decision variables (per OD, season):
+#   p_k      = 1 if anchor takes value level k, 0 otherwise
+#   y_k      = expected revenue at level k = price_k * E[demand | price_k]
+# Constraints:
+#   sum_k p_k = 1                   (pick exactly one level)
+#   floor &lt;= sum_k price_k * p_k    (regulatory floor)
+#   sum_k price_k * p_k &lt;= ceiling  (brand-positioning ceiling)
+#   ladder smoothness across cabins (saver, main, first)
+#   competitive constraints if any (don't undercut Delta by &gt; 5%)
+# Objective:
+#   max sum_k y_k * p_k
+</code></pre>
+
+  <p>
+    Solver: Gurobi or CPLEX or open-source CBC. Solve time per OD
+    is sub-second; 6,700 ODs &times; 2 cabins solve in &lt; 5 minutes
+    on a laptop. Output: signed JSON contract (anchor, floor,
+    ceiling, ladder rungs) sent to the bot. Auditable: the
+    constraint set is the policy; the solution is reproducible
+    given the same inputs.
+  </p>
+
+  <ul>
+    <li><strong>Pros</strong>: deterministic, auditable, handles complex constraint sets natively, fast.</li>
+    <li><strong>Cons</strong>: piecewise-linear approximation loses precision; struggles with stochastic objectives (you have to use sample-average approximation).</li>
+    <li><strong>When to pick</strong>: any L3 base-price problem at airline scale. <em>Production default.</em></li>
+  </ul>
+
+  <h2>2 &middot; Bayesian Optimization for hyperparameters &amp; constraint settings</h2>
+  <p>
+    BO is the right tool when the objective is expensive to evaluate,
+    you have no gradient, and you want sample-efficient search. Two
+    use cases at AA: (a) tuning the constraints on the MIP (where
+    should the floor/ceiling band go?), and (b) hyperparameter search
+    for the elasticity model.
+  </p>
+
+  <h3>The Gaussian-process surrogate + acquisition function</h3>
+
+<pre><code>Surrogate model:
+  f(x) ~ GP(mu(x), k(x, x'))
+  -- prior over the unknown objective
+  -- updated with each evaluation
+
+Acquisition functions:
+  EI (Expected Improvement) = E[max(0, f(x) - f_best)]
+  UCB (Upper Confidence Bound) = mu(x) + beta * sigma(x)
+  TS (Thompson Sampling)       = sample f from GP posterior, take argmax
+
+Loop:
+  for t in 1..T:
+      x_t = argmax of acquisition(x)
+      y_t = expensive_eval(x_t)         # one expensive function call
+      update GP posterior with (x_t, y_t)
+return argmax_t y_t
+</code></pre>
+
+  <p>
+    For our use, &ldquo;expensive eval&rdquo; means &ldquo;simulate
+    next week&apos;s revenue under this constraint setting through
+    1000 forecast samples.&rdquo; BO converges in 30&ndash;100
+    evaluations vs grid search&apos;s 10,000+. Tooling: <code>scikit-optimize</code>,
+    <code>optuna</code>, <code>botorch</code>.
+  </p>
+
+  <ul>
+    <li><strong>Pros</strong>: sample-efficient; principled
+      exploration via acquisition functions; uncertainty
+      quantification.</li>
+    <li><strong>Cons</strong>: scales poorly past ~20-dimensional
+      input; GP cubic in number of evaluations; choice of kernel
+      matters.</li>
+    <li><strong>When to pick</strong>: constraint tuning, expensive
+      simulator runs, hyperparameter search where each eval is
+      &gt; 1 minute.</li>
+  </ul>
+
+  <h2>3 &middot; Contextual bandits for the dynamic bot</h2>
+  <p>
+    L4 is online decision-making: per request, choose a price
+    deviation from the base, observe the booking outcome, learn.
+    Contextual bandits formalise this: at time t, observe context
+    x_t (load, days-to-departure, channel, segment), choose action
+    a_t (price level), observe reward r_t (booking value). Goal:
+    minimise cumulative regret vs the best context-conditional
+    policy.
+  </p>
+
+  <h3>LinUCB &mdash; the linear baseline</h3>
+
+<pre><code>For each arm a (price level):
+    A_a = identity, b_a = 0
+At each round t with context x_t:
+    for each arm a:
+        theta_a_hat = A_a^-1 b_a
+        upper_bound = theta_a_hat^T x_t + alpha * sqrt(x_t^T A_a^-1 x_t)
+    a_t = argmax of upper_bound
+    observe reward r_t
+    A_{a_t} += x_t x_t^T
+    b_{a_t} += r_t * x_t
+</code></pre>
+
+  <p>
+    The principle: build a confidence ellipsoid around each arm&apos;s
+    estimated reward, choose the arm with the highest UCB. Provably
+    sub-linear regret under linear-reward assumption.
+  </p>
+
+  <h3>Thompson Sampling &mdash; the Bayesian bandit</h3>
+
+<pre><code>For each arm a:
+    posterior over theta_a after observed (context, reward) pairs
+At each round t:
+    for each arm a:
+        sample theta_a from posterior
+    a_t = argmax of theta_a^T x_t
+    observe reward, update posterior
+</code></pre>
+
+  <p>
+    Each round, sample one parameter draw per arm from the
+    posterior, take the argmax. Naturally balances exploration vs
+    exploitation; closed-form for Beta-Bernoulli, Normal-Normal;
+    cheap to implement. Empirically as good as LinUCB and often
+    better. <em>This is what we recommend Pricing Tech ship for L4.</em>
+  </p>
+
+  <h3>Neural Bandit &mdash; nonlinear context</h3>
+  <p>
+    Replace the linear reward model with a neural net. Useful when
+    context-reward relationships are non-linear and abundant data
+    is available. Trade-off: harder to maintain confidence
+    intervals; harder to debug; harder to audit. We don&apos;t
+    recommend it for L4 unless the linear bandit hits a clear
+    accuracy wall.
+  </p>
+
+  <ul>
+    <li><strong>Pros</strong>: online learning, uncertainty-aware exploration, sub-linear regret.</li>
+    <li><strong>Cons</strong>: explores into bad outcomes (real customers see bad prices); requires logging exploration; auditable explanation harder.</li>
+    <li><strong>When to pick</strong>: high-volume, low-stakes per-decision (per-request fare deviation within a bounded floor/ceiling).</li>
+  </ul>
+
+  <h2>4 &middot; Reinforcement Learning</h2>
+  <p>
+    Bandits assume the action doesn&apos;t change the next-state
+    distribution. Pricing has temporal dynamics: a price drop today
+    cannibalises tomorrow&apos;s bookings; a sold-out flight changes
+    the inventory state; competitor reactions extend the horizon.
+    Full RL (PPO, SAC) handles these.
+  </p>
+
+<pre><code>State:    inventory + competitor fares + days-to-departure
+Action:   per-request fare deviation
+Reward:   immediate booking revenue + simulated future revenue
+Policy:   neural net: pi_theta(a | s)
+Loss:     PPO clipped objective + entropy bonus
+</code></pre>
+
+  <p>
+    Why we don&apos;t deploy RL at AA today: the simulator question.
+    Pricing RL needs a high-fidelity environment to train against
+    &mdash; one that respects competitor reactions, customer
+    fatigue, regulatory constraints, fare-class restrictions.
+    Building that simulator is a year of OR work and the simulator
+    itself becomes a regulated artefact. The bandit at L4 + the
+    structural model at L3 captures most of the win at a fraction
+    of the operational cost.
+  </p>
+
+  <ul>
+    <li><strong>When to pick</strong>: when you have a credible high-fidelity simulator and the temporal dynamics genuinely matter (e.g. inventory-constrained pricing on a single flight). Niche.</li>
+  </ul>
+
+  <h2>5 &middot; Off-policy evaluation &mdash; non-negotiable</h2>
+  <p>
+    Before any new policy goes live, score it on <em>logged</em>
+    data from the current policy. Three estimators, all under the
+    importance-sampling family:
+  </p>
+
+  <h3>Inverse Propensity Score (IPS)</h3>
+<pre><code>Logged data: (x_i, a_i, r_i, p_i)  where p_i = P(a_i | x_i, current policy)
+For new policy pi_new:
+    V_hat(pi_new) = (1/n) * sum_i [pi_new(a_i | x_i) / p_i] * r_i
+</code></pre>
+  <p>
+    Unbiased under positivity (p_i &gt; 0 wherever pi_new puts mass).
+    High variance when propensities are small.
+  </p>
+
+  <h3>Self-Normalised IPS (SNIPS)</h3>
+<pre><code>V_hat(pi_new) = sum_i w_i r_i / sum_i w_i
+    where w_i = pi_new(a_i | x_i) / p_i
+</code></pre>
+  <p>
+    Biased but lower variance than IPS. Practical default for many
+    teams. Used as a sanity check.
+  </p>
+
+  <h3>Doubly Robust (DR)</h3>
+<pre><code>q_hat(x, a) = ML reward model fit on logged data
+V_hat(pi_new) = (1/n) * sum_i [
+    sum_a pi_new(a | x_i) * q_hat(x_i, a)         # model-based term
+  + (pi_new(a_i | x_i) / p_i) * (r_i - q_hat(x_i, a_i))   # IPS correction
+]
+</code></pre>
+  <p>
+    Unbiased if either q_hat OR p is correct. Lower variance than
+    IPS in practice. Industry standard for bandit policy
+    evaluation.
+  </p>
+
+  <p>
+    For AA, the routing is: any candidate L4 policy is evaluated
+    via DR on 30 days of logged exploration data; if predicted
+    revenue lift &gt; 0.5% with 95% CI, ship to a 5% traffic A/B;
+    if A/B confirms, full ramp.
+  </p>
+
+  <h2>How they fit at AA &mdash; the recommended optimization stack</h2>
+
+  <table class="decision-matrix">
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Problem</th>
+        <th>Right tool</th>
+        <th>Why</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>L3 base-price (weekly)</td>
+        <td>Constrained, offline, deterministic given inputs</td>
+        <td>MIP + offline BO for constraint tuning</td>
+        <td>Auditable, regulator-friendly, no exploration cost</td>
+      </tr>
+      <tr>
+        <td>L4 dynamic bot (per-request)</td>
+        <td>Online, contextual, fast feedback</td>
+        <td>Thompson Sampling contextual bandit</td>
+        <td>Provable regret, cheap, explainable per request</td>
+      </tr>
+      <tr>
+        <td>Constraint tuning (offline)</td>
+        <td>Expensive simulator evaluation, low-D parameter space</td>
+        <td>Bayesian Optimization (botorch)</td>
+        <td>30 evaluations vs 10,000 grid</td>
+      </tr>
+      <tr>
+        <td>Policy evaluation</td>
+        <td>Score new policy on logged data before deploy</td>
+        <td>Doubly Robust off-policy evaluation</td>
+        <td>Lower variance than IPS; unbiased under either model</td>
+      </tr>
+      <tr>
+        <td>Inventory-aware pricing on a single flight</td>
+        <td>Temporal dynamics, sparse states, simulator available</td>
+        <td>Reinforcement Learning (PPO with reward shaping)</td>
+        <td>Bandits ignore inventory state; RL captures it</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Why we don&apos;t put a bandit on the base price</h2>
+  <p>
+    The temptation is to run one big bandit at the strategic level:
+    explore base prices, get rewards from realised bookings, learn
+    the optimal anchor. Three reasons we recommend against:
+  </p>
+  <ol>
+    <li><strong>Regulatory.</strong> Strategic prices need to be explained. &ldquo;We set DFW-LAX&apos;s anchor at $180 because the bandit was exploring&rdquo; doesn&apos;t pass legal review.</li>
+    <li><strong>Sample efficiency.</strong> Base prices change weekly. The bandit gets one reward signal per week per route &mdash; convergence takes years.</li>
+    <li><strong>Reward attribution.</strong> Realised weekly revenue depends on the entire stack: anchor + bot + competitor reactions + macro. Attributing to the anchor specifically is hard. The MIP-based optimizer separates the layers cleanly.</li>
+  </ol>
+
+  <p>
+    Bandits at L4 (per-request) get thousands of samples per route
+    per day; the per-request decision absorbs exploration noise; the
+    explanation is &ldquo;within the bounds set by the strategic anchor.&rdquo;
+    That&apos;s the right place for online learning.
+  </p>
+
+  <h2>Cross-elasticity in the optimizer</h2>
+  <p>
+    The single-OD MIP misses substitution: lowering DFW-LAX may
+    cannibalise DFW-BUR. The fix: joint optimization over substitute
+    clusters.
+  </p>
+
+<pre><code># Within a substitute cluster (DFW-LAX, DFW-LGB, DFW-BUR):
+maximize sum_i price_i * E[demand_i | price_i, price_{-i}]
+   subject to:
+       per-OD floor and ceiling
+       cluster-level total-revenue floor (don't drop the cluster)
+       smoothness across substitutes
+</code></pre>
+
+  <p>
+    Cross-elasticity matrix from the Layer 2 elasticity model. For
+    most domestic mainline ODs the cross-elasticity is small; for
+    LA-basin ODs (DFW-LAX vs DFW-BUR vs DFW-LGB) it&apos;s
+    decisive.
+  </p>
+
+  <h2>Tradeoffs at AA&apos;s scale</h2>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Decision</th><th>Cost</th><th>Benefit</th><th>What we accepted</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>MIP at L3 (vs LP relaxation)</td>
+          <td>Solve time minutes vs seconds</td>
+          <td>Discrete fare ladder respected; no fractional-price hacks</td>
+          <td>Minutes is fine for weekly cadence</td>
+        </tr>
+        <tr>
+          <td>Bayesian opt for constraint tuning (vs grid search)</td>
+          <td>GP fit cost; depends on kernel choice</td>
+          <td>30 evaluations vs 10,000 grid</td>
+          <td>Tooling maturity (botorch) makes the cost negligible</td>
+        </tr>
+        <tr>
+          <td>Thompson Sampling at L4 (vs LinUCB)</td>
+          <td>Posterior maintenance per arm</td>
+          <td>Equivalent regret bounds, cleaner Bayesian story, easier hyperparameter</td>
+          <td>Production default for L4</td>
+        </tr>
+        <tr>
+          <td>DR off-policy eval (vs A/B only)</td>
+          <td>Need a reward model + propensity scores logged</td>
+          <td>Score policies before risking traffic</td>
+          <td>Logging propensities is a pre-req; small storage cost</td>
+        </tr>
+        <tr>
+          <td>No RL at L3 / L4</td>
+          <td>Miss inventory-aware temporal optimization</td>
+          <td>No simulator to maintain; no RL audit story</td>
+          <td>Bandit captures most of the per-request win; the temporal residual is small for our ODs</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Failure modes</h2>
+  <ol>
+    <li><strong>MIP infeasibility.</strong> Constraints conflict (regulatory floor + competitive cap + brand-positioning). Mitigation: feasibility-relaxation MIP that minimises constraint violations rather than reporting infeasible.</li>
+    <li><strong>BO premature convergence.</strong> Acquisition function gets stuck in a local optimum. Mitigation: explicit exploration restart; multi-start.</li>
+    <li><strong>Bandit selection bias on logging.</strong> If the bandit prefers high-load contexts, the reward model trained on logged data is biased. Mitigation: Doubly Robust evaluation + propensity-aware training.</li>
+    <li><strong>Bandit cold-start.</strong> New context (new OD, new channel) has no exploration history. Mitigation: prior from family (similar ODs); guard with rule-based fallback.</li>
+    <li><strong>RL sim-to-real gap.</strong> Simulator can&apos;t capture competitor reaction perfectly; deployed policy fails in unexpected ways. Mitigation: deploy RL only after extensive A/B and shadow-mode validation.</li>
+  </ol>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; pricing optimization</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">When do you use MIP vs Bayesian optimization vs bandits?</div>
+        <div class="a">MIP for the deterministic constrained optimisation at L3 (anchor selection given fixed elasticity grid). BO for tuning the MIP&apos;s constraint parameters when each evaluation is expensive (forecast simulation). Bandits for online per-request decisions at L4. Different layers, different math, different audit profiles.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through Thompson Sampling for pricing.</div>
+        <div class="a">Maintain a posterior over each arm&apos;s reward parameters. Each round, sample one parameter per arm, take argmax. Bayesian story: arms with high posterior mean OR high posterior uncertainty get explored. Equivalent regret bounds to LinUCB but cleaner implementation. Closed-form posterior updates for many likelihood-prior pairs (Beta-Bernoulli, Normal-Normal).</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why not let one big RL policy run the whole stack?</div>
+        <div class="a">Four reasons. (1) No high-fidelity simulator; building one is a year of OR + a regulated artefact. (2) Auditability &mdash; explaining strategic prices via an RL policy is hard. (3) Antitrust &mdash; layer separation is easier to defend than &ldquo;one big policy.&rdquo; (4) Sample efficiency at strategic horizon &mdash; RL learns slowly when the reward signal is weekly. The MIP + bandit split captures most of the win at lower operational cost.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s wrong with using just A/B testing instead of off-policy evaluation?</div>
+        <div class="a">Cost. A/B requires risking real customer traffic on the new policy. Off-policy evaluation lets you score the new policy on logged data before deploying. Doubly Robust gives unbiased estimates with valid CIs from existing exploration data. We use OPE to filter candidate policies to the top 5%; only those go to A/B. Saves ~95% of A/B traffic.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you handle bandit cold-start for a new route?</div>
+        <div class="a">Two layers. First, the L4 bandit&apos;s prior comes from the route family (similar ODs already explored). Second, a rule-based fallback inside the floor/ceiling band picks a conservative price until the bandit has 100+ samples. The bandit explores around that prior; after a few hundred bookings the posterior converges.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What does the Doubly Robust estimator buy you over plain IPS?</div>
+        <div class="a">Lower variance and double-protection: DR is unbiased if either the propensity model OR the reward model is correctly specified. Plain IPS has high variance when propensities are small (rare actions); DR&apos;s reward model fills the gap. In our pricing context, propensities can be near-zero on rare contexts; DR keeps the variance manageable.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why log propensities at deploy time?</div>
+        <div class="a">Without logged propensities you can&apos;t do off-policy evaluation. The propensity is the probability the current policy assigned to the chosen action; it&apos;s necessary for any importance-sampling-based estimator. Storage is cheap (one extra float per request); skipping it is one of the most expensive decisions a team can make.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through MIP for a single OD.</div>
+        <div class="a">Decision: which fare ladder rung to anchor at. Variables: binary indicator per rung. Constraints: regulatory floor, brand-positioning ceiling, ladder smoothness across cabins, competitor cap. Objective: max expected revenue summed over rungs, weighted by indicator. Solver: Gurobi, sub-second per OD. The piecewise-linear elasticity from the L2 model gives the per-rung expected revenue.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When does Bayesian optimization fail?</div>
+        <div class="a">Three scenarios. (1) High-dimensional input (D &gt; 20) &mdash; GP scales cubically; Trust Region BO or random embeddings help. (2) Discontinuous objective &mdash; GP&apos;s smooth-kernel assumption breaks; reframe as bandit. (3) Cheap evaluations &mdash; if each eval is sub-second, grid search is competitive and simpler.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Cross-elasticity in the optimizer &mdash; how do you handle it?</div>
+        <div class="a">Joint optimisation over substitute clusters. Pre-cluster ODs by shopper-search co-occurrence (DFW-LAX / DFW-LGB / DFW-BUR are one cluster). Within a cluster, the MIP optimises jointly with the cross-elasticity matrix from L2. Across clusters, ODs are treated independently. For most domestic mainline ODs cross-elasticity is small; LA-basin ODs are where it matters most.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What stops the bandit from exploring into pathologically bad prices?</div>
+        <div class="a">The L3 floor / ceiling guardrails. The bandit explores within [floor, ceiling] only; both come from the L3 MIP. So the worst case is &ldquo;explore at floor,&rdquo; not &ldquo;explore at $0.&rdquo; Plus we cap exploration probability (epsilon) per route to bound the cost of bandit-driven mistakes.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <h2>Sources</h2>
+  <ul>
+    <li>Bertsimas, D. &amp; Tsitsiklis, J.N. (1997). <em>Introduction to Linear Optimization.</em> (MIP basics.)</li>
+    <li>Frazier, P.I. (2018). <em>A Tutorial on Bayesian Optimization.</em> arXiv:1807.02811.</li>
+    <li>Snoek, J., Larochelle, H., Adams, R.P. (2012). <em>Practical Bayesian Optimization of Machine Learning Algorithms.</em> NeurIPS.</li>
+    <li>Russo, D., Van Roy, B., Kazerouni, A., Osband, I., Wen, Z. (2018). <em>A Tutorial on Thompson Sampling.</em> Foundations and Trends in ML.</li>
+    <li>Li, L., Chu, W., Langford, J., Schapire, R.E. (2010). <em>A Contextual-Bandit Approach to Personalized News Article Recommendation (LinUCB).</em> WWW.</li>
+    <li>Riquelme, C., Tucker, G., Snoek, J. (2018). <em>Deep Bayesian Bandits Showdown.</em> ICLR.</li>
+    <li>Schulman, J. et al. (2017). <em>Proximal Policy Optimization Algorithms.</em> arXiv:1707.06347.</li>
+    <li>Dud&iacute;k, M., Langford, J., Li, L. (2011). <em>Doubly Robust Policy Evaluation and Learning.</em> ICML.</li>
+    <li>Swaminathan, A. &amp; Joachims, T. (2015). <em>The Self-Normalized Estimator for Counterfactual Learning.</em> NeurIPS.</li>
+  </ul>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="causal-elasticity-deepdive.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Causal elasticity deep-dive</div>
+    </a>
+    <a class="page-nav-item next" href="hierarchical-forecasting.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Hierarchical forecasting &amp; reconciliation</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>

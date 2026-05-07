@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Base Price Strategic Layer &middot; AA Pricing Forecast</title>
+<meta name="description" content="The four-layer pricing stack: TimesFM forecast, GBM/Bayesian elasticity, base-price optimizer, dynamic-pricing bot. Why the base price matters more, not less, when bots run the dynamic loop." />
+<link rel="stylesheet" href="../assets/css/style.css" />
+<link rel="stylesheet" href="../assets/css/pages.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="brand-mark">AA</span>
+      <div>
+        <div class="brand-title">Pricing Forecast with TimesFM</div>
+        <div class="brand-subtitle">Applied Scientist Portfolio</div>
+      </div>
+    </div>
+    <nav class="header-links">
+      <a href="../index.html">&larr; Portfolio Home</a>
+      <a href="https://github.com/SrikanthVelpuri/timesfm" target="_blank" rel="noopener">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content page-content">
+  <nav class="breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;/&nbsp; <a href="../index.html#decisions">Design decisions</a> &nbsp;/&nbsp; <span>Base price as a strategic layer</span>
+  </nav>
+
+  <h1>Base price as a strategic layer &mdash; where TimesFM stops and the bot begins</h1>
+  <p class="lead">
+    TimesFM produces a demand-driven daily-fare forecast. The <em>base price</em> is a
+    different object: a strategic anchor that the dynamic-pricing bot deviates from on
+    each customer request. As bots take over more of the per-customer decision, the
+    base price becomes the controllable strategic surface &mdash; the guardrail the bot
+    operates inside. This page makes that layer explicit and shows where TimesFM stops.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR.</strong> Pricing is four layers: <strong>(1) Forecast</strong> (TimesFM
+    2.5 + XReg + LoRA), <strong>(2) Elasticity / response</strong> (GBM + hierarchical
+    Bayes), <strong>(3) Base-price optimizer</strong> (MIP + Bayesian opt),
+    <strong>(4) Dynamic-pricing bot</strong> (rules + contextual bandits). The portfolio
+    today owns layer 1; layers 2&ndash;4 are owned by Operations Research, Pricing
+    Strategy, and Pricing Tech. As bots eat the dynamic loop, the base price
+    becomes more important, not less &mdash; the bot is good at execution; the base price
+    decides what is being executed.
+  </div>
+
+  <h2>The four-layer pricing stack</h2>
+  <p>Each layer has a distinct output, owner, model class, and update cadence. Mixing
+  layers is the most common failure I&apos;ve seen in airline RM &mdash; usually a forecast
+  team trying to set policy, or a pricing team treating a forecast coefficient as a
+  causal elasticity. Keep them separate.</p>
+
+  <div class="stage-grid">
+    <div class="stage-card" style="border-top-color: var(--aa-blue);">
+      <h3>1 &middot; Forecast layer</h3>
+      <ul>
+        <li><strong>Model:</strong> TimesFM 2.5 + XReg head + per-family LoRA.</li>
+        <li><strong>Output:</strong> q10 / q50 / q90 daily fare, 30-day horizon, per OD-pair, per cabin.</li>
+        <li><strong>Owner:</strong> Applied Science (us).</li>
+        <li><strong>Cadence:</strong> nightly + on-demand (off-cycle re-score).</li>
+        <li><strong>What it answers:</strong> &ldquo;What will the realised average fare look like under current policy?&rdquo;</li>
+      </ul>
+    </div>
+    <div class="stage-card" style="border-top-color: var(--accent-purple);">
+      <h3>2 &middot; Elasticity / response layer</h3>
+      <ul>
+        <li><strong>Model options:</strong> LightGBM + random effects (GPBoost), hierarchical Bayes (Stan/PyMC), Double ML, DeepIV, causal forests.</li>
+        <li><strong>Output:</strong> &part;E[demand]/&part;Price + cross-elasticities, per (route family, cabin, days-to-departure, segment).</li>
+        <li><strong>Owner:</strong> Operations Research.</li>
+        <li><strong>Cadence:</strong> weekly.</li>
+        <li><strong>What it answers:</strong> &ldquo;If we move price by &Delta;, how much does demand move?&rdquo;</li>
+      </ul>
+    </div>
+    <div class="stage-card" style="border-top-color: var(--accent-amber);">
+      <h3>3 &middot; Base-price optimizer</h3>
+      <ul>
+        <li><strong>Model options:</strong> mixed-integer programming, Bayesian optimization, simulation-based grid search.</li>
+        <li><strong>Output:</strong> anchor fare, fare-ladder rungs, floor, ceiling, per (OD, cabin, season).</li>
+        <li><strong>Owner:</strong> Pricing Strategy.</li>
+        <li><strong>Cadence:</strong> weekly to monthly.</li>
+        <li><strong>What it answers:</strong> &ldquo;What is the published anchor that maximises expected revenue under constraints?&rdquo;</li>
+      </ul>
+    </div>
+    <div class="stage-card" style="border-top-color: var(--aa-red);">
+      <h3>4 &middot; Dynamic-pricing bot</h3>
+      <ul>
+        <li><strong>Model options:</strong> contextual bandits (Thompson sampling), business-rules engine, lightweight elasticity-step lookup.</li>
+        <li><strong>Output:</strong> per-request fare = base &times; f(load, days-to-departure, competitor, channel).</li>
+        <li><strong>Owner:</strong> Pricing Tech.</li>
+        <li><strong>Cadence:</strong> per-request, milliseconds.</li>
+        <li><strong>What it answers:</strong> &ldquo;What price do we show this specific shopper right now?&rdquo;</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Why base price matters MORE when bots run the dynamic loop</h2>
+  <p>
+    The intuition cuts the other way for most people: &ldquo;if the bot is doing the
+    pricing, why bother with a base price at all?&rdquo; Three reasons.
+  </p>
+  <ol>
+    <li><strong>Bots execute within a strategy.</strong> Without an anchor, the bot has nothing to deviate <em>from</em>. Garbage-in for the bot if the base is wrong &mdash; the bot can only adjust around what it&apos;s given.</li>
+    <li><strong>The bot&apos;s gain is a thin layer of personalisation on top of the base.</strong> A typical bandit picks up 0.5&ndash;2% of revenue from segment-specific deviation. A $20 wrong base swamps a $2 right personalisation.</li>
+    <li><strong>Auditability and antitrust.</strong> The published base price is what regulators see; the bot deviation is bounded by the floor/ceiling guardrails. The base price is the visible strategic statement; the bot is the controlled execution.</li>
+  </ol>
+
+  <p>The user&apos;s example is the cleanest illustration:</p>
+
+  <div class="insight">
+    <strong>The $150 vs $220 problem.</strong> The market supports a base of $220.
+    Pricing files $150 by mistake. The bot detects strong demand and lifts 20%:
+    $150 &rarr; $180. The bot reacted correctly. The market would have supported
+    $220 &rarr; $260. The bot was right; the starting point was wrong; the airline
+    left $80 of revenue per booked seat on the table because the strategy was
+    misfiled, not because the execution was bad. <em>Bots optimise the deviation;
+    the base price decides what is being deviated from.</em>
+  </div>
+
+  <p>One-liner: <strong>Base price = strategy. Bot = execution.</strong> Bots are
+  good at the second and have nothing to say about the first.</p>
+
+  <h2>The contract between layers</h2>
+  <p>Each layer hands the next a small, versioned, signed JSON. This is what the
+  contracts look like in production:</p>
+
+<pre><code># Layer 1 (TimesFM) -&gt; Layer 2 (Elasticity)
+{ "od":"DFW-LAX", "cabin":"main", "horizon_d":30,
+  "fare_q10":[...30 floats], "fare_q50":[...], "fare_q90":[...],
+  "covariate_snapshot_hash":"sha256:...", "model_tag":"aa-timesfm-xreg-v1.4" }
+
+# Layer 2 (Elasticity) -&gt; Layer 3 (Base-price optimizer)
+{ "od":"DFW-LAX", "season":"Q4", "cabin":"main",
+  "elasticity":-1.21, "elasticity_se":0.08,
+  "cross":{"DFW-DAL":-0.04,"DFW-BUR":-0.07},
+  "method":"DoubleML+GPBoost", "fit_date":"2026-04-05" }
+
+# Layer 3 (Base-price optimizer) -&gt; Layer 4 (Bot)
+{ "od":"DFW-LAX", "anchor_fare":312, "floor":248, "ceiling":520,
+  "ladder":[248,272,294,312,348,398,460,520],
+  "approval":"director-signed-2026-04-08" }
+
+# Layer 4 (Bot) -&gt; Booking front-end
+{ "od":"DFW-LAX", "request_id":"...", "fare":318,
+  "rationale":{"base":312,"load_adj":+4,"competitor_adj":+2,"channel_adj":0} }
+</code></pre>
+
+  <p>Two things worth noting. First, every contract carries the producer&apos;s model tag
+  and an approval/audit field &mdash; cheap insurance for legal review. Second, the bot&apos;s
+  output explains itself in terms of the base; this is what makes the deviation
+  bounded and auditable.</p>
+
+  <h2>Where TimesFM stops</h2>
+  <div class="pros-cons-grid">
+    <div class="pros">
+      <h4>What TimesFM does well in this stack</h4>
+      <ul>
+        <li>Multi-step calibrated quantile forecasts (q10/q50/q90 over 30 days).</li>
+        <li>Cross-route information transfer through the frozen trunk.</li>
+        <li>Cold-start on new OD-pairs via zero-shot.</li>
+        <li>Native ingestion of dynamic + static covariates through the XReg head.</li>
+        <li>Cheap retraining ($7/quarter) keeps the forecast fresh.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>What TimesFM does NOT do</h4>
+      <ul>
+        <li>Estimate <em>causal</em> elasticity from observational price/quantity data &mdash; no confounding control built in.</li>
+        <li>Optimise a price subject to constraints (floor, ceiling, ladder smoothness).</li>
+        <li>Predict competitor reaction in equilibrium (it treats competitor fare as exogenous).</li>
+        <li>Learn from a deployed-policy reward signal (no closed-loop training; that would be policy-leakage).</li>
+        <li>Decide the strategic anchor &mdash; that&apos;s a policy choice, not a forecast.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout">
+    Right tool, wrong scope. TimesFM is the demand-side forecaster; the rest of
+    the stack solves problems with different assumptions and different math.
+    Calling TimesFM a &ldquo;pricing model&rdquo; is wrong both technically and
+    operationally; calling it the &ldquo;forecast layer underneath the pricing stack&rdquo;
+    is right.
+  </div>
+
+  <h2>Architecture diagram</h2>
+
+<pre><code>          +-----------------------------+
+          |  L1 &middot; FORECAST  (TimesFM)   |
+          |  Output: q10 / q50 / q90      |
+          |  Owner: Applied Science       |
+          +-------------+-----------------+
+                        | JSON contract (per OD, 30d)
+                        v
+          +-----------------------------+
+          |  L2 &middot; ELASTICITY  (GBM/HB)  |
+          |  Output: dD/dP, cross-elast  |
+          |  Owner: Operations Research  |
+          +-------------+-----------------+
+                        | JSON contract (per OD, season)
+                        v
+          +-----------------------------+
+          |  L3 &middot; BASE-PRICE OPTIMIZER  |
+          |  Output: anchor + ladder     |
+          |  Owner: Pricing Strategy     |
+          +-------------+-----------------+
+                        | JSON contract (per OD, cabin)
+                        v
+          +-----------------------------+
+          |  L4 &middot; DYNAMIC-PRICING BOT   |
+          |  Output: per-request fare    |
+          |  Owner: Pricing Tech         |
+          +-------------+-----------------+
+                        | per-request fare
+                        v
+                  Booking front-end
+                        |
+                        | realised bookings
+                        v
+          +-----------------------------+
+          |     Feedback to L2 only     |
+          |  (NEVER feeds back to L1 -  |
+          |   that would be policy      |
+          |   leakage in the forecast)  |
+          +-----------------------------+
+</code></pre>
+
+  <p class="caption">
+    The single most important arrow is the one that <em>doesn&apos;t</em> exist:
+    realised bookings feed L2 (elasticity refit) but not L1 (forecast). A forecast
+    that trains on its own deployed-policy outcomes contracts toward the policy
+    you ran &mdash; you stop seeing the demand curve and start seeing the conversion
+    funnel.
+  </p>
+
+  <h2>Antitrust separation gets sharper, not looser</h2>
+  <p>
+    The four-layer split is also the cleanest answer to the antitrust question.
+    Each layer is a different kind of artifact under regulatory review:
+  </p>
+  <ul>
+    <li><strong>Forecast (L1)</strong> &mdash; a probabilistic statement about demand. Auditable from the data hash + model tag.</li>
+    <li><strong>Elasticity (L2)</strong> &mdash; an estimated causal parameter. Auditable from the estimator class + identification strategy (instrument, randomisation, control set).</li>
+    <li><strong>Base price (L3)</strong> &mdash; a policy decision. Auditable from the optimizer&apos;s constraint set + Director-level approval signature.</li>
+    <li><strong>Bot deviation (L4)</strong> &mdash; a bounded execution. Auditable from the bandit&apos;s exploration log + the floor/ceiling that bounds it.</li>
+  </ul>
+  <p>
+    Compliance reviews each layer separately. The page does not move the boundary
+    between Applied Science and Pricing Strategy; it explains it more honestly.
+    Mixing layers (e.g. a forecast model that also picks the base price) is what
+    triggers the harder legal reviews.
+  </p>
+
+  <h2>100+ routes &mdash; partial pooling per layer</h2>
+  <p>
+    With 6,700 OD-pairs in the network and 141 fine-tuned, the cross-route
+    statistical decision is different at each layer:
+  </p>
+
+  <div class="role-table-wrapper">
+    <table class="role-table">
+      <thead>
+        <tr><th>Layer</th><th>Pooling decision</th><th>Why</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>L1 Forecast</strong></td>
+          <td>Global trunk + per-family LoRA (partial pool at family).</td>
+          <td>Foundation-model trunk handles cross-series transfer; LoRA captures family idiosyncrasies; works even on cold-start.</td>
+          <td>Shipped (this portfolio).</td>
+        </tr>
+        <tr>
+          <td><strong>L2 Elasticity</strong></td>
+          <td>Partial pool at OD level, nested in family priors.</td>
+          <td>Low-volume routes have noisy per-OD elasticity; group priors shrink them toward family means. GPBoost or hierarchical Bayes.</td>
+          <td>Recommended; OR team owns. Not shipped today.</td>
+        </tr>
+        <tr>
+          <td><strong>L3 Base-price opt</strong></td>
+          <td>Independent per OD, with cross-elasticity coupling on substitutable ODs.</td>
+          <td>Each OD has its own demand curve; coupling matters where shoppers substitute (DFW-LAX vs DFW-BUR vs DFW-LGB).</td>
+          <td>Status quo at most airlines.</td>
+        </tr>
+        <tr>
+          <td><strong>L4 Bot</strong></td>
+          <td>Per-OD bandit with shared prior over context features.</td>
+          <td>Per-OD bandit explores cheaply; shared prior accelerates learning on cold-start ODs.</td>
+          <td>Pricing Tech roadmap.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>How wrong base prices fail in production</h2>
+  <p>Three diagnostics I recommend the OR team monitor:</p>
+  <ol>
+    <li><strong>Fare-ladder skew.</strong> Fraction of bookings that land at the floor or ceiling. If &gt; 15% at either extreme, the band is mis-set; the optimizer is hitting the constraint, not the optimum.</li>
+    <li><strong>Reservation-price residuals.</strong> Conversion at price <em>p</em> minus expected conversion at price <em>p</em> from the elasticity model. Persistent positive residual means base too low; persistent negative means base too high.</li>
+    <li><strong>Analyst override rate per OD.</strong> RM analysts override base prices when they think the optimizer is wrong. A high override rate (&gt; 8%) on a route family is a flag the base-price optimizer or its inputs are stale.</li>
+  </ol>
+
+  <div class="interview-section">
+    <h2>Interview Q&amp;A &mdash; base price &amp; the four-layer stack</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Why is the base price more important when a bot runs the dynamic loop?</div>
+        <div class="a">The bot acts <em>within</em> the base. A bad base survives the bot &mdash; bot lifts 20% of $150 instead of 20% of $220, you lose the same dollars across millions of seats. A good base + good bot &gt; great bot + bad base. Bots optimise the deviation; the base decides what&apos;s being deviated from.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Where does the base price live in your portfolio today?</div>
+        <div class="a">It doesn&apos;t. Today the portfolio owns the forecast layer (L1). Operations Research owns elasticity (L2); Pricing Strategy owns the base-price optimizer (L3); Pricing Tech owns the bot (L4). This page calls out the gap explicitly so interviewers don&apos;t assume the forecast is doing more than it does.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Could TimesFM produce a base price directly?</div>
+        <div class="a">No. TimesFM forecasts <em>realised fares under existing policy</em>. The base price is a counterfactual policy choice (&ldquo;what would happen if we set the anchor here?&rdquo;). Treating a forecast coefficient as a policy lever is the most common mistake in airline RM and it&apos;s why we keep the layers separate.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through the four layers and what model class is right for each.</div>
+        <div class="a">L1 forecast: foundation TS (TimesFM) for cross-route transfer + cold-start. L2 elasticity: GBM with random effects (GPBoost) or hierarchical Bayes for partial pooling; Double ML / DeepIV when you need causal identification. L3 base-price: MIP with offline Bayesian-opt for constraint settings. L4 bot: contextual bandits (Thompson sampling) with floor/ceiling guardrails.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How would you detect that the base price is wrong in production?</div>
+        <div class="a">Three diagnostics. (1) Fare-ladder skew &mdash; bookings clumping at floor or ceiling. (2) Reservation-price residuals from the L2 elasticity model. (3) Analyst override rate per OD. Persistent override &gt; 8% on a family is a flag.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the feedback-loop risk if elasticity is re-estimated from realised bookings?</div>
+        <div class="a">Selection bias. Bookings reflect customers who <em>accepted</em> the offered price. Standard fixes: instrument with exogenous price variation (calendar-randomised A/B tests), or use Double ML / DeepIV with a credible instrument (fuel-price shock, FX shock). Without one of those, your estimated elasticity contracts toward the policy you ran.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why not let one big RL policy subsume all four layers?</div>
+        <div class="a">Four reasons. (1) Auditability &mdash; legal and revenue management need to explain strategic prices, not show an RL policy and shrug. (2) Antitrust &mdash; layer-specific reviews are easier than &ldquo;one giant policy.&rdquo; (3) Training-data sparsity at the strategic horizon &mdash; bandits learn fast; strategic anchors change weekly with limited samples. (4) Bot exploration cost &mdash; bandits explore into bad prices; OK at the per-request layer, not OK at the strategic anchor that customers see in advertising.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What changes when the competitor also runs a bot?</div>
+        <div class="a">The single-agent base-price math is mis-specified &mdash; you&apos;re solving an equilibrium problem with a non-equilibrium tool. The right answer is multi-agent forecasting or inverse optimization (infer competitor&apos;s objective from their actions). For v1 we keep the &ldquo;competitor fare as covariate&rdquo; approach and flag it as a known mis-specification; the next research bet is a Stackelberg leader-follower model on the top-20 competitive ODs.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <nav class="page-nav">
+    <a class="page-nav-item prev" href="pricing-algorithms.html">
+      <div class="label">&larr; Previous</div>
+      <div class="title">Pricing algorithms deep-dive</div>
+    </a>
+    <a class="page-nav-item next" href="alt-models-bakeoff.html">
+      <div class="label">Next &rarr;</div>
+      <div class="title">Alt-models bake-off</div>
+    </a>
+  </nav>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>Synthetic data only &mdash; numbers are illustrative for a portfolio project. American Airlines and AAdvantage are trademarks of American Airlines, Inc.; use here is illustrative only.</p>
+  </div>
+</footer>
+
+</body>
+</html>

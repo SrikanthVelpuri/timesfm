@@ -1,0 +1,50 @@
+name: Sync README portfolio links
+
+# Auto-regenerates the AA-PORTFOLIO-PAGES section of README.md whenever a
+# portfolio page is added, removed, or has its <title>/<meta description>
+# changed. Loop-prevention: skip when the head commit was made by this
+# workflow itself (looking for [skip-readme-sync] in the message).
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'docs/pages/**.html'
+      - 'scripts/generate_readme_links.py'
+      - '.github/workflows/sync-readme-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip-readme-sync]')"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Need full history so the eventual push is a fast-forward.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Regenerate README portfolio section
+        run: python3 scripts/generate_readme_links.py
+
+      - name: Commit and push if README changed
+        run: |
+          if [ -z "$(git status --porcelain README.md)" ]; then
+            echo "README.md already up to date; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: sync README portfolio links [skip-readme-sync]"
+          git push

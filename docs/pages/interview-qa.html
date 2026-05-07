@@ -58,6 +58,8 @@
     <li><a href="#section-business">Business impact &amp; revenue attribution</a></li>
     <li><a href="#section-leadership">Leadership, scope, and on-call</a></li>
     <li><a href="#section-trick">Trick &amp; failure-mode questions</a></li>
+    <li><a href="#section-base-price">Base price &amp; the four-layer pricing stack</a></li>
+    <li><a href="#section-altmodels">Alt-model bake-off (elasticity, base-price, competitor)</a></li>
   </ol>
 
   <!-- ============================================================== -->
@@ -561,6 +563,102 @@
         <div class="q">If you joined a new team, what&apos;s the first thing you&apos;d do?</div>
         <div class="a">Read the eval harness. If it doesn&apos;t exist, build it. Every other ML decision is unsafe without one. The eval harness is the first thing I built on this project; it&apos;s what enabled everything else.</div>
       </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-base-price">
+    <h2>13. Base price &amp; the four-layer pricing stack</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Why is the base price more important when bots run dynamic pricing?</div>
+        <div class="a">Bots act <em>within</em> the base. A bad base survives the bot &mdash; bot lifts 20% of $150 instead of 20% of $220, you lose $80 per booked seat across millions of seats. Bots optimise the deviation; the base decides what&apos;s being deviated from. As bots take over execution, the strategic anchor becomes the controllable surface.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Where does the base price live in your portfolio today?</div>
+        <div class="a">It doesn&apos;t. Today the portfolio owns the forecast layer (L1) only. Operations Research owns elasticity (L2); Pricing Strategy owns the base-price optimizer (L3); Pricing Tech owns the bot (L4). The <a href="base-price-strategy.html">base-price-strategy.html</a> page calls out the gap explicitly so interviewers don&apos;t assume the forecast does more than it does.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Could TimesFM produce a base price directly?</div>
+        <div class="a">No. TimesFM forecasts <em>realised fares under existing policy</em>. The base price is a counterfactual policy choice (&ldquo;what would happen if we set the anchor here?&rdquo;). Treating a forecast coefficient as a policy lever is the most common mistake in airline RM.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through the four layers and what model class is right for each.</div>
+        <div class="a">L1 forecast: foundation TS (TimesFM) for cross-route transfer + cold-start. L2 elasticity: GBM with random effects (GPBoost) or hierarchical Bayes for partial pooling; Double ML / DeepIV when you need causal identification. L3 base-price: MIP with offline Bayesian-opt for constraint settings. L4 bot: contextual bandits (Thompson sampling) with floor/ceiling guardrails.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How would you detect a wrong base price in production?</div>
+        <div class="a">Three diagnostics. (1) Fare-ladder skew &mdash; bookings clumping at the floor or ceiling (&gt; 15% at either is a flag). (2) Reservation-price residuals from the L2 elasticity model &mdash; persistent positive means base too low. (3) Analyst override rate per OD &gt; 8% on a route family.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the feedback-loop risk if elasticity is re-estimated from realised bookings?</div>
+        <div class="a">Selection bias. Bookings reflect customers who <em>accepted</em> the offered price. Standard fixes: instrument with exogenous price variation (calendar-randomised A/B), or use Double ML / DeepIV with a credible instrument (fuel-price shock, FX shock). Without one of those, the elasticity contracts toward the policy you ran.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why not let one big RL policy subsume all four layers?</div>
+        <div class="a">Auditability, antitrust, training-data sparsity at strategic horizons, and bot exploration cost. Bandits explore into bad prices; OK at per-request, not OK at the strategic anchor customers see in advertising. Two-level policy (strategic anchor + tactical deviation) is standard in revenue management for these reasons.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What changes when the competitor also runs a bot?</div>
+        <div class="a">The single-agent base-price math is mis-specified &mdash; you&apos;re solving an equilibrium problem with a non-equilibrium tool. The right answer is multi-agent forecasting or inverse optimization. For v1 we keep &ldquo;competitor fare as covariate&rdquo; and flag mis-specification; the next research bet is Stackelberg leader-follower on the top-20 competitive ODs.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <div class="interview-section" id="section-altmodels">
+    <h2>14. Alt-model bake-off (elasticity, base-price, competitor)</h2>
+    <div class="qa-grid">
+
+      <div class="qa">
+        <div class="q">Is there a better model than TimesFM for your forecasting layer?</div>
+        <div class="a">Not at our footprint. TFT and TiDE are credible if we had only mature routes with no cold-start. Chronos-Bolt is the closest foundation-model competitor at 5.9% MAPE vs TimesFM&apos;s 5.1%. We re-evaluate quarterly; Moirai-MoE is on the watch list. Full bake-off in <a href="alt-models-bakeoff.html#layer-1">alt-models-bakeoff.html</a>.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">What&apos;s the difference between the XReg head&apos;s price coefficient and a true elasticity?</div>
+        <div class="a">Confounding. The XReg coefficient is fit on observational data where price was set by current policy; it picks up demand-driven price moves <em>and</em> policy responses, conflated. A true elasticity needs an instrument (Double ML, DeepIV) or randomised variation. We label it <code>elast</code> for shorthand; the optimizer should consume a separately-estimated causal elasticity.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why GPBoost over plain LightGBM for elasticity?</div>
+        <div class="a">GPBoost adds Gaussian random effects per group (route, route family); it shrinks elasticity estimates on low-volume routes toward the family mean. Sigrist 2022 shows it dominates plain LightGBM on grouped data. The tradeoff: slower fit, less mature API.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Why not put a bandit on the base price?</div>
+        <div class="a">Strategic prices need to be explained to legal and revenue management. Bandits explore. You cannot tell a director &ldquo;we set DFW-LAX&apos;s anchor at $180 this week because our bandit was exploring.&rdquo; Bandits belong on the per-request bot (L4); not on the weekly strategic anchor.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Walk me through Double ML for fare elasticity.</div>
+        <div class="a">Two ML models: one predicts demand from non-price features, one predicts price from non-price features. Cross-fit residuals; regress demand-residual on price-residual; coefficient is debiased elasticity. Robust to confounding via Neyman orthogonality. Chernozhukov et al. 2018. Tooling: <code>econml</code>, <code>doubleml</code>.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">When would you actually pick TFT over TimesFM?</div>
+        <div class="a">100 well-known routes, 3+ years of stable history, hard requirement for per-feature variable-selection interpretability for a regulator. Lim et al. designed TFT for that audience. We don&apos;t fit any of those constraints; TimesFM wins.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">How do you handle 6,700 routes for elasticity when most have &lt; 500 days history?</div>
+        <div class="a">Hierarchical Bayes (Stan/PyMC) or GPBoost. Random effects per route nested in family priors; shrinkage toward family means is automatic. Plain per-route OLS is wildly noisy on &lt; 500 days. The OR team owns the layer.</div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Causal forests vs Double ML for elasticity heterogeneity?</div>
+        <div class="a">Causal forests give per-route treatment effects with valid CIs (Wager &amp; Athey 2018) but assume unconfoundedness or instruments. Double ML is more flexible on the nuisance side; less natural for heterogeneity. Use causal forests if you have a credible instrument and want per-OD elasticity with confidence intervals.</div>
+      </div>
+
     </div>
   </div>
 
